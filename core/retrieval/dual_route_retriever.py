@@ -125,10 +125,6 @@ class DualRouteRetriever:
             if intent:
                 score_breakdown["query_intent"] = intent
             if doc_result is not None:
-                score_breakdown["document_keyword_score"] = round(
-                    float(doc_result.bm25_score or 0.0),
-                    4,
-                )
                 score_breakdown["document_vector_score"] = round(
                     float(doc_result.vector_score or 0.0),
                     4,
@@ -147,13 +143,6 @@ class DualRouteRetriever:
                 HybridResult(
                     doc_id=doc_id,
                     final_score=final_score,
-                    rrf_score=max(
-                        doc_result.rrf_score if doc_result is not None else 0.0,
-                        graph_result.rrf_score if graph_result is not None else 0.0,
-                    ),
-                    bm25_score=doc_result.bm25_score
-                    if doc_result is not None
-                    else None,
                     vector_score=(
                         doc_result.vector_score if doc_result is not None else None
                     ),

@@ -7,7 +7,6 @@ LivingMemory核心模块
 - models/: 数据模型
 - managers/: 管理器（会话管理、记忆引擎）
 - processors/: 处理器（记忆处理、文本处理）
-- validators/: 验证器（索引验证）
 - retrieval/: 检索系统
 - utils/: 工具函数
 """
@@ -41,16 +40,11 @@ from .models import (
 
 # 处理器
 from .processors import (
-    ChatroomContextParser,
     EntityResolver,
     GraphExtractor,
     MemoryProcessor,
     TextProcessor,
-    store_round_with_length_check,
 )
-
-# 验证器
-from .validators import IndexValidator
 
 __all__ = [
     # 基础组件
@@ -76,12 +70,8 @@ __all__ = [
     "GraphMemoryManager",
     "MemoryEngine",
     # 处理器
-    "ChatroomContextParser",
     "EntityResolver",
     "GraphExtractor",
     "MemoryProcessor",
     "TextProcessor",
-    "store_round_with_length_check",
-    # 验证器
-    "IndexValidator",
 ]

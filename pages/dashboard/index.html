@@ -36,29 +36,35 @@
             <i data-lucide="chart-no-axes-combined" aria-hidden="true"></i>
             <span data-i18n="nav.system">System</span>
           </button>
-          <button class="nav-item" data-page="prompts" data-i18n-aria="nav.prompts">
-            <i data-lucide="braces" aria-hidden="true"></i>
-            <span data-i18n="nav.prompts">Prompts</span>
-          </button>
         </nav>
         <div class="sidebar-divider"></div>
+        <div class="sidebar-control">
+          <label class="control-label" for="persona-selector" data-i18n="persona.label">Persona</label>
+          <div class="sidebar-select-wrap">
+            <i data-lucide="user-round" aria-hidden="true"></i>
+            <select id="persona-selector" class="select input">
+              <option value="" data-i18n="persona.all">All personas</option>
+            </select>
+          </div>
+        </div>
         <div class="sidebar-footer">
+          <a
+            class="nav-item"
+            id="source-code-link"
+            href="https://github.com/W-Wolfycz/livingmemory_cm"
+            target="_blank"
+            rel="noopener noreferrer"
+            data-i18n-aria="license.sourceAria"
+            aria-label="Source code (AGPL-3.0)"
+          >
+            <i data-lucide="code-xml" aria-hidden="true"></i>
+            <span data-i18n="license.source">Source · AGPL-3.0</span>
+          </a>
           <button class="nav-item" id="theme-toggle" data-i18n-aria="header.theme">
             <i data-lucide="moon" id="theme-icon-dark" aria-hidden="true"></i>
             <i data-lucide="sun" id="theme-icon-light" class="hidden" aria-hidden="true"></i>
             <span data-i18n="header.theme">Theme</span>
           </button>
-          <details class="lang-menu" id="lang-menu">
-          <summary class="nav-item" id="lang-toggle" data-i18n-aria="header.lang">
-            <i data-lucide="languages" aria-hidden="true"></i>
-            <span id="lang-label" data-i18n="header.lang">Language</span>
-          </summary>
-          <div class="lang-options">
-            <button type="button" class="lang-option" data-lang="zh">中文</button>
-            <button type="button" class="lang-option" data-lang="en">English</button>
-            <button type="button" class="lang-option" data-lang="ru">Русский</button>
-          </div>
-          </details>
         </div>
       </aside>
 
@@ -92,7 +98,7 @@
             <div class="graph-legend" id="graph-legend"></div>
             <div class="graph-toolbar">
               <input type="text" id="graph-query-input" class="input" data-i18n-placeholder="graph.queryPh" placeholder="Search entities, topics, or memories..." />
-              <input type="text" id="graph-memory-id" class="input input-sm" data-i18n-placeholder="graph.memoryIdPh" placeholder="Memory ID" style="width:120px" />
+              <input type="text" id="graph-memory-id" class="input input-sm" data-i18n-placeholder="graph.memoryIdPh" placeholder="Memory ID" />
               <button class="btn btn-primary btn-sm" id="graph-search-btn">
                 <i data-lucide="search" aria-hidden="true"></i>
                 <span data-i18n="graph.searchBtn">Search</span>
@@ -145,23 +151,6 @@
                 <option value="50" data-i18n="common.perPage50">50 per page</option>
                 <option value="100" data-i18n="common.perPage100">100 per page</option>
               </select>
-              <select id="mem-transfer-format" class="select input" style="width:auto" data-i18n-title="transfer.formatTitle">
-                <option value="json">JSON</option>
-                <option value="csv">CSV</option>
-              </select>
-              <select id="mem-import-duplicates" class="select input" style="width:auto" data-i18n-title="transfer.duplicateTitle">
-                <option value="skip" data-i18n="transfer.skipDuplicates">Skip duplicates</option>
-                <option value="allow" data-i18n="transfer.allowDuplicates">Allow duplicates</option>
-              </select>
-              <button class="btn btn-sm btn-secondary" id="mem-export" data-i18n-title="transfer.exportTitle">
-                <i data-lucide="download" aria-hidden="true"></i>
-                <span data-i18n="transfer.export">Export</span>
-              </button>
-              <button class="btn btn-sm btn-secondary" id="mem-import" data-i18n-title="transfer.importTitle">
-                <i data-lucide="upload" aria-hidden="true"></i>
-                <span data-i18n="transfer.import">Import</span>
-              </button>
-              <input type="file" id="mem-import-file" accept=".json,.csv,application/json,text/csv" hidden />
               <button class="btn btn-sm btn-secondary" id="mem-batch-edit" disabled data-i18n-title="batchEdit.title">
                 <i data-lucide="pencil" aria-hidden="true"></i>
                 <span id="mem-batch-edit-label" data-i18n="batchEdit.button">Batch edit</span>
@@ -263,33 +252,6 @@
             <div class="system-panel">
               <div class="system-panel-title" data-i18n="system.versionBackups">Version Backups</div>
               <div class="backup-list" id="backup-list"></div>
-            </div>
-          </div>
-        </section>
-
-        <!-- Page: Prompts -->
-        <section class="page" id="page-prompts">
-          <header class="page-header">
-            <div class="page-heading"><span class="page-index">05</span><span class="page-title" data-i18n="nav.prompts">Prompt Management</span></div>
-          </header>
-          <div class="page-body">
-            <div id="prompt-content"></div>
-            <div class="prompt-editor hidden" id="prompt-editor">
-              <div class="prompt-editor-header">
-                <span class="prompt-editor-subtitle" data-i18n="prompt.editTitle">Edit Prompt</span>
-                <span class="prompt-editor-title" id="prompt-editor-title"></span>
-                <span class="prompt-editor-status" id="prompt-editor-status"></span>
-              </div>
-              <div class="prompt-editor-vars-row">
-                <span class="prompt-editor-vars-label" data-i18n="prompt.variables">Variables</span>
-                <span id="prompt-editor-vars"></span>
-              </div>
-              <textarea id="prompt-editor-textarea" class="input textarea prompt-editor-textarea" rows="20" spellcheck="false"></textarea>
-              <div class="prompt-editor-actions">
-                <button class="btn btn-secondary" id="prompt-cancel-btn"><i data-lucide="x" aria-hidden="true"></i><span data-i18n="common.cancel">Cancel</span></button>
-                <button class="btn btn-danger btn-sm" id="prompt-reset-btn"><i data-lucide="rotate-ccw" aria-hidden="true"></i><span data-i18n="prompt.reset">Reset to Default</span></button>
-                <button class="btn btn-primary" id="prompt-save-btn"><i data-lucide="save" aria-hidden="true"></i><span data-i18n="common.save">Save</span></button>
-              </div>
             </div>
           </div>
         </section>

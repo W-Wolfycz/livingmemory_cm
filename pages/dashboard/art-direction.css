@@ -285,6 +285,42 @@ summary:focus-visible {
   background: var(--border-normal);
 }
 
+.sidebar-control {
+  padding: 0 12px 12px;
+}
+
+.sidebar-control .control-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.sidebar-select-wrap {
+  position: relative;
+}
+
+.sidebar-select-wrap > svg {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 10px;
+  width: 15px;
+  height: 15px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.sidebar-select-wrap .select {
+  width: 100%;
+  padding-left: 34px;
+  font-size: 11px;
+}
+
 .sidebar-footer {
   gap: 4px;
 }
@@ -293,26 +329,6 @@ summary:focus-visible {
   min-height: 42px;
   color: var(--text-secondary);
   font-size: 10px;
-}
-
-.lang-options {
-  bottom: calc(100% + 8px);
-  padding: 5px;
-  background: var(--bg-card);
-  border-color: var(--border-normal);
-  border-radius: 2px;
-  box-shadow: 12px 12px 0 rgba(0, 0, 0, 0.25);
-}
-
-.lang-option {
-  color: var(--text-secondary);
-  border-radius: 1px;
-}
-
-.lang-option:hover,
-.lang-option.active {
-  color: var(--accent);
-  background: var(--accent-light);
 }
 
 /* Pages and editorial headers */
@@ -585,12 +601,16 @@ input[type="range"] {
   left: 16px;
   right: auto;
   bottom: auto;
+  transform: none;
+  max-width: min(460px, calc(100% - 32px));
   padding: 7px 9px;
   color: var(--text-secondary);
   background: var(--bg-overlay);
   border: 1px solid var(--border-light);
   border-radius: 1px;
   font: 600 10px/1.3 "SFMono-Regular", Consolas, monospace;
+  white-space: normal;
+  overflow-wrap: anywhere;
   backdrop-filter: blur(8px);
 }
 
@@ -607,13 +627,44 @@ input[type="range"] {
   grid-column: 2;
   grid-row: 2;
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) 120px auto auto;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  grid-template-areas:
+    "query search"
+    "memory focus";
   gap: 7px;
   padding: 10px;
   background: var(--bg-toolbar);
   border: 1px solid var(--border-normal);
   border-radius: 4px;
   backdrop-filter: blur(12px);
+}
+
+#graph-query-input {
+  grid-area: query;
+}
+
+#graph-memory-id {
+  grid-area: memory;
+}
+
+#graph-search-btn {
+  grid-area: search;
+}
+
+#graph-focus-btn {
+  grid-area: focus;
+}
+
+.graph-toolbar .input,
+.graph-toolbar .input-sm {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+
+.graph-toolbar .btn {
+  min-width: 112px;
+  justify-content: center;
 }
 
 .graph-toolbar .input {
@@ -647,7 +698,6 @@ input[type="range"] {
   .graph-toolbar {
     grid-column: 1 / -1;
     grid-row: 3;
-    grid-template-columns: minmax(0, 1fr) minmax(110px, 140px) auto auto;
   }
 
   .graph-toolbar .input {
@@ -1073,16 +1123,6 @@ input[type="range"] {
     grid-template-columns: 142px minmax(0, 1fr);
   }
 
-  .graph-toolbar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-
-  #graph-query-input,
-  #graph-memory-id {
-    grid-column: 1 / -1;
-    width: 100% !important;
-  }
-
   .graph-toolbar .btn {
     width: 100%;
   }
@@ -1123,6 +1163,7 @@ input[type="range"] {
   .sidebar-brand,
   .sidebar-coordinate,
   .sidebar-divider,
+  .sidebar-control,
   .nav-item span,
   .nav-item::after {
     display: none;
@@ -1153,13 +1194,6 @@ input[type="range"] {
 
   .nav-item:hover {
     transform: translateY(-2px);
-  }
-
-  .lang-options {
-    right: 0;
-    bottom: calc(100% + 10px);
-    left: auto;
-    min-width: 124px;
   }
 
   .page-header {
@@ -1242,13 +1276,6 @@ input[type="range"] {
   .graph-toolbar {
     grid-column: 1;
     grid-row: 4;
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .graph-toolbar .input,
-  .graph-toolbar .input-sm {
-    grid-column: 1 / -1;
-    width: 100% !important;
   }
 
   .filter-bar {

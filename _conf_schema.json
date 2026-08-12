@@ -1,40 +1,4 @@
 {
-    "bot_language": {
-        "description": "机器人回复语言",
-        "hint": "设置插件命令和状态回复的语言。zh=中文（默认），en=English，ru=Русский。",
-        "type": "string",
-        "options": [
-            "zh",
-            "en",
-            "ru"
-        ],
-        "default": "zh"
-    },
-    "access_control": {
-        "description": "记忆访问控制",
-        "hint": "限制哪些用户或会话可以使用长期记忆，并统一跨平台身份名称。",
-        "type": "object",
-        "items": {
-            "whitelist_enabled": {
-                "description": "启用记忆白名单",
-                "hint": "开启后，仅允许名单中的用户、群组或会话触发记忆捕获、总结、召回和 Agent 记忆工具。名单为空时拒绝所有记忆操作。",
-                "type": "bool",
-                "default": false
-            },
-            "allowed_ids": {
-                "description": "记忆白名单",
-                "hint": "每行填写一个用户 ID、平台:用户 ID、群组 ID 或完整会话 ID；也支持逗号和分号分隔。",
-                "type": "text",
-                "default": ""
-            },
-            "identity_aliases": {
-                "description": "用户身份别名",
-                "hint": "每行填写 source=统一名称。source 可使用平台:用户 ID、用户 ID 或当前用户名，例如 telegram:12345=小明。",
-                "type": "text",
-                "default": ""
-            }
-        }
-    },
     "provider_settings": {
         "description": "模型提供商",
         "hint": "配置记忆系统使用的 AI 模型",
@@ -48,53 +12,10 @@
             },
             "llm_provider_id": {
                 "description": "LLM 模型 ID",
-                "hint": "用于总结对话、评估记忆重要性的大语言模型 ID。留空使用 AstrBot 默认。推荐使用推理能力较强的模型。",
+                "hint": "用于中性事实萃取、主题拆分和评估记忆重要性的大语言模型 ID。留空使用 AstrBot 默认。推荐使用结构化输出稳定的模型。",
                 "type": "string",
                 "_special": "select_provider",
                 "default": ""
-            }
-        }
-    },
-    "session_manager": {
-        "description": "会话管理",
-        "hint": "管理用户会话状态和对话历史的缓存行为",
-        "type": "object",
-        "items": {
-            "enable_full_group_capture": {
-                "description": "捕获群聊所有消息",
-                "hint": "是否捕获群聊中的所有消息（包括非 @Bot 的消息）。开启后群聊中每条消息都会被记录，有助于构建更完整的群聊上下文。",
-                "type": "bool",
-                "default": true
-            },
-            "max_sessions": {
-                "description": "最大缓存会话数",
-                "hint": "内存中同时保留的最大会话数（LRU 淘汰）。超出后最久未使用的会话从缓存移除，但数据仍保存在数据库中。",
-                "type": "int",
-                "default": 100
-            },
-            "session_ttl": {
-                "description": "会话空闲超时（秒）",
-                "hint": "会话超过此时间无活动后从缓存移除。默认 3600（1 小时）。",
-                "type": "int",
-                "default": 3600
-            },
-            "context_window_size": {
-                "description": "上下文窗口大小（条）",
-                "hint": "传给 LLM 的最大历史消息条数。越大上下文越丰富，但消耗 token 越多。建议 20-100。",
-                "type": "int",
-                "default": 50
-            },
-            "max_messages_per_session": {
-                "description": "单会话最大历史消息数",
-                "hint": "数据库中每个会话保留的历史消息上限。超过后只会删除已经完成总结的最旧消息，避免丢失未总结上下文。",
-                "type": "int",
-                "default": 1000
-            },
-            "cleanup_batch_size": {
-                "description": "历史消息批量清理数量",
-                "hint": "会话历史超过上限后，每次至少尝试删除的旧已总结消息数量。值过小会导致超限后每轮只删少量消息。",
-                "type": "int",
-                "default": 50
             }
         }
     },
@@ -115,90 +36,21 @@
                 "type": "int",
                 "default": 10
             },
-            "importance_weight": {
-                "description": "重要性权重",
-                "hint": "混合评分中记忆重要性的占比系数。值越大，重要性高的记忆越优先被召回。",
-                "type": "float",
-                "default": 1.0
-            },
-            "min_importance_for_retrieval": {
-                "description": "召回最低重要性",
-                "hint": "过滤重要性低于该值的记忆。范围 0-1，设为 0 表示不过滤。",
-                "type": "float",
-                "default": 0.0
-            },
-            "min_similarity_for_retrieval": {
-                "description": "召回最低向量相似度",
-                "hint": "过滤向量相似度低于该值的候选；纯关键词命中不受影响。范围 0-1，设为 0 表示不过滤。",
-                "type": "float",
-                "default": 0.0
-            },
-            "recent_memory_count": {
-                "description": "近期记忆保留数量",
-                "hint": "在每次召回中为当前范围内的近期记忆保留槽位，避免只依赖向量相似度。设为 0 可关闭。",
-                "type": "int",
-                "default": 2
-            },
-            "recent_memory_max_age_hours": {
-                "description": "近期记忆时间窗口（小时）",
-                "hint": "只保留该时间窗口内的近期记忆。默认 72 小时，设为 0 表示不限制时间。",
-                "type": "int",
-                "default": 72
-            },
-            "memory_type_filter": {
-                "description": "记忆类型过滤",
-                "hint": "all 召回全部记忆；event_only 排除可明确识别为纯偏好或纯关系的记忆。旧记录没有类型元数据时保持可召回。",
-                "type": "string",
-                "options": ["all", "event_only"],
-                "default": "all"
-            },
-            "fallback_to_vector": {
-                "description": "降级到纯向量检索",
-                "hint": "混合检索失败或结果为空时，自动降级为纯向量检索。建议开启。",
-                "type": "bool",
-                "default": true
-            },
             "injection_method": {
                 "description": "记忆注入位置",
-                "hint": "记忆注入到 LLM 请求的位置。extra_user_content(推荐)：追加到用户消息末尾，不影响前缀缓存且不污染对话历史。user_message_before：作为用户消息前缀。user_message_after：作为用户消息后缀。fake_tool_call：伪造工具调用消息对注入到对话历史，使 LLM 自然地理解这是检索结果。fake_tool_call_deepseek_v4：⚠️已废弃，选择后自动回退至 fake_tool_call。Gemini 下若选择 fake_tool_call 会自动降级为 extra_user_content。system_prompt：⚠️已废弃，选择后自动回退至 extra_user_content。",
+                "hint": "记忆注入到 LLM 请求的位置。extra_user_content(推荐)：追加到用户消息末尾，不影响前缀缓存且不污染对话历史。user_message_before：作为用户消息前缀。user_message_after：作为用户消息后缀。fake_tool_call：伪造工具调用消息对注入到对话历史，使 LLM 自然地理解这是检索结果。Gemini 下若选择 fake_tool_call 会自动降级为 extra_user_content。",
                 "type": "string",
                 "default": "extra_user_content",
                 "options": [
                     "extra_user_content",
                     "user_message_before",
                     "user_message_after",
-                    "fake_tool_call",
-                    "fake_tool_call_deepseek_v4",
-                    "system_prompt"
+                    "fake_tool_call"
                 ]
-            },
-            "auto_remove_injected": {
-                "description": "自动清除旧注入片段",
-                "hint": "注入新记忆前自动删除历史中已注入的旧记忆片段，避免重复累积和 token 浪费。建议开启。",
-                "type": "bool",
-                "default": true
-            },
-            "inject_with_recent_context": {
-                "description": "启用跨轮次上下文扩展检索",
-                "hint": "启用后检索记忆时会自动拼接最近 2 轮对话（当前消息 + Bot 上一条回复 + 用户上一条消息）作为扩展查询，提升召回记忆与当前话题的相关性，减少无关记忆干扰。",
-                "type": "bool",
-                "default": false
-            },
-            "recent_context_max_age_seconds": {
-                "description": "扩展上下文最大间隔（秒）",
-                "hint": "仅使用该时间范围内的历史消息扩展召回查询，避免新话题被过久之前的上下文干扰。设为 0 表示不限制时间。",
-                "type": "int",
-                "default": 7200
-            },
-            "search_cache_enabled": {
-                "description": "启用短期检索缓存",
-                "hint": "短时间内相同会话和相同查询会复用检索结果，降低连续追问时的 SQLite/FAISS 开销。",
-                "type": "bool",
-                "default": true
             },
             "search_cache_ttl_seconds": {
                 "description": "检索缓存 TTL 秒数",
-                "hint": "缓存保留时间。写入、更新、删除记忆时会自动失效。设为 0 可关闭缓存。",
+                "hint": "短时间内相同会话和相同查询会复用检索结果，降低连续追问时的 SQLite/FAISS 开销。设为 0 关闭缓存（默认 45 秒）。",
                 "type": "float",
                 "default": 45.0
             },
@@ -207,6 +59,70 @@
                 "hint": "限制内存中保留的检索结果数量。超过上限时自动淘汰最久未使用的结果。",
                 "type": "int",
                 "default": 256
+            },
+            "query_context_rounds": {
+                "description": "召回查询历史轮数",
+                "hint": "当前发言始终是检索主体。额外从 CM 查询当前用户在当前会话中最近的 N 个完整 user/assistant 问答轮次，仅用于消解「那个」「继续」等指代。0 = 仅使用当前发言。默认 2。",
+                "type": "int",
+                "default": 2
+            },
+            "query_context_max_chars": {
+                "description": "召回历史字符上限",
+                "hint": "对上述最近问答轮次再施加字符上限，避免历史压过当前发言。0 = 不加入历史。默认 800。",
+                "type": "int",
+                "default": 800
+            },
+            "query_context_max_age_seconds": {
+                "description": "召回历史最大年龄(秒)",
+                "hint": "只从该时间窗口内读取当前用户的 CM 完整问答用于指代消歧。0 表示不限制时间并保持旧行为；例如 7200 表示 2 小时。",
+                "type": "int",
+                "default": 0
+            },
+            "injection_max_memories": {
+                "description": "单次注入最多记忆数",
+                "hint": "召回候选会先去重，再按检索排名最多注入该数量。建议 2-4，默认 3。",
+                "type": "int",
+                "default": 3
+            },
+            "injection_max_chars": {
+                "description": "单次注入字符预算",
+                "hint": "包括历史记忆规则、参与者、摘要和关键事实。超出预算的低排名记忆不注入。默认 3200。",
+                "type": "int",
+                "default": 3200
+            },
+            "min_importance_for_retrieval": {
+                "description": "召回最低重要性",
+                "hint": "过滤重要性低于该值的记忆。范围 0-1；0 表示不过滤，保持旧行为。",
+                "type": "float",
+                "default": 0.0
+            },
+            "min_similarity_for_retrieval": {
+                "description": "召回最低向量相似度",
+                "hint": "过滤所有可用向量信号都低于该值的候选；纯关键词或近期槽位候选不受影响。范围 0-1；0 表示不过滤。",
+                "type": "float",
+                "default": 0.0
+            },
+            "recent_memory_count": {
+                "description": "近期记忆保留数量",
+                "hint": "为当前 session/persona 范围内的近期 active 记忆保留槽位。0 表示关闭并保持旧排序；建议按需设置 1-2。",
+                "type": "int",
+                "default": 0
+            },
+            "recent_memory_max_age_hours": {
+                "description": "近期记忆时间窗口(小时)",
+                "hint": "近期槽位只读取该时间窗口内的记忆。默认 72 小时；0 表示不限时间。",
+                "type": "int",
+                "default": 72
+            },
+            "memory_type_filter": {
+                "description": "记忆类型过滤",
+                "hint": "all 召回全部记忆；event_only 仅在已有 atom_types 元数据明确表明为纯偏好/关系时排除，旧记录仍可召回。",
+                "type": "string",
+                "options": [
+                    "all",
+                    "event_only"
+                ],
+                "default": "all"
             }
         }
     },
@@ -241,78 +157,22 @@
             },
             "protected_importance_threshold": {
                 "description": "重要记忆保护阈值",
-                "hint": "重要性达到该值的记忆不参与每日重要性衰减。范围 0-1，默认 1.0 仅保护满分记忆。",
+                "hint": "重要性达到该值的记忆不参与每日衰减。范围 0-1，默认 1.0 仅保护满分记忆。",
                 "type": "float",
                 "default": 1.0
             }
         }
     },
-    "fusion_strategy": {
-        "description": "检索融合策略",
-        "hint": "BM25 和向量检索结果的融合参数（内部使用 RRF 算法）",
-        "type": "object",
-        "items": {
-            "rrf_k": {
-                "description": "RRF 融合参数 k",
-                "hint": "值越小越强调排名靠前的结果，值越大融合越平滑。推荐 30-120，默认 60。",
-                "type": "int",
-                "default": 60
-            }
-        }
-    },
-    "filtering_settings": {
-        "description": "记忆隔离设置",
-        "type": "object",
-        "items": {
-            "use_persona_filtering": {
-                "description": "按人格隔离记忆",
-                "hint": "开启后只召回与当前人格相关的记忆，不同人格的记忆互不干扰。",
-                "type": "bool",
-                "default": true
-            },
-            "use_session_filtering": {
-                "description": "按会话隔离记忆",
-                "hint": "仅在记忆作用域模式为 legacy 时生效。开启后每个会话独立；关闭后不按会话过滤。",
-                "type": "bool",
-                "default": true
-            },
-            "memory_scope_mode": {
-                "description": "记忆作用域模式",
-                "hint": "legacy 保持旧版配置；session 按实际会话隔离；user 让同一平台用户跨私聊和群聊共享；global 全局共享。",
-                "type": "string",
-                "options": ["legacy", "session", "user", "global"],
-                "default": "legacy"
-            },
-            "isolated_sessions": {
-                "description": "强制隔离会话",
-                "hint": "每行填写一个完整会话 ID。这些会话始终使用独立记忆作用域，不受 user、global 或旧版关闭会话过滤设置影响。",
-                "type": "text",
-                "default": ""
-            }
-        }
-    },
     "reflection_engine": {
         "description": "记忆生成设置",
-        "hint": "控制何时触发对话总结并生成记忆",
+        "hint": "控制何时从 CM 历史触发中性事实萃取并生成一条或多条长期记忆",
         "type": "object",
         "items": {
-            "summary_trigger_rounds": {
-                "description": "总结触发轮次",
-                "hint": "累计对话达到该轮次（一问一答为一轮）后触发总结并写入记忆。",
+            "trigger_count": {
+                "description": "触发数量",
+                "hint": "0 = 完全跟随 CM context_takeover.limit_rounds 的数值和有效单位。CM 仅包含 llm_success 时为配对模式，此处表示完整 user/assistant 轮数；CM 包含 no_llm/orphan/proactive/pending 等状态时为混合模式，此处表示过滤后的消息条数。正数 = 覆盖 CM 数值，但单位仍跟随 CM 模式。",
                 "type": "int",
-                "default": 10
-            },
-            "include_source_time_tags": {
-                "description": "写入来源时间标签",
-                "hint": "根据原始消息时间确定性地写入日期范围，并加入检索摘要；不依赖大模型推断时间。",
-                "type": "bool",
-                "default": true
-            },
-            "source_retention_importance_threshold": {
-                "description": "原文保留重要性阈值",
-                "hint": "总结重要性达到该值时，将原始消息独立保存，供详情核验、Agent 深度回溯和重新总结。范围 0-1；设为 1 仅保留满分记忆。",
-                "type": "float",
-                "default": 0.8
+                "default": 0
             }
         }
     },
@@ -432,119 +292,14 @@
             }
         }
     },
-    "migration_settings": {
-        "description": "数据库迁移",
-        "hint": "控制插件启动时的数据库版本升级行为",
+    "maintenance": {
+        "description": "维护任务",
+        "hint": "每日定时执行：重要性衰减 → 自动清理 → 自动备份。备份/清理是否启用由对应天数控制（设为 0 视为关闭该项任务）。",
         "type": "object",
         "items": {
-            "auto_migrate": {
-                "description": "自动迁移",
-                "hint": "插件启动时自动检测并升级旧版本数据库。建议保持开启。",
-                "type": "bool",
-                "default": true
-            },
-            "create_backup": {
-                "description": "迁移前自动备份",
-                "hint": "执行数据库迁移前自动创建备份文件，防止迁移失败导致数据丢失。建议保持开启。",
-                "type": "bool",
-                "default": true
-            }
-        }
-    },
-    "index_rebuild_settings": {
-        "description": "索引重建",
-        "hint": "控制 /lmem rebuild-index 的分批大小、Embedding 请求速率和失败容忍度。低配云服务器建议保持较小并发。",
-        "type": "object",
-        "items": {
-            "batch_size": {
-                "description": "读取批量",
-                "hint": "每批从 documents 表读取的记忆条数。越大内存峰值越高、失败时影响的条数越多，建议 25-100。",
-                "type": "int",
-                "default": 50
-            },
-            "embedding_batch_size": {
-                "description": "Embedding 批量",
-                "hint": "单次 Embedding API 请求包含的文本数量。服务商 TPM 限流严格时继续调小。",
-                "type": "int",
-                "default": 8
-            },
-            "tasks_limit": {
-                "description": "Embedding 并发",
-                "hint": "批量 Embedding 内部并发上限。为避免触发 API 限流，默认 1。",
-                "type": "int",
-                "default": 1
-            },
-            "max_retries": {
-                "description": "批次重试次数",
-                "hint": "单个 Embedding 批次失败后的最大重试次数。",
-                "type": "int",
-                "default": 5
-            },
-            "retry_base_delay": {
-                "description": "重试等待秒数",
-                "hint": "批次失败后的指数退避基础等待时间。遇到 429/TPM 限流时会至少等待 30 秒。",
-                "type": "float",
-                "default": 30.0
-            },
-            "batch_delay": {
-                "description": "读取批次间隔秒数",
-                "hint": "每个 documents 读取批次之间的额外等待时间，用于主动降低整体重建速率。",
-                "type": "float",
-                "default": 5.0
-            },
-            "request_delay": {
-                "description": "Embedding 请求间隔秒数",
-                "hint": "每个 Embedding API 子请求之间的等待时间。频繁触发 429/TPM 时优先增大此项。",
-                "type": "float",
-                "default": 5.0
-            },
-            "max_failure_ratio": {
-                "description": "允许失败比例",
-                "hint": "全量向量重建时，失败比例不超过该值才允许切换新索引。0.02 表示最多允许 2% 失败。",
-                "type": "float",
-                "default": 0.02
-            }
-        }
-    },
-    "backup_settings": {
-        "description": "定期备份",
-        "hint": "每日自动备份记忆数据库，防止数据意外丢失",
-        "type": "object",
-        "items": {
-            "enabled": {
-                "description": "启用每日自动备份",
-                "hint": "每日衰减任务执行后自动备份数据库。建议开启。",
-                "type": "bool",
-                "default": true
-            },
-            "keep_days": {
-                "description": "备份保留天数",
-                "hint": "超过该天数的旧备份文件将被自动删除。默认保留 7 天。",
-                "type": "int",
-                "default": 7
-            }
-        }
-    },
-    "forgetting_agent": {
-        "description": "自动清理设置",
-        "hint": "定期清理时间久远且重要性低的旧记忆，控制记忆库规模",
-        "type": "object",
-        "items": {
-            "auto_cleanup_enabled": {
-                "description": "启用每日自动清理",
-                "hint": "每日重要性衰减后自动清理符合条件的旧记忆。",
-                "type": "bool",
-                "default": true
-            },
-            "auto_archived_enabled": {
-                "description": "自动归档而非删除",
-                "hint": "开启后，自动清理候选会从检索索引移除并保留为 archived 文档，可在 Dashboard 中恢复。",
-                "type": "bool",
-                "default": false
-            },
             "cleanup_days_threshold": {
                 "description": "清理天数阈值（天）",
-                "hint": "记忆创建超过该天数后进入清理候选。需同时满足重要性低于阈值才会被删除。",
+                "hint": "记忆创建超过该天数且重要性低于阈值的旧记忆会被自动删除。设为 0 关闭自动清理。",
                 "type": "int",
                 "default": 30
             },
@@ -553,6 +308,31 @@
                 "hint": "重要性低于该值的旧记忆才会被清理。0.3 表示重要性低于 30% 的记忆。",
                 "type": "float",
                 "default": 0.3
+            },
+            "backup_keep_days": {
+                "description": "备份保留天数",
+                "hint": "每日衰减任务后自动备份数据库，超过该天数的旧备份会被自动删除。设为 0 关闭自动备份。",
+                "type": "int",
+                "default": 7
+            }
+        }
+    },
+    "log": {
+        "description": "日志设置",
+        "hint": "调试日志提级、多 bot 实例区分。与其他 lxfight 系插件一致。",
+        "type": "object",
+        "items": {
+            "debug_to_info": {
+                "description": "调试日志提级（debug → info）",
+                "type": "bool",
+                "default": false,
+                "hint": "启用后，本插件所有 debug 级别日志以 info 级别输出，无需调整 AstrBot 后台日志级别即可查看详细运行信息（recall 检索/反思触发/CM 状态等）。"
+            },
+            "log_with_bot_id": {
+                "description": "日志区分机器人实例",
+                "type": "bool",
+                "default": false,
+                "hint": "启用后，消息事件相关日志的前缀从 [livingmemory_cm:module] 变为 [livingmemory_cm:platform_id]，便于多 Bot 实例环境下定位问题。"
             }
         }
     }

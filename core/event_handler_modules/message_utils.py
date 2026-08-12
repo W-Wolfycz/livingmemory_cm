@@ -9,7 +9,7 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from astrbot.api import logger
+from ...log import logger, tag
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
@@ -163,7 +163,7 @@ class MessageUtils:
                     "type",
                     component.__class__.__name__,
                 )
-                logger.debug(f"跳过未知消息组件: {component_type}")
+                logger.debug(f"{tag('msg')} 跳过未知消息组件: {component_type}")
 
         return " ".join(parts).strip()
 
@@ -183,90 +183,3 @@ class MessageUtils:
             return ""
 
         return raw_message.strip()
-
-    async def enforce_message_limit(self, session_id: str):
-        """执行消息数量上限控制，只删除已被总结的消息"""
-        if not self.conversation_manager:
-            return
-
-        max_messages = self.config_manager.get(
-            "session_manager.max_messages_per_session", 1000
-        )
-        cleanup_batch_size = self.config_manager.get(
-            "session_manager.cleanup_batch_size", 50
-        )
-        try:
-            cleanup_batch_size = int(cleanup_batch_size)
-        except (TypeError, ValueError):
-            cleanup_batch_size = 50
-        cleanup_batch_size = max(1, cleanup_batch_size)
-
-        if (
-            not self.conversation_manager.store
-            or not self.conversation_manager.store.connection
-        ):
-            return
-
-        try:
-            actual_count = await self.conversation_manager.store.get_message_count(
-                session_id
-            )
-
-            if actual_count <= max_messages:
-                return
-
-            # 获取已总结的消息位置
-            last_summarized_index = (
-                await self.conversation_manager.get_session_metadata(
-                    session_id, "last_summarized_index", 0
-                )
-            )
-
-            # 计算需要删除的数量；超过上限时按批量清理，减少每轮只删 1 条的抖动。
-            overflow_count = actual_count - max_messages
-            target_delete = max(overflow_count, cleanup_batch_size)
-
-            # 只能删除已总结的消息，不能删除未总结的
-            safe_to_delete = min(target_delete, last_summarized_index)
-
-            if safe_to_delete <= 0:
-                logger.debug(
-                    f"[{session_id}] 无可删除消息: "
-                    f"溢出={overflow_count}, 批量={cleanup_batch_size}, "
-                    f"目标删除={target_delete}, 已总结={last_summarized_index}"
-                )
-                return
-
-            logger.info(
-                f"[{session_id}] 开始清理已总结消息: "
-                f"总数={actual_count}, 上限={max_messages}, "
-                f"溢出={overflow_count}, 批量={cleanup_batch_size}, "
-                f"目标删除={target_delete}, 已总结={last_summarized_index}, "
-                f"实际删除={safe_to_delete}"
-            )
-
-            actually_deleted = (
-                await self.conversation_manager.store.trim_session_messages(
-                    session_id,
-                    safe_to_delete,
-                )
-            )
-
-            new_actual_count = max(0, actual_count - actually_deleted)
-            new_summarized_index = await self.conversation_manager.get_session_metadata(
-                session_id,
-                "last_summarized_index",
-                max(0, last_summarized_index - actually_deleted),
-            )
-
-            # 清除缓存（使用公共接口）
-            await self.conversation_manager.invalidate_cache(session_id)
-
-            logger.info(
-                f"[{session_id}] 消息清理完成: "
-                f"删除={actually_deleted}条, 剩余={new_actual_count}条, "
-                f"总结索引: {last_summarized_index} -> {new_summarized_index}"
-            )
-
-        except Exception as e:
-            logger.error(f"[{session_id}] 删除旧消息失败: {e}", exc_info=True)

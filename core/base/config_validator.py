@@ -7,36 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from astrbot.api import logger
-
-
-class SessionManagerConfig(BaseModel):
-    """会话管理器配置"""
-
-    max_sessions: int = Field(
-        default=100, ge=1, le=10000, description="最大会话缓存数量"
-    )
-    session_ttl: int = Field(
-        default=3600, ge=60, le=86400, description="会话生存时间（秒）"
-    )
-    context_window_size: int = Field(
-        default=50, ge=1, le=1000, description="上下文窗口大小"
-    )
-    enable_full_group_capture: bool = Field(
-        default=True, description="是否捕获群聊中的所有消息(包括非@Bot的消息)"
-    )
-    max_messages_per_session: int = Field(
-        default=1000,
-        ge=100,
-        le=10000,
-        description="单会话最大消息数量(超出后自动删除旧消息)",
-    )
-    cleanup_batch_size: int = Field(
-        default=50,
-        ge=1,
-        le=1000,
-        description="历史消息超过上限后每次批量删除的旧已总结消息数",
-    )
+from ...log import logger, tag
 
 
 class RecallEngineConfig(BaseModel):
@@ -48,31 +19,6 @@ class RecallEngineConfig(BaseModel):
     max_k: int = Field(
         default=10, ge=1, le=50, description="Agent 主动检索时允许的最大返回数量"
     )
-    importance_weight: float = Field(
-        default=1.0, ge=0.0, le=10.0, description="重要性权重"
-    )
-    min_importance_for_retrieval: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="召回记忆的最低重要性，0 表示不过滤",
-    )
-    min_similarity_for_retrieval: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="召回记忆的最低向量相似度，0 表示不过滤",
-    )
-    recent_memory_count: int = Field(
-        default=2, ge=0, le=20, description="每次召回保留的近期记忆数量"
-    )
-    recent_memory_max_age_hours: int = Field(
-        default=72, ge=0, le=8760, description="近期记忆时间窗口，0 表示不限制"
-    )
-    memory_type_filter: str = Field(
-        default="all", pattern="^(all|event_only)$", description="记忆类型过滤模式"
-    )
-    fallback_to_vector: bool = Field(default=True, description="是否启用向量检索回退")
     injection_method: str = Field(
         default="extra_user_content",
         description=(
@@ -80,55 +26,78 @@ class RecallEngineConfig(BaseModel):
             "extra_user_content(推荐，临时消息追加到用户消息末尾，不影响前缀缓存且不污染对话历史), "
             "user_message_before(用户消息前), "
             "user_message_after(用户消息后), "
-            "fake_tool_call(伪造工具调用), "
-            "fake_tool_call_deepseek_v4(已废弃，自动回退至fake_tool_call), "
-            "system_prompt(已废弃，自动回退至extra_user_content)"
+            "fake_tool_call(伪造工具调用)"
         ),
     )
-    auto_remove_injected: bool = Field(
-        default=True, description="是否自动删除对话历史中已注入的记忆片段"
-    )
-    inject_with_recent_context: bool = Field(
-        default=False,
-        description="启用后使用最近2轮对话作为扩展查询关键词，提升检索精准度",
-    )
-    recent_context_max_age_seconds: int = Field(
-        default=7200,
-        ge=0,
-        le=604800,
-        description="扩展召回查询允许使用的历史消息最大时间间隔，0 表示不限制",
-    )
-    search_cache_enabled: bool = Field(
-        default=True, description="是否启用短期检索结果缓存"
-    )
     search_cache_ttl_seconds: float = Field(
-        default=45.0, ge=0.0, le=600.0, description="检索缓存 TTL 秒数"
+        default=45.0, ge=0.0, le=600.0, description="检索缓存 TTL 秒数（0 关闭缓存）"
     )
     search_cache_max_size: int = Field(
         default=256, ge=0, le=10000, description="检索缓存最大条目数"
     )
-
-
-class FusionStrategyConfig(BaseModel):
-    """结果融合策略配置"""
-
-    rrf_k: int = Field(default=60, ge=1, le=1000, description="RRF参数k")
+    query_context_rounds: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="召回查询用于消歧的当前用户最近完整问答轮数，0 = 仅当前发言",
+    )
+    query_context_max_chars: int = Field(
+        default=800,
+        ge=0,
+        le=4000,
+        description="召回查询中历史问答的字符上限，0 = 不加入历史",
+    )
+    query_context_max_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=31_536_000,
+        description="召回消歧 CM 问答最大年龄，0 表示不限时间",
+    )
+    injection_max_memories: int = Field(
+        default=3, ge=1, le=10, description="去重后最多注入的记忆条数"
+    )
+    injection_max_chars: int = Field(
+        default=3200, ge=500, le=12000, description="单次长期记忆注入字符预算"
+    )
+    min_importance_for_retrieval: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="召回最低重要性，0 表示不过滤",
+    )
+    min_similarity_for_retrieval: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="召回最低向量相似度，0 表示不过滤",
+    )
+    recent_memory_count: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="当前 session/persona 的近期记忆保留槽位，0 表示关闭",
+    )
+    recent_memory_max_age_hours: int = Field(
+        default=72,
+        ge=0,
+        le=8760,
+        description="近期记忆最大时间窗口，0 表示不限时间",
+    )
+    memory_type_filter: str = Field(
+        default="all",
+        pattern="^(all|event_only)$",
+        description="记忆类型过滤：all 或 event_only",
+    )
 
 
 class ReflectionEngineConfig(BaseModel):
     """反思引擎配置"""
 
-    summary_trigger_rounds: int = Field(
-        default=10, ge=1, le=100, description="触发反思的对话轮次"
-    )
-    include_source_time_tags: bool = Field(
-        default=True, description="是否从原始消息时间写入确定性时间标签"
-    )
-    source_retention_importance_threshold: float = Field(
-        default=0.8,
-        ge=0.0,
-        le=1.0,
-        description="保留原始对话的重要性阈值",
+    trigger_count: int = Field(
+        default=0,
+        ge=0,
+        le=2000,
+        description="触发数量（0 = 跟随 CM；CM 配对模式按轮，混合模式按消息条数）",
     )
 
 
@@ -143,40 +112,23 @@ class AgentToolsConfig(BaseModel):
     )
 
 
-class ForgettingAgentConfig(BaseModel):
-    """遗忘代理配置"""
+class MaintenanceConfig(BaseModel):
+    """维护任务配置（每日衰减 → 清理 → 备份）
 
-    auto_cleanup_enabled: bool = Field(
-        default=True, description="是否启用每日自动清理旧记忆"
-    )
-    auto_archived_enabled: bool = Field(
-        default=False, description="自动清理候选是否归档而非删除"
-    )
+    是否启用某项任务由对应天数控制：
+    - cleanup_days_threshold == 0：关闭自动清理
+    - backup_keep_days == 0：关闭自动备份
+    """
+
     cleanup_days_threshold: int = Field(
-        default=30, ge=1, le=3650, description="清理天数阈值"
+        default=30, ge=0, le=3650, description="清理天数阈值（0 关闭）"
     )
     cleanup_importance_threshold: float = Field(
         default=0.3, ge=0.0, le=1.0, description="清理重要性阈值"
     )
-
-
-class FilteringConfig(BaseModel):
-    """过滤配置"""
-
-    use_persona_filtering: bool = Field(default=True, description="是否使用人格过滤")
-    use_session_filtering: bool = Field(default=True, description="是否使用会话过滤")
-    memory_scope_mode: str = Field(
-        default="legacy", pattern="^(legacy|session|user|global)$"
+    backup_keep_days: int = Field(
+        default=7, ge=0, le=365, description="备份保留天数（0 关闭）"
     )
-    isolated_sessions: str = Field(default="", description="强制隔离的会话列表")
-
-
-class AccessControlConfig(BaseModel):
-    """记忆访问控制与身份映射配置。"""
-
-    whitelist_enabled: bool = Field(default=False, description="是否启用记忆白名单")
-    allowed_ids: str = Field(default="", description="允许使用长期记忆的标识列表")
-    identity_aliases: str = Field(default="", description="跨平台用户身份别名")
 
 
 class ProviderConfig(BaseModel):
@@ -209,33 +161,14 @@ class ImportanceDecayConfig(BaseModel):
     )
 
 
-class MigrationSettings(BaseModel):
-    """数据库迁移设置"""
+class LogSettings(BaseModel):
+    """日志设置（debug_to_info + log_with_bot_id）"""
 
-    auto_migrate: bool = Field(default=True, description="是否启用自动迁移")
-    create_backup: bool = Field(default=True, description="迁移前是否创建备份")
-
-
-class IndexRebuildSettings(BaseModel):
-    """索引重建设置"""
-
-    batch_size: int = Field(default=50, ge=1, le=500, description="重建读取批量")
-    embedding_batch_size: int = Field(
-        default=8, ge=1, le=256, description="Embedding 请求批量"
+    debug_to_info: bool = Field(
+        default=False, description="把 debug 日志提级为 info 输出"
     )
-    tasks_limit: int = Field(default=1, ge=1, le=8, description="Embedding 并发上限")
-    max_retries: int = Field(default=5, ge=1, le=8, description="批次最大重试次数")
-    retry_base_delay: float = Field(
-        default=30.0, ge=0.0, le=60.0, description="重试基础等待秒数"
-    )
-    batch_delay: float = Field(
-        default=5.0, ge=0.0, le=10.0, description="读取批次间隔秒数"
-    )
-    request_delay: float = Field(
-        default=5.0, ge=0.0, le=60.0, description="Embedding 请求间隔秒数"
-    )
-    max_failure_ratio: float = Field(
-        default=0.02, ge=0.0, le=1.0, description="允许切换的最大失败比例"
+    log_with_bot_id: bool = Field(
+        default=False, description="日志前缀附加 platform_id 区分多 bot 实例"
     )
 
 
@@ -303,29 +236,20 @@ class GraphMemoryConfig(BaseModel):
 class LivingMemoryConfig(BaseModel):
     """完整插件配置"""
 
-    session_manager: SessionManagerConfig = Field(default_factory=SessionManagerConfig)
     recall_engine: RecallEngineConfig = Field(default_factory=RecallEngineConfig)
     reflection_engine: ReflectionEngineConfig = Field(
         default_factory=ReflectionEngineConfig
     )
     agent_tools: AgentToolsConfig = Field(default_factory=AgentToolsConfig)
-    forgetting_agent: ForgettingAgentConfig = Field(
-        default_factory=ForgettingAgentConfig
-    )
-    access_control: AccessControlConfig = Field(default_factory=AccessControlConfig)
-    filtering_settings: FilteringConfig = Field(default_factory=FilteringConfig)
     provider_settings: ProviderConfig = Field(default_factory=ProviderConfig)
-    migration_settings: MigrationSettings = Field(default_factory=MigrationSettings)
-    index_rebuild_settings: IndexRebuildSettings = Field(
-        default_factory=IndexRebuildSettings
-    )
     graph_memory: GraphMemoryConfig = Field(default_factory=GraphMemoryConfig)
-    fusion_strategy: FusionStrategyConfig = Field(
-        default_factory=FusionStrategyConfig, description="结果融合策略配置"
-    )
     importance_decay: ImportanceDecayConfig = Field(
         default_factory=ImportanceDecayConfig, description="重要性衰减配置"
     )
+    maintenance: MaintenanceConfig = Field(
+        default_factory=MaintenanceConfig, description="维护任务配置（清理 + 备份）"
+    )
+    log: LogSettings = Field(default_factory=LogSettings, description="日志设置")
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容
 
@@ -345,10 +269,10 @@ def validate_config(raw_config: dict[str, Any]) -> LivingMemoryConfig:
     """
     try:
         config = LivingMemoryConfig(**raw_config)
-        logger.info("配置验证成功")
+        logger.info(f"{tag('config')} 配置验证成功")
         return config
     except Exception as e:
-        logger.error(f"配置验证失败: {e}")
+        logger.error(f"{tag('config')} 配置验证失败: {e}")
         raise ValueError(f"插件配置无效: {e}") from e
 
 
@@ -389,47 +313,5 @@ def merge_config_with_defaults(user_config: dict[str, Any]) -> dict[str, Any]:
         return result
 
     merged = deep_merge(default_config, user_config)
-    logger.debug("配置已与默认值合并")
+    logger.debug(f"{tag('config')} 配置已与默认值合并")
     return merged
-
-
-def validate_runtime_config_changes(
-    current_config: LivingMemoryConfig, changes: dict[str, Any]
-) -> bool:
-    """
-    验证运行时配置更改是否有效。
-
-    Args:
-        current_config: 当前配置
-        changes: 要更改的配置项
-
-    Returns:
-        bool: 是否有效
-    """
-    try:
-        # 创建更新后的配置副本进行验证
-        updated_dict = current_config.model_dump()
-
-        def update_nested_dict(target: dict[str, Any], updates: dict[str, Any]):
-            for key, value in updates.items():
-                if "." in key:
-                    # 处理嵌套键，如 "recall_engine.top_k"
-                    parts = key.split(".")
-                    current = target
-                    for part in parts[:-1]:
-                        if part not in current:
-                            current[part] = {}
-                        current = current[part]
-                    current[parts[-1]] = value
-                else:
-                    target[key] = value
-
-        update_nested_dict(updated_dict, changes)
-
-        # 验证更新后的配置
-        LivingMemoryConfig(**updated_dict)
-        return True
-
-    except Exception as e:
-        logger.error(f"运行时配置更改验证失败: {e}")
-        return False

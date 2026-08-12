@@ -1,525 +1,149 @@
-"""
-pytest 配置文件
-提供测试夹具和基础运行环境。
+"""Local unit-test boundary for LivingMemoryCM.
+
+Only the small public ``astrbot.api`` surface imported by the plugin is
+stubbed here.  ``astrbot.core`` is deliberately left untouched: these tests
+do not pretend to provide an AstrBot runtime, lifecycle, provider, platform,
+or browser environment.
 """
 
-import asyncio
+from __future__ import annotations
+
 import logging
 import sys
-import tempfile
-import types
-from collections.abc import Generator
-from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Callable
 
+import astrbot as _astrbot_package
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLUGINS_DIR = Path(__file__).resolve().parents[2]
-ASTRBOT_ROOT = Path(__file__).resolve().parents[4]
 
-for candidate in (PROJECT_ROOT, PLUGINS_DIR, ASTRBOT_ROOT):
-    candidate_str = str(candidate)
-    if candidate_str not in sys.path:
-        sys.path.insert(0, candidate_str)
-
-
-def _ensure_plugin_package_alias() -> None:
-    """将当前源码目录暴露为测试中使用的包名。"""
-    if "astrbot_plugin_livingmemory" in sys.modules:
-        return
-
-    plugin_pkg = types.ModuleType("astrbot_plugin_livingmemory")
-    plugin_pkg.__path__ = [str(PROJECT_ROOT)]
-    plugin_pkg.__file__ = str(PROJECT_ROOT / "__init__.py")
-    sys.modules["astrbot_plugin_livingmemory"] = plugin_pkg
-
-
-def _install_optional_dependency_stubs() -> None:
-    """为单元测试安装轻量的第三方依赖桩。"""
-    try:
-        import aiosqlite  # type: ignore  # noqa: F401
-    except Exception:
-        aiosqlite_mod = types.ModuleType("aiosqlite")
-
-        class Connection:
-            pass
-
-        async def connect(*args, **kwargs):
-            return Connection()
-
-        aiosqlite_mod.Connection = Connection
-        aiosqlite_mod.connect = connect
-        sys.modules["aiosqlite"] = aiosqlite_mod
-
-    try:
-        import jieba  # type: ignore  # noqa: F401
-    except Exception:
-        jieba_mod = types.ModuleType("jieba")
-        jieba_mod.cut = lambda text, cut_all=False: list(text) if text else []
-        jieba_mod.lcut = lambda text, cut_all=False: list(text) if text else []
-        sys.modules["jieba"] = jieba_mod
-
-    try:
-        import pytz  # type: ignore  # noqa: F401
-    except Exception:
-        pytz_mod = types.ModuleType("pytz")
-        pytz_mod.timezone = lambda name: None
-        sys.modules["pytz"] = pytz_mod
-
-
-def _install_astrbot_stubs() -> None:
-    """安装满足当前单元测试所需的最小 AstrBot 桩模块。"""
-    logger = logging.getLogger("astrbot-test")
-    logger.addHandler(logging.NullHandler())
-
-    class _StorageProxy:
-        async def get_async(self, *args, **kwargs):
-            return None
-
-    class _Filter:
-        def on_llm_request(self):
-            return lambda func: func
-
-        def on_llm_response(self):
-            return lambda func: func
-
-        def after_message_sent(self):
-            return lambda func: func
-
-        def platform_adapter_type(self, *args, **kwargs):
-            return lambda func: func
-
-        def custom_filter(self, *args, **kwargs):
-            return lambda func: func
-
-        def command_group(self, *args, **kwargs):
-            class _CommandGroup:
-                def __call__(self, func):
-                    return self
-
-                def command(self, *cmd_args, **cmd_kwargs):
-                    return lambda func: func
-
-            return _CommandGroup()
+def _identity_decorator(function: Callable[..., Any]) -> Callable[..., Any]:
+    return function
 
-    class AstrMessageEvent:
-        pass
 
-    class MessageEventResult:
-        pass
+def _decorator(*_args: Any, **_kwargs: Any):
+    return _identity_decorator
 
-    class MessageType(Enum):
-        FRIEND_MESSAGE = "friend"
-        GROUP_MESSAGE = "group"
 
-    @dataclass
-    class ProviderRequest:
-        prompt: str | None = None
-        session_id: str | None = ""
-        image_urls: list = field(default_factory=list)
-        audio_urls: list = field(default_factory=list)
-        extra_user_content_parts: list = field(default_factory=list)
-        func_tool: object | None = None
-        contexts: list = field(default_factory=list)
-        system_prompt: str = ""
-        conversation: object | None = None
-        tool_calls_result: list | None = None
-        model: str | None = None
+def _command_group(*_args: Any, **_kwargs: Any):
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        function.command = _decorator  # type: ignore[attr-defined]
+        return function
 
-    @dataclass
-    class LLMResponse:
-        role: str = "assistant"
-        result_chain: object | None = None
-        tools_call_args: list = field(default_factory=list)
-        tools_call_name: list | None = None
-        tools_call_ids: list = field(default_factory=list)
-        tools_call_extra_content: dict | None = None
-        completion_text: str = ""
+    return decorate
 
-    class Context:
-        pass
 
-    class Star:
-        pass
+class _PermissionType(Enum):
+    ADMIN = "admin"
+    MEMBER = "member"
 
-    class StarTools:
-        pass
 
-    class FunctionTool:
-        @classmethod
-        def __class_getitem__(cls, item):
-            return cls
+class _MessageType(Enum):
+    FRIEND_MESSAGE = "friend"
+    GROUP_MESSAGE = "group"
 
-    class ToolSet:
-        pass
 
-    ToolExecResult = str
+class _AstrMessageEvent:
+    """Type marker only; tests provide their own event fakes."""
 
-    class BaseFunctionToolExecutor:
-        pass
 
-    class ContextWrapper:
-        @classmethod
-        def __class_getitem__(cls, item):
-            return cls
+class _AstrBotMessage:
+    """Type marker required by AstrBot's StarTools annotations."""
 
-    class TextPart:
-        def __init__(self, text=""):
-            self.text = text
-            self._no_save = False
 
-        def mark_as_temp(self):
-            self._no_save = True
-            return self
+class _MessageMember:
+    """Type marker required by AstrBot's StarTools annotations."""
 
-        def model_dump_for_context(self):
-            return {"type": "text", "text": self.text}
 
-    class AstrAgentContext:
-        pass
+class _MessageEventResult:
+    """Type marker only; tests assert domain output, not AstrBot rendering."""
 
-    class AstrBotConfig:
-        pass
 
-    class CustomFilter:
-        def __init__(self, raise_error: bool = True, **kwargs):
-            self.raise_error = raise_error
+class _ProviderRequest:
+    """Type marker only; tests pass explicit lightweight request objects."""
 
-        def filter(self, event, cfg):
-            return True
 
-    class EmbeddingProvider:
-        pass
+class _Context:
+    """Minimal type marker used by annotations and ``isinstance`` guards."""
 
-    class Provider:
-        pass
 
-    class SQLiteDatabase:
-        pass
+class _Star:
+    def __init__(self, context: _Context | None = None) -> None:
+        self.context = context
 
-    class FaissVecDB:
-        pass
 
-    class _BaseComponent:
-        type = "component"
+class _StarTools:
+    @staticmethod
+    def get_data_dir(plugin_name: str) -> Path:
+        return Path.cwd() / ".astrbot-test-data" / plugin_name
 
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
 
-    class Plain(_BaseComponent):
-        type = "plain"
+def _install_astrbot_api_stub() -> None:
+    api = ModuleType("astrbot.api")
+    api.__path__ = []  # type: ignore[attr-defined]
+    api.logger = logging.getLogger("livingmemory_cm.tests")
+    # Some imported AstrBot core type modules reference the public shared-
+    # preferences handle at module scope.  Domain tests never call it.
+    api.sp = object()
 
-        def __init__(self, text=""):
-            super().__init__(text=text)
+    event = ModuleType("astrbot.api.event")
+    event.__path__ = []  # type: ignore[attr-defined]
+    event.AstrMessageEvent = _AstrMessageEvent
+    event.MessageEventResult = _MessageEventResult
 
-    class Image(_BaseComponent):
-        type = "image"
+    event_filter = ModuleType("astrbot.api.event.filter")
+    event_filter.PermissionType = _PermissionType
+    event_filter.permission_type = _decorator
+    event_filter.on_llm_request = _decorator
+    event_filter.on_decorating_result = _decorator
+    event_filter.after_message_sent = _decorator
+    event_filter.command_group = _command_group
+    event.filter = event_filter
 
-    class Record(_BaseComponent):
-        type = "record"
+    provider = ModuleType("astrbot.api.provider")
+    provider.ProviderRequest = _ProviderRequest
 
-    class Video(_BaseComponent):
-        type = "video"
+    platform = ModuleType("astrbot.api.platform")
+    platform.AstrBotMessage = _AstrBotMessage
+    platform.MessageMember = _MessageMember
+    platform.MessageType = _MessageType
 
-    class File(_BaseComponent):
-        type = "file"
+    star = ModuleType("astrbot.api.star")
+    star.Context = _Context
+    star.Star = _Star
+    star.StarTools = _StarTools
+    star.register = _decorator
 
-        def __init__(self, name=""):
-            super().__init__(name=name)
-
-    class Face(_BaseComponent):
-        type = "face"
-
-        def __init__(self, id=""):
-            super().__init__(id=id)
-
-    class At(_BaseComponent):
-        type = "at"
-
-        def __init__(self, qq=""):
-            super().__init__(qq=qq)
-
-    class AtAll(At):
-        type = "atall"
-
-    class Forward(_BaseComponent):
-        type = "forward"
-
-    class Reply(_BaseComponent):
-        type = "reply"
-
-        def __init__(self, message_str=""):
-            super().__init__(message_str=message_str)
-
-    def register(*args, **kwargs):
-        return lambda obj: obj
-
-    def register_agent(*args, **kwargs):
-        return lambda obj: obj
-
-    def register_llm_tool(*args, **kwargs):
-        return lambda obj: obj
-
-    class PermissionType(Enum):
-        ADMIN = "admin"
-
-    class PlatformAdapterType(Enum):
-        ALL = "all"
-
-    def permission_type(*args, **kwargs):
-        return lambda func: func
-
-    def _package(name: str) -> types.ModuleType:
-        module = types.ModuleType(name)
-        module.__path__ = []
-        return module
-
-    astrbot_mod = _package("astrbot")
-    astrbot_mod.logger = logger
-
-    api_mod = _package("astrbot.api")
-    api_mod.logger = logger
-    api_mod.sp = _StorageProxy()
-
-    event_mod = _package("astrbot.api.event")
-    event_mod.AstrMessageEvent = AstrMessageEvent
-    event_mod.MessageEventResult = MessageEventResult
-    event_mod.filter = _Filter()
-    event_mod.filter.PlatformAdapterType = PlatformAdapterType
-
-    event_filter_mod = types.ModuleType("astrbot.api.event.filter")
-    event_filter_mod.CustomFilter = CustomFilter
-    event_filter_mod.PlatformAdapterType = PlatformAdapterType
-    event_filter_mod.PermissionType = PermissionType
-    event_filter_mod.permission_type = permission_type
-
-    platform_mod = types.ModuleType("astrbot.api.platform")
-    platform_mod.MessageType = MessageType
-
-    provider_mod = types.ModuleType("astrbot.api.provider")
-    provider_mod.ProviderRequest = ProviderRequest
-    provider_mod.LLMResponse = LLMResponse
-
-    star_mod = types.ModuleType("astrbot.api.star")
-    star_mod.Context = Context
-    star_mod.Star = Star
-    star_mod.StarTools = StarTools
-    star_mod.register = register
-
-    core_mod = _package("astrbot.core")
-    core_mod.sp = api_mod.sp
-    core_mod.html_renderer = None
-
-    core_db_mod = _package("astrbot.core.db")
-    core_vec_db_mod = _package("astrbot.core.db.vec_db")
-    core_faiss_pkg_mod = _package("astrbot.core.db.vec_db.faiss_impl")
-    core_faiss_vec_mod = types.ModuleType("astrbot.core.db.vec_db.faiss_impl.vec_db")
-    core_faiss_vec_mod.FaissVecDB = FaissVecDB
-
-    core_agent_mod = _package("astrbot.core.agent")
-    core_agent_message_mod = types.ModuleType("astrbot.core.agent.message")
-    core_agent_message_mod.TextPart = TextPart
-    core_agent_tool_mod = types.ModuleType("astrbot.core.agent.tool")
-    core_agent_tool_mod.FunctionTool = FunctionTool
-    core_agent_tool_mod.ToolSet = ToolSet
-    core_agent_tool_mod.ToolExecResult = ToolExecResult
-
-    core_agent_executor_mod = types.ModuleType("astrbot.core.agent.tool_executor")
-    core_agent_executor_mod.BaseFunctionToolExecutor = BaseFunctionToolExecutor
-
-    core_agent_run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
-    core_agent_run_context_mod.ContextWrapper = ContextWrapper
-
-    core_astr_agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
-    core_astr_agent_context_mod.AstrAgentContext = AstrAgentContext
-
-    core_config_mod = _package("astrbot.core.config")
-    core_config_astrbot_mod = types.ModuleType("astrbot.core.config.astrbot_config")
-    core_config_astrbot_mod.AstrBotConfig = AstrBotConfig
-
-    core_star_mod = _package("astrbot.core.star")
-    core_star_register_mod = types.ModuleType("astrbot.core.star.register")
-    core_star_register_mod.register_agent = register_agent
-    core_star_register_mod.register_llm_tool = register_llm_tool
-
-    core_provider_mod = _package("astrbot.core.provider")
-    core_provider_provider_mod = types.ModuleType("astrbot.core.provider.provider")
-    core_provider_provider_mod.EmbeddingProvider = EmbeddingProvider
-    core_provider_provider_mod.Provider = Provider
-
-    core_sqlite_mod = types.ModuleType("astrbot.core.db.sqlite")
-    core_sqlite_mod.SQLiteDatabase = SQLiteDatabase
-
-    core_message_mod = _package("astrbot.core.message")
-    core_message_components_mod = types.ModuleType("astrbot.core.message.components")
-    core_message_components_mod.Plain = Plain
-    core_message_components_mod.Image = Image
-    core_message_components_mod.Record = Record
-    core_message_components_mod.Video = Video
-    core_message_components_mod.File = File
-    core_message_components_mod.Face = Face
-    core_message_components_mod.At = At
-    core_message_components_mod.AtAll = AtAll
-    core_message_components_mod.Forward = Forward
-    core_message_components_mod.Reply = Reply
+    api.event = event
+    api.provider = provider
+    api.platform = platform
+    api.star = star
 
     sys.modules.update(
         {
-            "astrbot": astrbot_mod,
-            "astrbot.api": api_mod,
-            "astrbot.api.event": event_mod,
-            "astrbot.api.event.filter": event_filter_mod,
-            "astrbot.api.platform": platform_mod,
-            "astrbot.api.provider": provider_mod,
-            "astrbot.api.star": star_mod,
-            "astrbot.core": core_mod,
-            "astrbot.core.db": core_db_mod,
-            "astrbot.core.db.sqlite": core_sqlite_mod,
-            "astrbot.core.db.vec_db": core_vec_db_mod,
-            "astrbot.core.db.vec_db.faiss_impl": core_faiss_pkg_mod,
-            "astrbot.core.db.vec_db.faiss_impl.vec_db": core_faiss_vec_mod,
-            "astrbot.core.agent": core_agent_mod,
-            "astrbot.core.agent.message": core_agent_message_mod,
-            "astrbot.core.agent.tool": core_agent_tool_mod,
-            "astrbot.core.agent.tool_executor": core_agent_executor_mod,
-            "astrbot.core.agent.run_context": core_agent_run_context_mod,
-            "astrbot.core.astr_agent_context": core_astr_agent_context_mod,
-            "astrbot.core.config": core_config_mod,
-            "astrbot.core.config.astrbot_config": core_config_astrbot_mod,
-            "astrbot.core.star": core_star_mod,
-            "astrbot.core.star.register": core_star_register_mod,
-            "astrbot.core.provider": core_provider_mod,
-            "astrbot.core.provider.provider": core_provider_provider_mod,
-            "astrbot.core.message": core_message_mod,
-            "astrbot.core.message.components": core_message_components_mod,
+            "astrbot.api": api,
+            "astrbot.api.event": event,
+            "astrbot.api.event.filter": event_filter,
+            "astrbot.api.provider": provider,
+            "astrbot.api.platform": platform,
+            "astrbot.api.star": star,
         }
     )
-
-    astrbot_mod.api = api_mod
-    astrbot_mod.core = core_mod
-    api_mod.event = event_mod
-    api_mod.platform = platform_mod
-    api_mod.provider = provider_mod
-    api_mod.star = star_mod
-    api_mod.FunctionTool = FunctionTool
-    api_mod.ToolSet = ToolSet
-    api_mod.BaseFunctionToolExecutor = BaseFunctionToolExecutor
-    api_mod.AstrBotConfig = AstrBotConfig
-    api_mod.agent = register_agent
-    api_mod.llm_tool = register_llm_tool
-
-    core_mod.db = core_db_mod
-    core_mod.agent = core_agent_mod
-    core_mod.config = core_config_mod
-    core_mod.star = core_star_mod
-    core_mod.provider = core_provider_mod
-    core_mod.message = core_message_mod
-    core_db_mod.sqlite = core_sqlite_mod
-    core_db_mod.vec_db = core_vec_db_mod
-    core_vec_db_mod.faiss_impl = core_faiss_pkg_mod
-    core_faiss_pkg_mod.vec_db = core_faiss_vec_mod
-    core_agent_mod.message = core_agent_message_mod
-    core_agent_mod.tool = core_agent_tool_mod
-    core_agent_mod.tool_executor = core_agent_executor_mod
-    core_agent_mod.run_context = core_agent_run_context_mod
-    core_config_mod.astrbot_config = core_config_astrbot_mod
-    core_star_mod.register = core_star_register_mod
-    core_provider_mod.provider = core_provider_provider_mod
-    core_message_mod.components = core_message_components_mod
+    _astrbot_package.api = api
 
 
-_ensure_plugin_package_alias()
-_install_optional_dependency_stubs()
-
-try:
-    import astrbot.api  # type: ignore  # noqa: F401
-    from astrbot.core.db.vec_db.faiss_impl.vec_db import (  # type: ignore  # noqa: F401
-        FaissVecDB,
-    )
-except Exception:
-    _install_astrbot_stubs()
+_install_astrbot_api_stub()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _init_i18n() -> None:
-    """确保测试运行前 i18n 翻译已加载。"""
-    from astrbot_plugin_livingmemory.core.i18n_backend import init as i18n_init
-
-    i18n_init("zh")
-
-
-@pytest.fixture(scope="session")
-def event_loop() -> Generator:
-    """创建事件循环"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture
-def temp_dir() -> Generator[Path, None, None]:
-    """创建临时目录"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir)
-
-
-@pytest.fixture
-def test_db_path(temp_dir: Path) -> str:
-    """创建测试数据库路径"""
-    return str(temp_dir / "test_livingmemory.db")
-
-
-@pytest.fixture
-def test_index_path(temp_dir: Path) -> str:
-    """创建测试索引路径"""
-    return str(temp_dir / "test_livingmemory.index")
-
-
-@pytest.fixture
-def test_config() -> dict:
-    """创建测试配置"""
-    return {
-        "rrf_k": 60,
-        "decay_rate": 0.01,
-        "importance_weight": 1.0,
-        "fallback_enabled": True,
-        "cleanup_days_threshold": 30,
-        "cleanup_importance_threshold": 0.3,
-    }
-
-
-@pytest.fixture
-def mock_event():
-    """Create a minimal mock event compatible with command/event handlers."""
-
-    class _Event:
-        unified_msg_origin = "test:private:session-1"
-
-        def plain_result(self, message):
-            return message
-
-        def get_message_type(self):
-            return None
-
-        def get_sender_id(self):
-            return "user-1"
-
-        def get_self_id(self):
-            return "bot-1"
-
-        def get_sender_name(self):
-            return "Tester"
-
-        def get_message_str(self):
-            return "hello"
-
-        def get_messages(self):
-            return []
-
-        def get_platform_name(self):
-            return "test"
-
-    return _Event()
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    integration_items = [
+        item.nodeid for item in items if item.get_closest_marker("integration")
+    ]
+    if integration_items:
+        formatted = "\n".join(f"- {nodeid}" for nodeid in integration_items)
+        raise pytest.UsageError(
+            "本地 tests/ 不接收 AstrBot 集成测试；请移交远端部署验收：\n"
+            f"{formatted}"
+        )

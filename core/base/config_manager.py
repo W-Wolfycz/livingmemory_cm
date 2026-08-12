@@ -5,7 +5,7 @@
 
 from typing import Any
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 from .config_validator import (
     get_default_config,
@@ -39,7 +39,7 @@ class ConfigManager:
             self._config_obj = validate_config(merged_config)
             self._config = self._config_obj.model_dump()
         except Exception:
-            logger.warning("配置验证失败，已降级为默认配置", exc_info=True)
+            logger.warning(f"{tag('config')} 配置验证失败，已降级为默认配置", exc_info=True)
             # 配置验证失败，使用默认配置
             try:
                 self._config = get_default_config()
@@ -93,11 +93,6 @@ class ConfigManager:
         return self.get_section("provider_settings")
 
     @property
-    def session_manager(self) -> dict[str, Any]:
-        """会话管理器配置"""
-        return self.get_section("session_manager")
-
-    @property
     def recall_engine(self) -> dict[str, Any]:
         """召回引擎配置"""
         return self.get_section("recall_engine")
@@ -106,11 +101,6 @@ class ConfigManager:
     def reflection_engine(self) -> dict[str, Any]:
         """反思引擎配置"""
         return self.get_section("reflection_engine")
-
-    @property
-    def filtering_settings(self) -> dict[str, Any]:
-        """过滤设置"""
-        return self.get_section("filtering_settings")
 
     @property
     def graph_memory(self) -> dict[str, Any]:

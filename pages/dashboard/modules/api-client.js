@@ -125,12 +125,23 @@ export class ApiClient {
   }
 
   /**
+   * Persona 列表端点本身不能带 persona_id，否则选项会被当前筛选收窄。
+   */
+  _isPersonasEndpoint(path) {
+    const cleanPath = String(path).replace(/^\/+|\?.*$/g, "");
+    return cleanPath === "personas" || cleanPath.endsWith("/personas");
+  }
+
+  /**
    * GET 请求
    * @param {string} path - API 路径
    * @param {Object} params - Query 参数
    * @returns {Promise<any>} 响应数据
    */
   async get(path, params = {}) {
+    if (window.lmPersonaId && !this._isPersonasEndpoint(path)) {
+      params = { ...params, persona_id: window.lmPersonaId };
+    }
     const qs = new URLSearchParams(params).toString();
     const fullPath = qs ? `${path}?${qs}` : path;
     return this.unwrapResponse(await this.request(fullPath, { method: "GET" }));
@@ -143,6 +154,9 @@ export class ApiClient {
    * @returns {Promise<any>} 响应数据
    */
   async post(path, body = {}, options = {}) {
+    if (window.lmPersonaId && !this._isPersonasEndpoint(path)) {
+      body = { ...body, persona_id: window.lmPersonaId };
+    }
     return this.unwrapResponse(await this.request(path, {
       method: "POST",
       body,

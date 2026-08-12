@@ -237,7 +237,7 @@ class TextProcessor:
         """
         self.stopwords.update(words)
 
-    def remove_stopwords_from_list(self, words: list[str]):
+    def remove_stopwords(self, words: list[str]):
         """
         从停用词表中移除指定词
 
@@ -382,60 +382,6 @@ class TextProcessor:
 
         flush_buffer()
         return tokens
-
-    def is_stopword(self, word: str) -> bool:
-        """
-        检查词是否为停用词
-
-        Args:
-            word: 待检查的词
-
-        Returns:
-            是否为停用词
-        """
-        return word in self.stopwords
-
-    def filter_stopwords(self, tokens: list[str]) -> list[str]:
-        """
-        从分词列表中过滤停用词
-
-        Args:
-            tokens: 分词列表
-
-        Returns:
-            过滤后的分词列表
-        """
-        return [token for token in tokens if token not in self.stopwords]
-
-    def preprocess_for_bm25(self, text: str) -> str:
-        """
-        为 BM25 索引预处理文本
-
-        返回空格分隔的 token 字符串,可直接用于 FTS5 索引
-
-        Args:
-            text: 原始文本
-
-        Returns:
-            预处理后的文本 (空格分隔的tokens)
-
-        Examples:
-            >>> processor = TextProcessor()
-            >>> processor.preprocess_for_bm25("我今天去图书馆")
-            "今天 图书馆"
-        """
-        tokens = self.tokenize(text, remove_stopwords=True)
-        return " ".join(tokens)
-
-    @property
-    def stopwords_count(self) -> int:
-        """获取停用词数量"""
-        return len(self.stopwords)
-
-    @property
-    def custom_words_count(self) -> int:
-        """获取自定义词汇数量"""
-        return len(self.custom_words)
 
 
 # 便捷函数

@@ -9,7 +9,6 @@ import {
   MemoryPage,
   RecallPage,
   SystemPage,
-  PromptPage,
   esc,
   statusPill,
   nodeBadge,
@@ -53,7 +52,6 @@ import {
   const memoryPage = new MemoryPage(state, api, peekPanel);
   const recallPage = new RecallPage(state, api, peekPanel);
   const systemPage = new SystemPage(state, api);
-  const promptPage = new PromptPage(state, api);
 
   function hydrateIcons() {
     if (!window.lucide || typeof window.lucide.createIcons !== "function") return;
@@ -163,19 +161,6 @@ import {
     if (name === "memory") memoryPage.fetch();
     if (name === "recall") { /* 召回页面按需加载 */ }
     if (name === "system") systemPage.fetch();
-    if (name === "prompts") promptPage.fetch();
-  }
-
-  function normalizeLocale(locale) {
-    const lang = String(locale || "").split("-")[0];
-    return ["zh", "en", "ru"].includes(lang) ? lang : "zh";
-  }
-
-  function getCurrentLanguage() {
-    if (typeof window.getLanguage === "function") {
-      return window.getLanguage();
-    }
-    return normalizeLocale(api.bridge?.getLocale?.());
   }
 
   function initSidebar() {
@@ -187,77 +172,63 @@ import {
 
     document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 
-    const langMenu = document.getElementById("lang-menu");
-    document.querySelectorAll(".lang-option[data-lang]").forEach(option => {
-      option.addEventListener("click", () => {
-        const lang = option.dataset.lang;
-        if (!lang) return;
-
-        if (typeof window.setLanguage === "function") {
-          window.setLanguage(lang, { persist: true, source: "user" });
-        } else {
-          try {
-            localStorage.setItem("lmem_lang", lang);
-          } catch (e) {
-            console.warn("[LM] Failed to save language to localStorage:", e);
-          }
-        }
-
-        if (langMenu) {
-          langMenu.removeAttribute("open");
-        }
-        if (typeof window.setLanguage !== "function") {
-          refreshDynamicI18n();
-        }
-        showToast(window.t("language.toast", option.textContent.trim()));
-      });
-    });
-
-    if (langMenu) {
-      langMenu.addEventListener("toggle", (e) => {
-        if (e.newState === "open") {
-          updateLanguageMenu();
-        }
-      });
-    }
   }
 
-  function updateLanguageMenu() {
-    const currentLang = getCurrentLanguage();
+  /* ================================================================
+     Persona Selector (CM compatibility)
+     ================================================================ */
+  function initPersonaSelector() {
+    const select = document.getElementById("persona-selector");
+    if (!select) return;
 
-    document.querySelectorAll(".lang-option[data-lang]").forEach(option => {
-      const active = option.dataset.lang === currentLang;
-      option.classList.toggle("active", active);
-      option.setAttribute("aria-current", active ? "true" : "false");
-    });
-  }
-
-  function refreshDynamicI18n() {
-    updateLanguageMenu();
-
-    if (state.page === "memory") {
-      memoryPage.renderVirtual();
-      memoryPage.updatePagination();
-    }
-    if (state.page === "recall" && state._recallCache) {
-      recallPage.renderResults(state._recallCache.data, state._recallCache.elapsed);
-    }
-    if (state.page === "system" && state._systemCache) {
-      systemPage.render(state._systemCache.data);
-    }
-    if (state.page === "prompts" && promptPage.prompts.length) {
-      promptPage.render();
-      promptPage.refreshEditorTitle();
+    try {
+      const saved = localStorage.getItem("lmem_persona_id");
+      if (saved) window.lmPersonaId = saved;
+    } catch (e) {
+      console.warn("[LM] Failed to read persona from localStorage:", e);
     }
 
-    const peekPanelEl = document.getElementById("peek-panel");
-    const peekVisible = peekPanelEl && peekPanelEl.classList.contains("visible");
-    if (peekVisible && !state.isEditing) {
-      if (state._detailCache) {
-        peekPanel.renderDetailView(state._detailCache);
-      } else if (state._nodeDetailCache) {
-        peekPanel.renderNode(state._nodeDetailCache);
+    api.get("personas").then(data => {
+      const items = data.items || [];
+      const current = window.lmPersonaId || "";
+      select.querySelectorAll("option:not([value=''])").forEach(option => option.remove());
+      items.forEach(id => {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = id;
+        select.appendChild(option);
+      });
+      select.value = current;
+    }).catch(error => console.warn("[LM] Failed to load personas:", error));
+
+    select.addEventListener("change", () => {
+      const personaId = select.value;
+      window.lmPersonaId = personaId;
+      try {
+        localStorage.setItem("lmem_persona_id", personaId);
+      } catch (e) {
+        console.warn("[LM] Failed to save persona to localStorage:", e);
       }
+      window.dispatchEvent(new CustomEvent("personachange", { detail: { personaId } }));
+    });
+  }
+
+  function onPersonaChange() {
+    state._systemCache = null;
+    state._recallCache = null;
+    state._detailCache = null;
+    state._nodeDetailCache = null;
+
+    if (state.page === "graph") {
+      fetchGraphStats();
+      if (window.refreshGraphForPersona) window.refreshGraphForPersona();
+    } else if (state.page === "memory") {
+      memoryPage.fetch();
+    } else if (state.page === "recall") {
+      const query = document.getElementById("recall-query");
+      if (query && query.value.trim()) recallPage.runRecall();
+    } else if (state.page === "system") {
+      systemPage.fetch();
     }
   }
 
@@ -298,9 +269,6 @@ import {
           }
         }
 
-        if (ctx && ctx.locale) {
-          updateLanguageMenu();
-        }
       });
     }
 
@@ -308,6 +276,7 @@ import {
     applyTheme(initialTheme);
 
     initSidebar();
+    initPersonaSelector();
 
     memoryPage.initEventListeners();
     recallPage.initEventListeners();
@@ -320,7 +289,7 @@ import {
         peekPanel.close();
       }
     });
-    window.addEventListener("languagechange", refreshDynamicI18n);
+    window.addEventListener("personachange", onPersonaChange);
 
     fetchGraphStats();
     switchPage("graph");

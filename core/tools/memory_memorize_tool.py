@@ -7,13 +7,12 @@ from typing import Any
 
 from pydantic.dataclasses import dataclass
 
-from astrbot.api import logger
+from ...log import logger, tag
 from astrbot.api.platform import MessageType
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
-from ..memory_scope import is_event_memory_allowed, resolve_memory_scope
 from ..utils import get_persona_id
 
 
@@ -37,7 +36,6 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
     __pydantic_config__ = {"arbitrary_types_allowed": True}
 
     context: Any = None
-    config_manager: Any = None
     memory_engine: Any = None
     memory_processor: Any = None
 
@@ -120,14 +118,7 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
 
         try:
             event = context.context.event
-            if not is_event_memory_allowed(self.config_manager, event):
-                return _json_result(
-                    {"memorized": False, "error": "memory access is not allowed"}
-                )
             session_id = event.unified_msg_origin
-            memory_scope = (
-                resolve_memory_scope(self.config_manager, event) or session_id
-            )
             persona_id = await get_persona_id(self.context, event)
             is_group_chat = event.get_message_type() == MessageType.GROUP_MESSAGE
 
@@ -152,14 +143,13 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
                 "tool_name": self.name,
             }
             metadata["memory_origin"] = "agent_memorize_tool"
-            metadata["source_session_id"] = session_id
             cleaned_reason = (reason or "").strip()
             if cleaned_reason:
                 metadata["memorize_reason"] = cleaned_reason
 
             memory_id = await self.memory_engine.add_memory(
                 content=content,
-                session_id=memory_scope,
+                session_id=session_id,
                 persona_id=persona_id,
                 importance=normalized_importance,
                 metadata=metadata,
@@ -171,12 +161,12 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
                     "id": memory_id,
                     "content": content,
                     "importance": normalized_importance,
-                    "session_id": memory_scope,
+                    "session_id": session_id,
                     "persona_id": persona_id,
                 }
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"记忆工具写入失败: {e}", exc_info=True)
+            logger.error(f"{tag('tool')} 记忆工具写入失败: {e}", exc_info=True)
             return _json_result({"memorized": False, "error": "internal_error"})

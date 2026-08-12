@@ -5,8 +5,14 @@ Tests for CommandHandler.
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
-from astrbot_plugin_livingmemory.core.command_handler import CommandHandler
+from livingmemory_cm.core.base.config_manager import ConfigManager
+from livingmemory_cm.core.command_handler import CommandHandler
+from livingmemory_cm.core.i18n_backend import init as init_i18n
+
+
+@pytest.fixture(autouse=True)
+def initialize_i18n():
+    init_i18n()
 
 
 @pytest.fixture
@@ -39,33 +45,21 @@ def conversation_manager():
 
 
 @pytest.fixture
-def index_validator():
-    validator = Mock()
-    validator.check_consistency = AsyncMock(
-        return_value=Mock(
-            is_consistent=True,
-            needs_rebuild=False,
-            reason="ok",
-            documents_count=2,
-            bm25_count=2,
-            vector_count=2,
-        )
-    )
-    validator.rebuild_indexes = AsyncMock(
-        return_value={"success": True, "processed": 2, "errors": 0, "total": 2}
-    )
-    return validator
+def mock_event():
+    event = Mock()
+    event.unified_msg_origin = "platform:private:10001"
+    event.plain_result = Mock(side_effect=lambda message: message)
+    return event
 
 
 @pytest.fixture
-def handler(config_manager, memory_engine, conversation_manager, index_validator):
+def handler(config_manager, memory_engine, conversation_manager):
     context = Mock()
     return CommandHandler(
         context=context,
         config_manager=config_manager,
         memory_engine=memory_engine,
         conversation_manager=conversation_manager,
-        index_validator=index_validator,
         initialization_status_callback=lambda: "ready",
     )
 
@@ -79,6 +73,32 @@ async def test_handle_status_returns_report(handler, mock_event):
 
 
 @pytest.mark.asyncio
+async def test_handle_status_reports_legacy_graph_migration(
+    handler, mock_event, memory_engine
+):
+    memory_engine.get_statistics = AsyncMock(
+        return_value={
+            "total_memories": 2,
+            "sessions": {"s1": 2},
+            "newest_memory": 1_700_000_000.0,
+            "graph_index": {
+                "state": "rebuild_required",
+                "total_vectors": 9,
+                "memory_vectors": 2,
+                "legacy_vectors": 7,
+                "orphan_vectors": 0,
+            },
+        }
+    )
+
+    messages = [msg async for msg in handler.handle_status(mock_event)]
+
+    assert "需要迁移" in messages[0]
+    assert "旧 entry 级向量: 7" in messages[0]
+    assert "/lmem rebuild-graph" in messages[0]
+
+
+@pytest.mark.asyncio
 async def test_handle_status_without_engine_returns_actionable_message(
     config_manager, mock_event
 ):
@@ -87,7 +107,6 @@ async def test_handle_status_without_engine_returns_actionable_message(
         config_manager=config_manager,
         memory_engine=None,
         conversation_manager=None,
-        index_validator=None,
     )
 
     messages = [msg async for msg in handler.handle_status(mock_event)]
@@ -143,51 +162,6 @@ async def test_handle_forget_success_and_not_found(handler, mock_event, memory_e
 
 
 @pytest.mark.asyncio
-async def test_handle_rebuild_index_branches(handler, mock_event, index_validator):
-    # no rebuild needed
-    msgs = [msg async for msg in handler.handle_rebuild_index(mock_event)]
-    assert any("索引状态正常" in msg for msg in msgs)
-
-    # rebuild needed
-    index_validator.check_consistency = AsyncMock(
-        return_value=Mock(
-            is_consistent=False,
-            needs_rebuild=True,
-            reason="inconsistent",
-            documents_count=3,
-            bm25_count=2,
-            vector_count=1,
-        )
-    )
-    msgs2 = [msg async for msg in handler.handle_rebuild_index(mock_event)]
-    assert any("开始重建索引" in msg for msg in msgs2)
-    assert index_validator.rebuild_indexes.await_count >= 1
-
-
-@pytest.mark.asyncio
-async def test_handle_rebuild_index_failed_result_contains_retry_hint(
-    handler, mock_event, index_validator
-):
-    index_validator.check_consistency = AsyncMock(
-        return_value=Mock(
-            is_consistent=False,
-            needs_rebuild=True,
-            reason="inconsistent",
-            documents_count=3,
-            bm25_count=2,
-            vector_count=1,
-        )
-    )
-    index_validator.rebuild_indexes = AsyncMock(
-        return_value={"success": False, "message": "vector unavailable"}
-    )
-
-    messages = [msg async for msg in handler.handle_rebuild_index(mock_event)]
-    assert any("索引重建失败" in msg for msg in messages)
-    assert any("/lmem rebuild-index" in msg for msg in messages)
-
-
-@pytest.mark.asyncio
 async def test_handle_reset_and_help(handler, mock_event, conversation_manager):
     reset = [msg async for msg in handler.handle_reset(mock_event)]
     assert "已重置" in reset[0]
@@ -196,9 +170,10 @@ async def test_handle_reset_and_help(handler, mock_event, conversation_manager):
     help_msg = [msg async for msg in handler.handle_help(mock_event)]
     assert "/lmem status" in help_msg[0]
     assert (
-        "https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
+        "https://github.com/W-Wolfycz/livingmemory_cm"
         in help_msg[0]
     )
+    assert "AGPL-3.0" in help_msg[0]
 
 
 @pytest.mark.asyncio
@@ -212,7 +187,7 @@ async def test_handle_webui_shows_guide(handler, mock_event):
 
 @pytest.mark.asyncio
 async def test_handle_cleanup_invalid_history_json_returns_clear_error(
-    config_manager, memory_engine, conversation_manager, index_validator, mock_event
+    config_manager, memory_engine, conversation_manager, mock_event
 ):
     context = Mock()
     context.conversation_manager = Mock()
@@ -229,7 +204,6 @@ async def test_handle_cleanup_invalid_history_json_returns_clear_error(
         config_manager=config_manager,
         memory_engine=memory_engine,
         conversation_manager=conversation_manager,
-        index_validator=index_validator,
     )
 
     messages = [msg async for msg in handler.handle_cleanup(mock_event, dry_run=True)]
@@ -246,7 +220,6 @@ async def test_handle_search_renders_dual_route_breakdown(
         final_score=0.91,
         content="graph memory",
         score_breakdown={
-            "document_keyword_score": 0.11,
             "document_vector_score": 0.22,
             "graph_keyword_score": 0.33,
             "graph_vector_score": 0.44,
@@ -256,7 +229,6 @@ async def test_handle_search_renders_dual_route_breakdown(
 
     messages = [msg async for msg in handler.handle_search(mock_event, "graph", 5)]
     assert len(messages) == 1
-    assert "0.11" in messages[0]
     assert "0.22" in messages[0]
     assert "0.33" in messages[0]
     assert "0.44" in messages[0]

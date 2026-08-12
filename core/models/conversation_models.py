@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from astrbot.api import logger
+from ...log import log_ref, logger, tag
 
 
 @dataclass
@@ -167,9 +167,9 @@ class Message:
 
             # Debug: 记录发送者信息获取情况
             logger.debug(
-                f"[format_for_llm] 消息格式化: "
-                f"sender_id={self.sender_id}, sender_name={self.sender_name}, "
-                f"display_name={display_name}, is_bot={is_bot}, role={self.role}"
+                f"{tag('model')} [format_for_llm] 消息格式化: "
+                f"sender={log_ref(self.sender_id, 'sender')}, "
+                f"is_bot={is_bot}, role={self.role}"
             )
 
             # 构建发送者信息前缀
@@ -255,19 +255,6 @@ class Session:
             metadata=metadata,
         )
 
-    def add_participant(self, sender_id: str) -> None:
-        """添加参与者 (避免重复)"""
-        if sender_id not in self.participants:
-            self.participants.append(sender_id)
-
-    def update_activity(self) -> None:
-        """更新最后活跃时间"""
-        self.last_active_at = time.time()
-
-    def increment_message_count(self) -> None:
-        """增加消息计数"""
-        self.message_count += 1
-
 
 @dataclass
 class MemoryEvent:
@@ -318,10 +305,6 @@ class MemoryEvent:
             timestamp=data.get("timestamp", time.time()),
             metadata=metadata,
         )
-
-    def is_important(self, threshold: float = 0.5) -> bool:
-        """判断记忆是否重要 (高于阈值)"""
-        return self.importance_score >= threshold
 
 
 # 辅助函数

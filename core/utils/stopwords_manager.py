@@ -4,7 +4,7 @@
 
 from pathlib import Path
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 from ..models.default_stopwords import DEFAULT_STOPWORDS
 
@@ -52,7 +52,7 @@ class StopwordsManager:
         Returns:
             Set[str]: 停用词集合
         """
-        logger.info(f"开始加载停用词表: source={source}")
+        logger.info(f"{tag('stopwords')} 开始加载停用词表: source={source}")
 
         # 1. 加载标准停用词表
         if source == "hit":
@@ -61,9 +61,9 @@ class StopwordsManager:
             filepath = Path(stopwords_path) if stopwords_path else None
             if filepath and filepath.exists():
                 self.stopwords = await self._load_from_file(filepath)
-                logger.info(f"从内置目录加载停用词: {filepath}")
+                logger.info(f"{tag('stopwords')} 从内置目录加载停用词: {filepath}")
             else:
-                logger.warning("内置停用词文件不可用，使用后备停用词")
+                logger.warning(f"{tag('stopwords')} 内置停用词文件不可用，使用后备停用词")
                 self.stopwords = self._get_builtin_stopwords()
         else:
             # 使用自定义文件路径
@@ -71,16 +71,16 @@ class StopwordsManager:
             if custom_path.exists():
                 self.stopwords = await self._load_from_file(custom_path)
             else:
-                logger.error(f"自定义停用词文件不存在: {source}")
+                logger.error(f"{tag('stopwords')} 自定义停用词文件不存在: {source}")
                 self.stopwords = self._get_builtin_stopwords()
 
         # 2. 添加用户自定义停用词
         if custom_words:
             self.custom_stopwords = set(custom_words)
             self.stopwords.update(self.custom_stopwords)
-            logger.info(f"添加自定义停用词: {len(custom_words)} 个")
+            logger.info(f"{tag('stopwords')} 添加自定义停用词: {len(custom_words)} 个")
 
-        logger.info(f"停用词表加载完成，共 {len(self.stopwords)} 个词")
+        logger.info(f"{tag('stopwords')} 停用词表加载完成，共 {len(self.stopwords)} 个词")
         return self.stopwords
 
     async def _load_from_file(self, filepath: Path) -> set[str]:
@@ -103,11 +103,11 @@ class StopwordsManager:
                     if word and not word.startswith("#"):  # 跳过空行和注释
                         stopwords.add(word)
 
-            logger.debug(f"从文件加载停用词: {filepath}, 共 {len(stopwords)} 个")
+            logger.debug(f"{tag('stopwords')} 从文件加载停用词: {filepath}, 共 {len(stopwords)} 个")
             return stopwords
 
         except Exception as e:
-            logger.error(f"读取停用词文件失败: {filepath}, 错误: {e}")
+            logger.error(f"{tag('stopwords')} 读取停用词文件失败: {filepath}, 错误: {e}")
             return set()
 
     def _get_builtin_stopwords(self) -> set[str]:
@@ -118,83 +118,8 @@ class StopwordsManager:
             Set[str]: 基础停用词集合
         """
         builtin = set(DEFAULT_STOPWORDS)
-        logger.warning(f"使用内置停用词表（后备方案），共 {len(builtin)} 个词")
+        logger.warning(f"{tag('stopwords')} 使用内置停用词表（后备方案），共 {len(builtin)} 个词")
         return builtin
-
-    def add_custom_stopwords(self, words: list):
-        """
-        添加自定义停用词
-
-        Args:
-            words: 停用词列表
-        """
-        if words:
-            self.custom_stopwords.update(words)
-            self.stopwords.update(words)
-            logger.info(f"添加 {len(words)} 个自定义停用词")
-
-    def remove_stopwords(self, words: list):
-        """
-        从停用词表中移除指定词
-
-        Args:
-            words: 要移除的词列表
-        """
-        if words:
-            for word in words:
-                self.stopwords.discard(word)
-                self.custom_stopwords.discard(word)
-            logger.info(f"移除 {len(words)} 个停用词")
-
-    def is_stopword(self, word: str) -> bool:
-        """
-        检查是否为停用词
-
-        Args:
-            word: 待检查的词
-
-        Returns:
-            bool: 是否为停用词
-        """
-        return word in self.stopwords
-
-    def filter_stopwords(self, tokens: list) -> list:
-        """
-        过滤停用词
-
-        Args:
-            tokens: 分词列表
-
-        Returns:
-            list: 过滤后的分词列表
-        """
-        return [token for token in tokens if token not in self.stopwords]
-
-    async def save_custom_stopwords(self, filepath: Path | None = None):
-        """
-        保存自定义停用词到文件
-
-        Args:
-            filepath: 保存路径，默认为用户自定义目录下的 custom_stopwords.txt
-        """
-        if not filepath:
-            if self.custom_stopwords_dir:
-                filepath = self.custom_stopwords_dir / "custom_stopwords.txt"
-            else:
-                logger.warning("未设置自定义停用词目录，无法保存")
-                return
-
-        try:
-            import aiofiles
-
-            async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
-                for word in sorted(self.custom_stopwords):
-                    await f.write(f"{word}\n")
-
-            logger.info(f"自定义停用词已保存到: {filepath}")
-
-        except Exception as e:
-            logger.error(f"保存自定义停用词失败: {e}")
 
     async def get_stopwords(self, source: str = "hit") -> str | None:
         """
@@ -217,14 +142,14 @@ class StopwordsManager:
             if filepath.exists():
                 return str(filepath)
 
-            logger.warning(f"内置停用词文件不存在: {filepath}")
+            logger.warning(f"{tag('stopwords')} 内置停用词文件不存在: {filepath}")
             if self.custom_stopwords_dir:
                 fallback_path = self.custom_stopwords_dir / filename
                 await self._write_fallback_stopwords(fallback_path)
                 return str(fallback_path)
             return None
         except Exception as e:
-            logger.error(f"获取停用词文件失败: {e}")
+            logger.error(f"{tag('stopwords')} 获取停用词文件失败: {e}")
             return None
 
     async def _write_fallback_stopwords(self, filepath: Path) -> None:
@@ -240,9 +165,9 @@ class StopwordsManager:
                 await f.write("# Generated fallback stopwords for LivingMemory\n")
                 for word in words:
                     await f.write(f"{word}\n")
-            logger.info(f"已生成后备停用词文件: {filepath}")
+            logger.info(f"{tag('stopwords')} 已生成后备停用词文件: {filepath}")
         except Exception as e:
-            logger.error(f"生成后备停用词文件失败: {e}")
+            logger.error(f"{tag('stopwords')} 生成后备停用词文件失败: {e}")
             raise
 
 

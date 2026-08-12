@@ -2,18 +2,16 @@
 Tests for MemoryProcessor.
 """
 
-import tempfile
-from datetime import datetime
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import livingmemory_cm.core.processors.text_processor as text_processor_module
 import pytest
-from astrbot_plugin_livingmemory.core.models.conversation_models import Message
-from astrbot_plugin_livingmemory.core.processors.memory_processor import MemoryProcessor
-from astrbot_plugin_livingmemory.core.prompts.prompt_manager import (
-    get_prompt_manager,
-    init_prompt_manager,
-)
+from livingmemory_cm.core.models.conversation_models import Message
+from livingmemory_cm.core.processors.memory_processor import MemoryProcessor
+from livingmemory_cm.core.processors.text_processor import TextProcessor
+from livingmemory_cm.core.utils.stopwords_manager import StopwordsManager
 
 
 class _DummyLLMProvider:
@@ -52,12 +50,41 @@ def _make_messages():
     ]
 
 
+def test_participant_identities_keep_aliases_for_one_sender() -> None:
+    messages = [
+        Message(
+            id=1,
+            session_id="s1",
+            role="user",
+            content="第一条",
+            sender_id="10001",
+            sender_name="旧昵称",
+            platform="qq",
+        ),
+        Message(
+            id=2,
+            session_id="s1",
+            role="user",
+            content="第二条",
+            sender_id="10001",
+            sender_name="新昵称",
+            platform="qq",
+        ),
+    ]
+
+    identities = MemoryProcessor._extract_participant_identities(messages)
+
+    assert len(identities) == 1
+    assert identities[0]["identity_key"] == "qq:10001"
+    assert identities[0]["display_name"] == "新昵称"
+    assert identities[0]["aliases"] == ["旧昵称", "新昵称"]
+
+
 @pytest.mark.asyncio
 async def test_process_conversation_success():
     llm = _DummyLLMProvider(
         """{
-            "summary":"张三明天下午三点要开会呀，我已经认真记下来啦！",
-            "canonical_summary":"张三明天下午三点开会，Bot 已确认提醒",
+            "summary":"我记录了张三明天下午三点开会，并给出提醒",
             "topics":["会议提醒"],
             "key_facts":["张三明天下午三点开会"],
             "sentiment":"neutral",
@@ -94,34 +121,8 @@ async def test_process_conversation_handles_non_json_response_with_fallback():
     assert 0.0 <= importance <= 1.0
 
 
-class TestPromptLiveReload:
-    """验证 WebUI 保存后 MemoryProcessor 立即使用新 prompt（不依赖实例字段缓存）。"""
-
-    def test_get_chat_prompt_reads_from_prompt_manager(self):
-        custom_text = "自定义私聊 prompt 内容 [{conversation}]"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            init_prompt_manager(tmpdir)
-            get_prompt_manager().update_prompt("private_chat_prompt", custom_text)
-
-            llm = _DummyLLMProvider("{}")
-            processor = MemoryProcessor(llm_provider=llm, context=None)
-
-            live = processor._get_chat_prompt(is_group_chat=False)
-            assert live == custom_text
-
-            # 清理：重置为默认，避免影响其他测试
-            get_prompt_manager().reset_prompt("private_chat_prompt")
-
-    def test_get_chat_prompt_returns_valid_content(self):
-        llm = _DummyLLMProvider("{}")
-        processor = MemoryProcessor(llm_provider=llm, context=None)
-        live = processor._get_chat_prompt(is_group_chat=False)
-        assert isinstance(live, str) and len(live) > 50
-        assert "{conversation}" in live
-
-
 @pytest.mark.asyncio
-async def test_persona_prompt_is_included_when_available():
+async def test_persona_prompt_is_not_included_in_extraction():
     llm = _DummyLLMProvider(
         """{
             "summary":"我愉快地记录了这次交流",
@@ -140,24 +141,19 @@ async def test_persona_prompt_is_included_when_available():
     processor = MemoryProcessor(llm_provider=llm, context=context)
 
     system_prompt = await processor._build_system_prompt_with_persona("persona_1")
-    assert "人格设定" in system_prompt
-    assert "活泼助手" in system_prompt
+    assert "长期记忆事实萃取器" in system_prompt
+    assert "活泼助手" not in system_prompt
+    context.persona_manager.get_persona.assert_not_awaited()
 
 
-# ── New tests for dual-channel summary and quality validator ──────────────────
+# ── 中性摘要与质量校验 ───────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_dual_channel_summary_stores_canonical_and_persona():
-    """
-    process_conversation 应在 metadata 中同时存储
-    canonical_summary（供图抽取等中性消费方）和 persona_summary（人格风格展示用），
-    且检索内容 content 恒为 summary + key_facts 的富文本。
-    """
+async def test_neutral_summary_stores_canonical_without_persona_summary():
     llm = _DummyLLMProvider(
         """{
-            "summary":"张三明天下午三点要开会呀，我已经认真记下来啦！",
-            "canonical_summary":"张三明天下午三点开会，Bot 已确认提醒",
+            "summary":"我记录了张三明天下午三点开会，并给出提醒",
             "topics":["会议提醒"],
             "key_facts":["张三明天下午三点开会"],
             "sentiment":"neutral",
@@ -172,66 +168,69 @@ async def test_dual_channel_summary_stores_canonical_and_persona():
         persona_id=None,
     )
 
-    # canonical_summary 应保留 LLM 输出（自定义提示词兼容）
+    # canonical_summary 应存在且包含事实内容
     assert "canonical_summary" in metadata
-    assert "呀" not in metadata["canonical_summary"]
-    assert metadata["canonical_summary"] == "张三明天下午三点开会，Bot 已确认提醒"
+    assert len(metadata["canonical_summary"]) > 0
 
-    # persona_summary 应存在（等于原始 LLM summary）
-    assert "persona_summary" in metadata
-    assert "张三" in metadata["persona_summary"]
-    assert "呀" in metadata["persona_summary"]
+    assert metadata["neutral_summary"]
+    assert "persona_summary" not in metadata
 
-    # content 应为 summary + key_facts 富文本（检索语料）
-    assert (
-        content
-        == "张三明天下午三点要开会呀，我已经认真记下来啦！ | 张三明天下午三点开会"
-    )
+    # content 应使用 canonical_summary（事实导向）
+    assert content == metadata["canonical_summary"]
 
     # schema 版本标记
-    assert metadata.get("summary_schema_version") == "v2"
+    assert metadata.get("summary_schema_version") == "v3"
 
 
 @pytest.mark.asyncio
-async def test_source_time_tags_come_from_message_timestamps_without_rewriting_summary():
+async def test_process_conversation_batch_returns_multiple_topic_memories():
     llm = _DummyLLMProvider(
-        '{"summary":"记住这件事", "canonical_summary":"发布计划已确认", '
-        '"topics":["发布"], "key_facts":["发布计划已确认"], '
-        '"sentiment":"neutral", "importance":0.8}'
+        """{
+          "memories": [
+            {
+              "summary": "张三安排项目会议",
+              "topics": ["会议"],
+              "key_facts": ["张三安排 2026-07-20 15:00 开会", "会议需准备项目文档"],
+              "event_time": "2026-07-20 15:00",
+              "sentiment": "neutral",
+              "importance": 0.8
+            },
+            {
+              "summary": "张三偏好黑咖啡",
+              "topics": ["饮食偏好"],
+              "key_facts": ["张三喝黑咖啡时不加糖"],
+              "event_time": "",
+              "sentiment": "neutral",
+              "importance": 0.6
+            }
+          ]
+        }"""
     )
-    messages = _make_messages()
-    messages[0].timestamp = datetime(2025, 5, 1, 9, 0).timestamp()
-    messages[1].timestamp = datetime(2025, 5, 2, 10, 0).timestamp()
     processor = MemoryProcessor(llm_provider=llm, context=None)
 
-    content, metadata, _ = await processor.process_conversation(messages)
+    memories = await processor.process_conversation_batch(_make_messages())
 
-    assert content == "记住这件事 | 发布计划已确认"
-    assert metadata["canonical_summary"] == "发布计划已确认"
-    assert metadata["time_tags"] == ["2025-05-01", "2025-05-02"]
-    assert metadata["source_time_label"] == "2025-05-01 - 2025-05-02"
-
-
-def test_atom_classification_persists_parent_memory_types():
-    processor = MemoryProcessor(context=None)
-    metadata = {
-        "key_facts": ["明天下午发布新版本", "用户喜欢爵士乐"],
-        "topics": ["发布", "音乐"],
-    }
-
-    atoms = processor.classify_atoms_from_metadata(metadata)
-
-    assert len(atoms) == 2
-    assert metadata["atom_types"] == ["planned", "preference"]
+    assert len(memories) == 2
+    assert "项目文档" in memories[0][0]
+    assert "黑咖啡" in memories[1][0]
+    assert all(item[1]["summary_schema_version"] == "v3" for item in memories)
 
 
 @pytest.mark.asyncio
-async def test_canonical_summary_falls_back_to_rich_text():
-    """旧/自定义 Prompt 缺少 canonical_summary 时应回退为 summary + key_facts 富文本。"""
+async def test_process_conversation_batch_allows_empty_memories():
+    processor = MemoryProcessor(
+        llm_provider=_DummyLLMProvider('{"memories": []}'), context=None
+    )
+
+    assert await processor.process_conversation_batch(_make_messages()) == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_summary_includes_key_facts():
+    """canonical_summary 应将 key_facts 拼接到摘要中，提升检索覆盖率。"""
     llm = _DummyLLMProvider(
         """{
             "summary":"用户提到了一个重要事项",
-            "canonical_summary":null,
             "topics":["备忘"],
             "key_facts":["明天下午三点开会", "需要准备PPT"],
             "sentiment":"neutral",
@@ -246,11 +245,9 @@ async def test_canonical_summary_falls_back_to_rich_text():
         persona_id=None,
     )
 
-    # 回退应同时包含 summary 与 key_facts，保证检索语料信息密度
+    # canonical_summary 应包含 key_facts 内容
     assert "明天下午三点开会" in metadata["canonical_summary"]
     assert "需要准备PPT" in metadata["canonical_summary"]
-    assert "用户提到了一个重要事项" in metadata["canonical_summary"]
-    assert content == metadata["canonical_summary"]
 
 
 @pytest.mark.asyncio
@@ -408,6 +405,7 @@ def test_build_memory_from_structured_data_uses_standard_storage_format():
             "summary": "用户希望主动记忆工具复用自动总结格式",
             "topics": ["LivingMemory", "主动记忆"],
             "key_facts": ["主动记忆应复用 MemoryProcessor 格式化流程"],
+            "event_time": "2026-07-19",
             "sentiment": "neutral",
             "importance": 0.8,
         },
@@ -416,12 +414,14 @@ def test_build_memory_from_structured_data_uses_standard_storage_format():
     )
 
     assert content == metadata["canonical_summary"]
-    assert metadata["persona_summary"] == "用户希望主动记忆工具复用自动总结格式"
+    assert metadata["neutral_summary"] == "用户希望主动记忆工具复用自动总结格式"
+    assert "persona_summary" not in metadata
     assert metadata["topics"] == ["LivingMemory", "主动记忆"]
     assert metadata["key_facts"] == ["主动记忆应复用 MemoryProcessor 格式化流程"]
+    assert metadata["event_time"] == "2026-07-19"
     assert metadata["sentiment"] == "neutral"
     assert metadata["interaction_type"] == "private_chat"
-    assert metadata["summary_schema_version"] == "v2"
+    assert metadata["summary_schema_version"] == "v3"
     assert metadata["summary_quality"] == "normal"
     assert importance == 0.8
 
@@ -541,8 +541,7 @@ async def test_process_group_chat_extracts_participants():
 
 
 @pytest.mark.asyncio
-async def test_process_group_chat_dual_channel_summary():
-    """群聊路径也应生成双通道摘要（canonical_summary + persona_summary）。"""
+async def test_process_group_chat_uses_neutral_summary_schema():
     llm = _DummyLLMProvider(
         """{
             "summary":"群聊讨论了 AI 工具的使用效果，建议内部部署私有化 LLM",
@@ -562,8 +561,9 @@ async def test_process_group_chat_dual_channel_summary():
     )
 
     assert "canonical_summary" in metadata
-    assert "persona_summary" in metadata
-    assert metadata.get("summary_schema_version") == "v2"
+    assert "neutral_summary" in metadata
+    assert "persona_summary" not in metadata
+    assert metadata.get("summary_schema_version") == "v3"
     # canonical_summary 应包含 key_facts
     assert "私有化 LLM" in metadata["canonical_summary"]
     # content 应等于 canonical_summary
@@ -732,3 +732,90 @@ def test_format_conversation_uses_placeholder_for_image_only_group_message():
     assert "张三" in formatted
     assert "[图片消息]" in formatted
     assert "image_url" not in formatted
+
+
+def test_text_tokenize_handles_empty_and_basic_cleaning() -> None:
+    processor = TextProcessor()
+
+    assert processor.tokenize("") == []
+    assert processor.tokenize("   ") == []
+    tokens = processor.tokenize("Visit https://example.com now!!!")
+    assert "Visit" in tokens or "visit" in [token.lower() for token in tokens]
+
+
+def test_text_tokenize_removes_common_stopwords() -> None:
+    processor = TextProcessor()
+    processor.add_stopwords(["我"])
+
+    tokens = processor.tokenize("我 今天 去 图书馆", remove_stopwords=True)
+
+    assert "我" not in tokens
+    assert tokens
+
+
+@pytest.mark.asyncio
+async def test_text_load_stopwords_and_custom_words(tmp_path: Path) -> None:
+    processor = TextProcessor()
+    path = tmp_path / "stopwords.txt"
+    path.write_text("# comment\nalpha\nbeta\n", encoding="utf-8")
+
+    loaded = await processor.load_stopwords(str(path))
+    processor.add_stopwords(["gamma"])
+
+    assert "alpha" in loaded
+    assert "alpha" in processor.stopwords
+    assert "gamma" in processor.stopwords
+    processor.remove_stopwords(["gamma"])
+    assert "gamma" not in processor.stopwords
+
+
+def test_text_word_frequency() -> None:
+    frequency = TextProcessor().get_word_freq(["我 爱 编程", "编程 很 有趣"])
+
+    assert isinstance(frequency, dict)
+    assert frequency
+
+
+def test_text_tokenize_falls_back_when_jieba_runtime_fails(monkeypatch) -> None:
+    class BrokenJieba:
+        @staticmethod
+        def cut_for_search(_text):
+            raise AttributeError(
+                "module 'pkg_resources' has no attribute 'resource_stream'"
+            )
+
+    monkeypatch.setattr(text_processor_module, "JIEBA_AVAILABLE", True)
+    monkeypatch.setattr(text_processor_module, "JIEBA_RUNTIME_DISABLED", False)
+    monkeypatch.setattr(text_processor_module, "jieba", BrokenJieba)
+
+    with pytest.warns(UserWarning, match="jieba 分词初始化失败"):
+        tokens = TextProcessor().tokenize("编程快乐")
+
+    assert tokens
+    assert "编" in tokens
+    assert text_processor_module.JIEBA_RUNTIME_DISABLED is True
+
+
+@pytest.mark.asyncio
+async def test_stopwords_manager_materializes_builtin_fallback(tmp_path: Path) -> None:
+    manager = StopwordsManager(str(tmp_path))
+    manager.builtin_stopwords_dir = tmp_path / "missing"
+
+    stopwords_path = await manager.get_stopwords()
+    loaded = await manager.load_stopwords()
+
+    assert stopwords_path is not None
+    assert Path(stopwords_path).exists()
+    assert "的" in loaded
+
+
+@pytest.mark.asyncio
+async def test_text_processor_async_init_loads_builtin_stopwords(
+    tmp_path: Path,
+) -> None:
+    processor = TextProcessor(str(tmp_path))
+
+    await processor.async_init()
+
+    assert "的" in processor.stopwords
+    assert not (tmp_path / "stopwords_hit.txt").exists()

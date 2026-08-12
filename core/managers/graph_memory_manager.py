@@ -9,8 +9,7 @@ from collections.abc import AsyncIterable
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
-
+from ...log import logger, tag
 from ...storage.graph_store import GraphStore
 from ..models.graph_models import GraphEntry
 from ..processors.graph_extractor import GraphExtractor
@@ -31,6 +30,9 @@ class GraphMemoryManager:
         self.graph_extractor = graph_extractor
         self._rebuild_gate = asyncio.Lock()
         self._rebuild_active = False
+        self._rebuild_status = "idle"
+        self._rebuild_error: str | None = None
+        self._last_rebuild_result: dict[str, int] | None = None
         self._rebuild_delta: dict[
             int, tuple[str, dict[str, Any] | None, list | None] | None
         ] = {}
@@ -44,8 +46,8 @@ class GraphMemoryManager:
     ) -> None:
         """Rebuild graph artifacts for one source memory.
 
-        When atoms are provided, each atom independently contributes
-        nodes/edges/entries with per-atom confidence scores.
+        Writes that arrive during a full rebuild are queued and replayed into
+        the shadow generation before it is switched into service.
         """
         async with self._rebuild_gate:
             if self._rebuild_active:
@@ -65,7 +67,6 @@ class GraphMemoryManager:
         atoms: list | None = None,
     ) -> None:
         await self._delete_memory_now(source_memory_id)
-
         entries, entry_ids = await self._store_graph_structure(
             source_memory_id,
             content,
@@ -91,18 +92,19 @@ class GraphMemoryManager:
     ) -> tuple[list[GraphEntry], list[int]]:
         """Persist graph structure without touching the vector index."""
         extracted = self.graph_extractor.extract(
-            source_memory_id, content, metadata, atoms
+            source_memory_id,
+            content,
+            metadata,
+            atoms,
         )
         if not extracted.entries:
             return [], []
 
         node_key_to_id = await self.graph_store.upsert_nodes(extracted.nodes)
-
         edge_key_to_id = await self.graph_store.add_edges(
             extracted.edges,
             node_key_to_id,
         )
-
         entry_ids = await self.graph_store.add_entries(
             extracted.entries,
             node_key_to_id,
@@ -126,11 +128,12 @@ class GraphMemoryManager:
     async def _delete_memory_now(self, source_memory_id: int) -> None:
         vector_doc_ids = await self.graph_store.delete_memory(source_memory_id)
         await self.graph_vector_retriever.delete_entries(
-            source_memory_id, vector_doc_ids
+            source_memory_id,
+            vector_doc_ids,
         )
 
     async def batch_delete_memories(self, source_memory_ids: list[int]) -> None:
-        """Delete graph artifacts in one FAISS bulk operation when supported."""
+        """Batch delete graph artifacts for multiple source memories."""
         if not source_memory_ids:
             return
         async with self._rebuild_gate:
@@ -145,7 +148,7 @@ class GraphMemoryManager:
         self,
         memories: list[tuple[int, str, dict[str, Any]]],
     ) -> dict[str, int]:
-        """Compatibility wrapper for callers that already materialized memories."""
+        """Compatibility wrapper for callers that materialized memories."""
 
         async def batches():
             yield memories
@@ -158,11 +161,13 @@ class GraphMemoryManager:
         *,
         vector_batch_size: int = 100,
     ) -> dict[str, int]:
-        """Build graph data in shadow storage and atomically switch when complete."""
+        """Build graph data in shadow storage and switch only when complete."""
         async with self._rebuild_gate:
             if self._rebuild_active:
                 raise RuntimeError("graph rebuild already in progress")
             self._rebuild_active = True
+            self._rebuild_status = "rebuilding"
+            self._rebuild_error = None
             self._rebuild_delta.clear()
 
         temp_dir = Path(tempfile.mkdtemp(prefix="livingmemory_graph_rebuild_"))
@@ -173,13 +178,13 @@ class GraphMemoryManager:
             self.graph_extractor,
         )
         new_vector_doc_ids: dict[int, set[int]] = {}
-        old_vector_doc_ids = await self.graph_store.list_vector_doc_ids_by_source()
         rebuilt = 0
         skipped = 0
         switched = False
 
         async def remove_shadow_vectors(
-            source_memory_id: int, vector_doc_ids: list[int]
+            source_memory_id: int,
+            vector_doc_ids: list[int],
         ) -> None:
             known_ids = new_vector_doc_ids.get(int(source_memory_id), set())
             ids = [
@@ -197,10 +202,15 @@ class GraphMemoryManager:
                 new_vector_doc_ids.pop(int(source_memory_id), None)
 
         async def apply_shadow_delta(
-            delta: dict[int, tuple[str, dict[str, Any] | None, list | None] | None],
+            delta: dict[
+                int,
+                tuple[str, dict[str, Any] | None, list | None] | None,
+            ],
         ) -> None:
             for source_memory_id, payload in delta.items():
-                replaced_vector_ids = await shadow_store.delete_memory(source_memory_id)
+                replaced_vector_ids = await shadow_store.delete_memory(
+                    source_memory_id
+                )
                 await remove_shadow_vectors(source_memory_id, replaced_vector_ids)
                 if payload is None:
                     continue
@@ -228,6 +238,9 @@ class GraphMemoryManager:
                 )
 
         try:
+            old_vector_doc_ids = (
+                await self.graph_vector_retriever.list_document_ids()
+            )
             await shadow_store.initialize()
             async for memories in memory_batches:
                 for source_memory_id, content, metadata in memories:
@@ -259,7 +272,9 @@ class GraphMemoryManager:
                         f"ids={len(vector_doc_ids)}, memories={len(groups)}"
                     )
                 for (source_memory_id, _, _), vector_doc_id in zip(
-                    groups, vector_doc_ids, strict=True
+                    groups,
+                    vector_doc_ids,
+                    strict=True,
                 ):
                     new_vector_doc_ids.setdefault(int(source_memory_id), set()).add(
                         int(vector_doc_id)
@@ -268,7 +283,9 @@ class GraphMemoryManager:
                     {
                         representative_entry_id: int(vector_doc_id)
                         for (_, representative_entry_id, _), vector_doc_id in zip(
-                            groups, vector_doc_ids, strict=True
+                            groups,
+                            vector_doc_ids,
+                            strict=True,
                         )
                     }
                 )
@@ -287,9 +304,6 @@ class GraphMemoryManager:
                         try:
                             await asyncio.shield(switch_task)
                         except asyncio.CancelledError:
-                            # Learn whether the transaction committed before
-                            # propagating cancellation; never roll back the new
-                            # vectors after a successful table switch.
                             await switch_task
                             switched = True
                             self._rebuild_active = False
@@ -302,25 +316,36 @@ class GraphMemoryManager:
             if old_vector_doc_ids:
                 try:
                     await self.graph_vector_retriever.delete_entries_batch(
-                        old_vector_doc_ids
+                        {0: old_vector_doc_ids}
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    # The graph tables already reference the new generation. Old
-                    # vectors are redundant but harmless and can be cleaned later.
                     logger.warning(
-                        "图谱已切换，但旧图向量清理失败；保留新一代索引",
+                        f"{tag('graph')} 图谱已切换，但旧图向量清理失败；"
+                        "保留新一代索引",
                         exc_info=True,
                     )
-            return {"rebuilt": rebuilt, "skipped": skipped}
-        except BaseException:
+            result = {"rebuilt": rebuilt, "skipped": skipped}
+            self._last_rebuild_result = result
+            self._rebuild_status = "switched"
+            return result
+        except BaseException as exc:
+            if switched:
+                self._rebuild_status = "switched"
+            elif isinstance(exc, asyncio.CancelledError):
+                self._rebuild_status = "cancelled"
+            else:
+                self._rebuild_status = "failed"
+            self._rebuild_error = type(exc).__name__
             if not switched and new_vector_doc_ids:
                 try:
                     await self.graph_vector_retriever.delete_entries_batch(
                         {
                             source_memory_id: sorted(vector_doc_ids)
-                            for source_memory_id, vector_doc_ids in new_vector_doc_ids.items()
+                            for source_memory_id, vector_doc_ids in (
+                                new_vector_doc_ids.items()
+                            )
                         }
                     )
                 except Exception:
@@ -338,6 +363,15 @@ class GraphMemoryManager:
             raise
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def get_rebuild_status(self) -> dict[str, Any]:
+        """Return a redacted snapshot of the in-process rebuild state."""
+        return {
+            "state": self._rebuild_status,
+            "active": self._rebuild_active,
+            "error_type": self._rebuild_error,
+            "result": dict(self._last_rebuild_result or {}),
+        }
 
 
 __all__ = ["GraphMemoryManager"]

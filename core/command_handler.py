@@ -7,16 +7,13 @@ import os
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
-from astrbot.api import logger
+from ..log import log_ref, logger, tag
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
 from .base.config_manager import ConfigManager
 from .i18n_backend import t, t_list
 from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
-from .memory_scope import is_event_memory_allowed, resolve_memory_scope
-from .memory_source import serialize_source_messages
-from .validators.index_validator import IndexValidator
 
 
 class CommandHandler:
@@ -28,7 +25,6 @@ class CommandHandler:
         config_manager: ConfigManager,
         memory_engine: MemoryEngine | None,
         conversation_manager: ConversationManager | None,
-        index_validator: IndexValidator | None,
         memory_processor=None,
         initialization_status_callback=None,
     ):
@@ -40,7 +36,6 @@ class CommandHandler:
             config_manager: 配置管理器
             memory_engine: 记忆引擎
             conversation_manager: 会话管理器
-            index_validator: 索引验证器
             memory_processor: 记忆处理器（用于手动总结）
             initialization_status_callback: 初始化状态回调函数
         """
@@ -48,7 +43,6 @@ class CommandHandler:
         self.config_manager = config_manager
         self.memory_engine = memory_engine
         self.conversation_manager = conversation_manager
-        self.index_validator = index_validator
         self._memory_processor = memory_processor
         self.get_initialization_status = initialization_status_callback
 
@@ -114,20 +108,35 @@ class CommandHandler:
                 db_size=db_size,
             )
 
-            maintenance = stats.get("index_maintenance") or {}
-            maintenance_state = str(maintenance.get("state") or "idle")
-            if maintenance_state not in {"idle", "ready"}:
+            graph_index = stats.get("graph_index")
+            if isinstance(graph_index, dict):
+                graph_state = str(graph_index.get("state") or "current")
+                state_labels = {
+                    "disabled": t("status.graph_states.disabled"),
+                    "current": t("status.graph_states.current"),
+                    "rebuild_required": t(
+                        "status.graph_states.rebuild_required"
+                    ),
+                    "rebuilding": t("status.graph_states.rebuilding"),
+                    "switched": t("status.graph_states.switched"),
+                    "failed": t("status.graph_states.failed"),
+                    "cancelled": t("status.graph_states.cancelled"),
+                }
                 message += t(
-                    "status.index_maintenance",
-                    state=maintenance_state,
-                    current=int(maintenance.get("current", 0) or 0),
-                    total=int(maintenance.get("total", 0) or 0),
-                    message=str(maintenance.get("message") or ""),
+                    "status.graph_index",
+                    state=state_labels.get(graph_state, graph_state),
+                    total=int(graph_index.get("total_vectors", 0) or 0),
+                    memory=int(graph_index.get("memory_vectors", 0) or 0),
+                    legacy=int(graph_index.get("legacy_vectors", 0) or 0),
+                    orphan=int(graph_index.get("orphan_vectors", 0) or 0),
+                    missing=int(
+                        graph_index.get("missing_source_vectors", 0) or 0
+                    ),
                 )
 
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"获取状态失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 获取状态失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("status.action_name"),
@@ -191,7 +200,7 @@ class CommandHandler:
 
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"搜索失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 搜索失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("search.action_name"),
@@ -222,85 +231,12 @@ class CommandHandler:
             else:
                 yield event.plain_result(t("forget.not_found", id=doc_id))
         except Exception as e:
-            logger.error(f"删除失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 删除失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("forget.action_name"),
                     e,
                     t_list("error.suggestions.forget"),
-                )
-            )
-
-    async def handle_rebuild_index(
-        self, event: AstrMessageEvent
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """处理 /lmem rebuild-index 命令"""
-        if not self.memory_engine or not self.index_validator:
-            yield event.plain_result(
-                self._component_not_ready_message(
-                    "记忆引擎或索引验证器", "/lmem rebuild-index"
-                )
-            )
-            return
-
-        try:
-            yield event.plain_result(t("rebuild_index.checking"))
-
-            # 检查索引一致性
-            status = await self.index_validator.check_consistency()
-
-            if status.is_consistent and not status.needs_rebuild:
-                yield event.plain_result(t("rebuild_index.ok", reason=status.reason))
-                return
-
-            # 显示当前状态
-            status_msg = t(
-                "rebuild_index.status_template",
-                doc_count=status.documents_count,
-                bm25_count=status.bm25_count,
-                vec_count=status.vector_count,
-                reason=status.reason,
-            )
-            yield event.plain_result(status_msg)
-
-            # 执行重建
-            result = await self.index_validator.rebuild_indexes(self.memory_engine)
-
-            if result["success"]:
-                partial_notice = ""
-                if result.get("partial"):
-                    partial_notice = t(
-                        "rebuild_index.partial_notice",
-                        ratio=result.get("failure_ratio", 0),
-                    )
-                switched_str = (
-                    t("common.yes") if result.get("switched") else t("common.no")
-                )
-                result_msg = t(
-                    "rebuild_index.result_template",
-                    success=result["processed"],
-                    failed=result["errors"],
-                    total=result["total"],
-                    vector_mode=result.get("vector_mode", "unknown"),
-                    switched=switched_str,
-                    partial_notice=partial_notice,
-                )
-                yield event.plain_result(result_msg)
-            else:
-                yield event.plain_result(
-                    t(
-                        "rebuild_index.failed",
-                        message=result.get("message", t("common.unknown_error")),
-                    )
-                )
-
-        except Exception as e:
-            logger.error(f"重建索引失败: {e}", exc_info=True)
-            yield event.plain_result(
-                self._format_error_message(
-                    t("rebuild_index.action_name"),
-                    e,
-                    t_list("error.suggestions.rebuild_index"),
                 )
             )
 
@@ -325,7 +261,7 @@ class CommandHandler:
                 )
             )
         except Exception as e:
-            logger.error(f"重建图记忆失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 重建图记忆失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("rebuild_graph.action_name"),
@@ -339,174 +275,6 @@ class CommandHandler:
     ) -> AsyncGenerator[MessageEventResult, None]:
         """处理 /lmem webui 命令"""
         yield event.plain_result(t("webui.guide"))
-
-    async def handle_summarize(
-        self, event: AstrMessageEvent, message_count: int | None = None
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """处理 /lmem summarize 命令 - 立即触发记忆总结"""
-        if not self.conversation_manager or not self.memory_engine:
-            yield event.plain_result(
-                self._component_not_ready_message(
-                    "会话管理器或记忆引擎", "/lmem summarize"
-                )
-            )
-            return
-
-        session_id = event.unified_msg_origin
-        try:
-            if not is_event_memory_allowed(self.config_manager, event):
-                logger.debug("当前事件不在记忆白名单中，跳过手动总结")
-                yield event.plain_result(t("summarize.access_denied"))
-                return
-
-            # 获取当前消息数和总结进度
-            actual_count = await self.conversation_manager.store.get_message_count(
-                session_id
-            )
-            last_summarized_index = (
-                await self.conversation_manager.get_session_metadata(
-                    session_id, "last_summarized_index", 0
-                )
-            )
-            try:
-                last_summarized_index = int(last_summarized_index)
-            except (TypeError, ValueError):
-                last_summarized_index = 0
-
-            if message_count is not None:
-                try:
-                    requested_count = int(message_count)
-                except (TypeError, ValueError):
-                    requested_count = 0
-                if requested_count < 2:
-                    yield event.plain_result(t("summarize.invalid_count"))
-                    return
-                last_summarized_index = max(0, actual_count - requested_count)
-
-            unsummarized = actual_count - last_summarized_index
-
-            if unsummarized < 2:
-                yield event.plain_result(
-                    t(
-                        "summarize.no_new",
-                        total=actual_count,
-                        index=last_summarized_index,
-                    )
-                )
-                return
-
-            yield event.plain_result(
-                t(
-                    "summarize.starting",
-                    start=last_summarized_index,
-                    end=actual_count,
-                    count=unsummarized,
-                )
-            )
-
-            history_messages = await self.conversation_manager.get_messages_range(
-                session_id=session_id,
-                start_index=last_summarized_index,
-                end_index=actual_count,
-            )
-
-            if not history_messages:
-                yield event.plain_result(t("summarize.fetch_failed"))
-                return
-
-            # 获取 persona_id
-            from .utils import get_persona_id
-
-            persona_id = await get_persona_id(self.context, event)
-            memory_scope = (
-                resolve_memory_scope(self.config_manager, event) or session_id
-            )
-
-            # 判断是否群聊
-            is_group_chat = bool(
-                history_messages[0].group_id if history_messages else False
-            )
-            if not is_group_chat and "GroupMessage" in session_id:
-                is_group_chat = True
-
-            if not self._memory_processor:
-                yield event.plain_result(
-                    self._component_not_ready_message("记忆处理器", "/lmem summarize")
-                )
-                return
-
-            (
-                content,
-                metadata,
-                importance,
-            ) = await self._memory_processor.process_conversation(
-                messages=history_messages,
-                is_group_chat=is_group_chat,
-                persona_id=persona_id,
-            )
-
-            atoms = self._memory_processor.classify_atoms_from_metadata(
-                metadata=metadata,
-                parent_importance=importance,
-                session_id=memory_scope,
-                persona_id=persona_id,
-            )
-
-            metadata["source_window"] = {
-                "session_id": session_id,
-                "start_index": last_summarized_index,
-                "end_index": actual_count,
-                "message_count": actual_count - last_summarized_index,
-                "triggered_by": "manual",
-            }
-            metadata["source_session_id"] = session_id
-
-            await self.memory_engine.add_memory(
-                content=content,
-                session_id=memory_scope,
-                persona_id=persona_id,
-                importance=importance,
-                metadata=metadata,
-                atoms=atoms,
-                source_messages=(
-                    serialize_source_messages(history_messages)
-                    if importance
-                    >= float(
-                        self.config_manager.get(
-                            "reflection_engine.source_retention_importance_threshold",
-                            0.8,
-                        )
-                    )
-                    else None
-                ),
-            )
-
-            await self.conversation_manager.update_session_metadata(
-                session_id, "last_summarized_index", actual_count
-            )
-            await self.conversation_manager.update_session_metadata(
-                session_id, "pending_summary", None
-            )
-
-            topics = ", ".join(metadata.get("topics", [])) or t("common.none")
-            yield event.plain_result(
-                t(
-                    "summarize.success",
-                    importance=importance,
-                    topics=topics,
-                    count=actual_count,
-                )
-            )
-
-        except Exception as e:
-            logger.error(f"手动触发记忆总结失败: {e}", exc_info=True)
-            yield event.plain_result(
-                self._format_error_message(
-                    t("summarize.action_name"),
-                    e,
-                    t_list("error.suggestions.summarize"),
-                )
-            )
 
     async def handle_reset(
         self, event: AstrMessageEvent
@@ -524,7 +292,7 @@ class CommandHandler:
             message = t("reset.success")
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"手动重置记忆上下文失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 手动重置记忆上下文失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("reset.action_name"),
@@ -615,7 +383,7 @@ class CommandHandler:
                     if not cleaned_content:
                         stats["deleted"] += 1
                         logger.debug(
-                            f"[cleanup] 删除纯记忆注入消息: role={msg.get('role')}"
+                            f"{tag('cmd')} [cleanup] 删除纯记忆注入消息: role={msg.get('role')}"
                         )
                         continue
 
@@ -626,7 +394,7 @@ class CommandHandler:
                         cleaned_history.append(msg_copy)
                         stats["cleaned"] += 1
                         logger.debug(
-                            f"[cleanup] 清理消息内部记忆片段: "
+                            f"{tag('cmd')} [cleanup] 清理消息内部记忆片段: "
                             f"原长度={len(content)}, 新长度={len(cleaned_content)}"
                         )
                         continue
@@ -641,7 +409,8 @@ class CommandHandler:
                     history=cleaned_history,
                 )
                 logger.info(
-                    f"[{session_id}] cleanup 已更新 AstrBot 对话历史: "
+                    f"{tag('cmd')} [{log_ref(session_id, 'session')}] "
+                    "cleanup 已更新 AstrBot 对话历史: "
                     f"清理={stats['cleaned']}, 删除={stats['deleted']}"
                 )
 
@@ -662,7 +431,7 @@ class CommandHandler:
             yield event.plain_result(message)
 
         except Exception as e:
-            logger.error(f"清理历史消息失败: {e}", exc_info=True)
+            logger.error(f"{tag('cmd')} 清理历史消息失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("cleanup.action_name"),

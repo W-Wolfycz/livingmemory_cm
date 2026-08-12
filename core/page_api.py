@@ -16,12 +16,12 @@ from .page_api_modules import (
     GraphHandler,
     MemoryHandler,
     PageApiUtils,
-    PromptHandler,
+    PersonaHandler,
     RecallHandler,
     StatsHandler,
 )
 
-PLUGIN_NAME = "astrbot_plugin_livingmemory"
+PLUGIN_NAME = "livingmemory_cm"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 
 
@@ -39,7 +39,7 @@ class PluginPageApi:
         self.memory_handler = MemoryHandler(self.utils)
         self.recall_handler = RecallHandler(self.utils)
         self.graph_handler = GraphHandler(self.utils)
-        self.prompt_handler = PromptHandler(self.utils)
+        self.persona_handler = PersonaHandler(self.utils)
 
         # BackupHandler 需要 data_dir，延迟初始化
         self._backup_handler = None
@@ -82,24 +82,6 @@ class PluginPageApi:
             "LivingMemory Page update memory",
         )
         register(
-            f"{PAGE_API_PREFIX}/memories/resummarize",
-            self.resummarize_memory,
-            ["POST"],
-            "LivingMemory Page resummarize memory source",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/memories/export",
-            self.export_memories,
-            ["POST"],
-            "LivingMemory Page export memories",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/memories/import",
-            self.import_memories,
-            ["POST"],
-            "LivingMemory Page import memories",
-        )
-        register(
             f"{PAGE_API_PREFIX}/memories/batch-delete",
             self.batch_delete_memories,
             ["POST"],
@@ -136,34 +118,10 @@ class PluginPageApi:
             "LivingMemory Page backup list",
         )
         register(
-            f"{PAGE_API_PREFIX}/prompts",
-            self.list_prompts,
+            f"{PAGE_API_PREFIX}/personas",
+            self.list_personas,
             ["GET"],
-            "LivingMemory Page prompt list",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/prompts/detail",
-            self.get_prompt_detail,
-            ["GET"],
-            "LivingMemory Page prompt detail",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/prompts/update",
-            self.update_prompt,
-            ["POST"],
-            "LivingMemory Page update prompt",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/prompts/reset",
-            self.reset_prompt,
-            ["POST"],
-            "LivingMemory Page reset prompt",
-        )
-        register(
-            f"{PAGE_API_PREFIX}/prompts/default",
-            self.get_prompt_default,
-            ["GET"],
-            "LivingMemory Page get prompt default content",
+            "LivingMemory Page personas",
         )
 
     # ==================== 路由处理方法 ====================
@@ -196,31 +154,6 @@ class PluginPageApi:
         if error:
             return error
         return await self.memory_handler.update_memory(ready["memory_engine"])
-
-    async def resummarize_memory(self):
-        """Regenerate one memory from its retained source messages."""
-        ready, error = await self._ensure_plugin_ready()
-        if error:
-            return error
-        return await self.memory_handler.resummarize_memory(
-            ready["memory_engine"], ready["memory_processor"]
-        )
-
-    async def export_memories(self):
-        """Export all or selected memories."""
-        ready, error = await self._ensure_plugin_ready()
-        if error:
-            return error
-        return await self.memory_handler.export_memories(ready["memory_engine"])
-
-    async def import_memories(self):
-        """Preview or import portable memory data."""
-        ready, error = await self._ensure_plugin_ready()
-        if error:
-            return error
-        return await self.memory_handler.import_memories(
-            ready["memory_engine"], ready["memory_processor"]
-        )
 
     async def batch_delete_memories(self):
         """批量删除记忆"""
@@ -261,22 +194,12 @@ class PluginPageApi:
         """列出所有版本备份及其元数据"""
         return await self.backup_handler.list_backups()
 
-    # ---- Prompt 管理路由 ----
-
-    async def list_prompts(self):
-        return await self.prompt_handler.list_prompts()
-
-    async def get_prompt_detail(self):
-        return await self.prompt_handler.get_prompt_detail()
-
-    async def update_prompt(self):
-        return await self.prompt_handler.update_prompt()
-
-    async def reset_prompt(self):
-        return await self.prompt_handler.reset_prompt()
-
-    async def get_prompt_default(self):
-        return await self.prompt_handler.get_prompt_default()
+    async def list_personas(self):
+        """列出所有 distinct persona_id"""
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            return error
+        return await self.persona_handler.list_personas(ready["memory_engine"])
 
     # ==================== 辅助方法 ====================
 
@@ -300,8 +223,4 @@ class PluginPageApi:
         return {
             "memory_engine": memory_engine,
             "conversation_manager": self.plugin.initializer.conversation_manager,
-            "index_validator": self.plugin.initializer.index_validator,
-            "memory_processor": getattr(
-                self.plugin.initializer, "memory_processor", None
-            ),
         }, None

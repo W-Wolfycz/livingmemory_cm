@@ -7,13 +7,12 @@ from typing import Any
 
 from pydantic.dataclasses import dataclass
 
-from astrbot.api import logger
+from ...log import logger, tag
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from ..base.config_manager import ConfigManager
-from ..memory_scope import is_event_memory_allowed, resolve_memory_scope
 from ..utils import get_persona_id
 
 
@@ -54,11 +53,6 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
                     "description": "Maximum number of memory items to return for one recall. Keep this small unless more evidence is needed.",
                     "default": 5,
                 },
-                "include_source": {
-                    "type": "boolean",
-                    "description": "Include retained original messages when exact details are needed. Use only after normal recall is insufficient.",
-                    "default": False,
-                },
             },
             "required": ["query"],
         }
@@ -69,7 +63,6 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
         context: ContextWrapper[AstrAgentContext],
         query: str,
         k: int = 5,
-        include_source: bool = False,
     ) -> ToolExecResult:
         """执行长期记忆回忆。"""
         cleaned_query = (query or "").strip()
@@ -99,26 +92,13 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
 
         try:
             event = context.context.event
-            if not is_event_memory_allowed(self.config_manager, event):
-                return _json_result(
-                    {
-                        "query": cleaned_query,
-                        "count": 0,
-                        "results": [],
-                        "error": "memory access is not allowed",
-                    }
-                )
-            filtering_config = self.config_manager.filtering_settings
-            use_persona_filtering = filtering_config.get("use_persona_filtering", True)
 
-            persona_id = (
-                await get_persona_id(self.context, event)
-                if use_persona_filtering
-                else None
-            )
+            # 人格/会话过滤恒开（与 memory_recall 保持一致）
+            session_id = event.unified_msg_origin
+            persona_id = await get_persona_id(self.context, event)
 
-            recall_session_id = resolve_memory_scope(self.config_manager, event)
-            recall_persona_id = persona_id if use_persona_filtering else None
+            recall_session_id = session_id
+            recall_persona_id = persona_id
 
             default_k = int(self.config_manager.get("recall_engine.top_k", 5))
             max_k = int(self.config_manager.get("recall_engine.max_k", 10))
@@ -140,30 +120,25 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
             serialized_results = []
             for memory in memories:
                 metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-                item = {
-                    "id": memory.doc_id,
-                    "content": memory.content,
-                    "score": memory.final_score,
-                    "importance": metadata.get("importance"),
-                    "session_id": metadata.get("session_id"),
-                    "persona_id": metadata.get("persona_id"),
-                    "create_time": metadata.get("create_time"),
-                    "last_access_time": metadata.get("last_access_time"),
-                }
-                if include_source and metadata.get("has_source"):
-                    get_source = getattr(
-                        self.memory_engine, "get_memory_source", None
-                    )
-                    if callable(get_source):
-                        item["source_messages"] = await get_source(memory.doc_id)
-                serialized_results.append(item)
+                serialized_results.append(
+                    {
+                        "id": memory.doc_id,
+                        "content": memory.content,
+                        "score": memory.final_score,
+                        "importance": metadata.get("importance"),
+                        "session_id": metadata.get("session_id"),
+                        "persona_id": metadata.get("persona_id"),
+                        "create_time": metadata.get("create_time"),
+                        "last_access_time": metadata.get("last_access_time"),
+                    }
+                )
 
             return _json_result(
                 {
                     "query": cleaned_query,
                     "applied_filters": {
-                        "session_filtered": recall_session_id is not None,
-                        "persona_filtered": use_persona_filtering,
+                        "session_filtered": True,
+                        "persona_filtered": True,
                     },
                     "count": len(serialized_results),
                     "results": serialized_results,
@@ -172,7 +147,7 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"记忆工具检索失败: {e}", exc_info=True)
+            logger.error(f"{tag('tool')} 记忆工具检索失败: {e}", exc_info=True)
             return _json_result(
                 {
                     "query": cleaned_query,

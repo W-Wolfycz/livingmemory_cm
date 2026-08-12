@@ -4,17 +4,11 @@
 """
 
 import asyncio
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
 import time
-from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from ..log import logger, tag
 from astrbot.api.star import Context
 from astrbot.core.provider.provider import EmbeddingProvider, Provider
 
@@ -22,26 +16,19 @@ from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
 from .base.config_manager import ConfigManager
 from .base.exceptions import InitializationError, ProviderNotReadyError
+from .bootstrap import (
+    EmbeddingIndexBootstrapService,
+    EmbeddingIndexSpec,
+    FaissBootstrapService,
+)
 from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
 from .schedulers.decay_scheduler import DecayScheduler
-from .validators.index_validator import IndexValidator
 
 FaissVecDB: Any = None
 
-_FAISS_GENERIC_FALLBACK_MARKERS = (
-    "illegal instruction",
-    "optimized",
-    "avx",
-    "simd",
-    "dll load failed",
-    "cannot open shared object file",
-    "could not load library",
-    "image not found",
-    "symbol not found",
-    "undefined symbol",
-)
+_FAISS_BOOTSTRAP_COMPAT = FaissBootstrapService()
 
 # ── Faiss C++ fopen() 在 Windows 上使用 ANSI codepage ──
 # Python 传给 Faiss 的路径是 UTF-8 字节，Windows fopen 期望 ANSI 编码，
@@ -52,80 +39,22 @@ _FAISS_GENERIC_FALLBACK_MARKERS = (
 
 def _needs_bridge(path: str) -> bool:
     """判断是否需要 ASCII 临时文件桥接。"""
-    path = os.fspath(path)
-    return os.name == "nt" and not path.isascii()
+    return _FAISS_BOOTSTRAP_COMPAT.needs_bridge(path)
 
 
 def _safe_temp_dir() -> str:
     """返回保证纯 ASCII 且可写的临时目录。"""
-    if os.name == "nt":
-        root = os.environ.get("SystemRoot", r"C:\Windows")
-        temp_dir = os.path.join(root, "Temp")
-        if (
-            temp_dir.isascii()
-            and os.path.isdir(temp_dir)
-            and os.access(temp_dir, os.W_OK)
-        ):
-            return temp_dir
-        tmp = tempfile.gettempdir()
-        if tmp.isascii():
-            return tmp
-        raise OSError("_safe_temp_dir: 无法找到可写的纯 ASCII 临时目录")
-    return tempfile.gettempdir()
+    return _FAISS_BOOTSTRAP_COMPAT.safe_temp_dir()
 
 
 def _make_temp_file(prefix: str) -> str:
     """创建 Faiss 桥接临时文件，返回纯 ASCII 路径。"""
-    safe_dir = _safe_temp_dir()
-    fd, path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=".faiss", dir=safe_dir)
-    os.close(fd)
-    return path
+    return _FAISS_BOOTSTRAP_COMPAT.make_temp_file(prefix)
 
 
 def _sanitize_path(path: str) -> str:
     """脱敏路径：非 ASCII 部分替换为 [***]，避免日志泄露中文用户名。"""
-    path = os.fspath(path)
-    if path.isascii():
-        return path
-    parts: list[str] = []
-    for ch in path:
-        if ch.isascii():
-            parts.append(ch)
-        elif not parts or parts[-1] != "[***]":
-            parts.append("[***]")
-    return "".join(parts)
-
-
-def _faiss_error_details(result: subprocess.CompletedProcess[str]) -> str:
-    """Extract useful diagnostics from a FAISS import probe."""
-    details = (result.stderr or result.stdout or "").strip()
-    if result.returncode < 0:
-        details = f"进程被信号 {-result.returncode} 终止。{details}".strip()
-    return details
-
-
-def _is_faiss_binding_mismatch(details: str) -> bool:
-    """Identify known Python-wrapper/binary-extension mismatches."""
-    lowered = details.lower()
-    return "superkmeans" in lowered or (
-        "python binding" in lowered and "mismatch" in lowered
-    )
-
-
-def _should_try_faiss_generic(result: subprocess.CompletedProcess[str]) -> bool:
-    """Return whether a generic-instruction-set probe can plausibly help."""
-    if result.returncode < 0:
-        return True
-    details = _faiss_error_details(result).lower()
-    return any(marker in details for marker in _FAISS_GENERIC_FALLBACK_MARKERS)
-
-
-def _installed_faiss_version() -> str:
-    """Read package metadata without importing a potentially broken FAISS module."""
-    try:
-        return metadata.version("faiss-cpu")
-    except metadata.PackageNotFoundError:
-        return "未知"
+    return _FAISS_BOOTSTRAP_COMPAT.sanitize_path(path)
 
 
 class PluginInitializer:
@@ -153,7 +82,6 @@ class PluginInitializer:
         self.memory_processor: MemoryProcessor | None = None
         self.db_migration: DBMigration | None = None
         self.conversation_manager: ConversationManager | None = None
-        self.index_validator: IndexValidator | None = None
         self.decay_scheduler: DecayScheduler | None = None
 
         # 初始化状态
@@ -165,18 +93,8 @@ class PluginInitializer:
         self._provider_check_attempts = 0
         self._max_provider_attempts = 60
         self._retry_task: asyncio.Task | None = None
-        self._index_maintenance_task: asyncio.Task | None = None
-        self._graph_index_requires_rebuild = False
-        self._index_maintenance_status: dict[str, Any] = {
-            "state": "idle",
-            "reason": "",
-            "current": 0,
-            "total": 0,
-            "message": "",
-            "started_at": None,
-            "finished_at": None,
-            "result": None,
-        }
+        self._faiss_bootstrap = FaissBootstrapService()
+        self._embedding_index_bootstrap: EmbeddingIndexBootstrapService | None = None
 
     async def initialize(self) -> bool:
         """
@@ -189,18 +107,14 @@ class PluginInitializer:
             if self._initialization_complete or self._initialization_failed:
                 return self._initialization_complete
 
-        logger.info("LivingMemory 插件开始后台初始化...")
-
-        # 0. 初始化 PromptManager（尽早初始化，供后续组件使用）
-        try:
-            from .prompts.prompt_manager import init_prompt_manager
-
-            init_prompt_manager(self.data_dir)
-        except Exception as e:
-            logger.warning(f"PromptManager 初始化失败（不影响核心功能）: {e}")
+        logger.info(f"{tag('init')} LivingMemory 插件开始后台初始化...")
 
         try:
-            # 1. 等待 Provider 就绪
+            # 1. 在 Provider 等待前先检查已有数据库，避免旧库在后台重试阶段
+            # 才暴露为“插件已加载但核心不可用”的半初始化状态。
+            await self._preflight_database_compatibility()
+
+            # 2. 等待 Provider 就绪
             if not await self._wait_for_providers_non_blocking():
                 missing = []
                 if not self.embedding_provider:
@@ -210,17 +124,17 @@ class PluginInitializer:
                 if not self.llm_provider:
                     missing.append("LLM Provider（请在 AstrBot 中配置语言模型）")
                 logger.warning(
-                    f"以下 Provider 暂时不可用，将在后台继续尝试: {', '.join(missing)}"
+                    f"{tag('init')} 以下 Provider 暂时不可用，将在后台继续尝试: {', '.join(missing)}"
                 )
                 self._start_retry_task_if_needed()
                 return False
 
-            # 2. Provider 就绪，继续完整初始化
+            # 3. Provider 就绪，继续完整初始化
             await self._complete_initialization()
             return True
 
         except Exception as e:
-            logger.error(f"LivingMemory 插件初始化失败: {e}", exc_info=True)
+            logger.error(f"{tag('init')} LivingMemory 插件初始化失败: {e}", exc_info=True)
             self._initialization_failed = True
             self._initialization_error = str(e)
             return False
@@ -241,7 +155,7 @@ class PluginInitializer:
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"Provider 重试任务异常退出: {exc}")
+                logger.error(f"{tag('init')} Provider 重试任务异常退出: {exc}")
         except Exception:
             # 防御性处理：读取 task.exception() 时不应阻断主流程
             pass
@@ -256,7 +170,7 @@ class PluginInitializer:
 
             if self.embedding_provider and self.llm_provider:
                 logger.info(
-                    "Provider check passed: embedding and llm providers are ready."
+                    f"{tag('init')} Provider check passed: embedding and llm providers are ready."
                 )
                 self._providers_ready = True
                 return True
@@ -265,7 +179,7 @@ class PluginInitializer:
             self._provider_check_attempts += 1
 
         logger.debug(
-            f"Provider 在 {max_wait}秒内未就绪（已尝试 {self._provider_check_attempts} 次）"
+            f"{tag('init')} Provider 在 {max_wait}秒内未就绪（已尝试 {self._provider_check_attempts} 次）"
             f"：embedding={'ready' if self.embedding_provider else 'not ready'}, "
             f"llm={'ready' if self.llm_provider else 'not ready'}"
         )
@@ -295,14 +209,14 @@ class PluginInitializer:
                 if not self.llm_provider:
                     missing.append("LLM Provider")
                 logger.info(
-                    f"等待 Provider 就绪（未就绪: {', '.join(missing)}）..."
+                    f"{tag('init')} 等待 Provider 就绪（未就绪: {', '.join(missing)}）..."
                     f"（已尝试 {self._provider_check_attempts}/{self._max_provider_attempts} 次，"
                     f"下次重试间隔 {current_interval:.1f}s）"
                 )
 
             if self.embedding_provider and self.llm_provider:
                 logger.info(
-                    f"Provider 在第 {self._provider_check_attempts} 次尝试后就绪，继续初始化。"
+                    f"{tag('init')} Provider 在第 {self._provider_check_attempts} 次尝试后就绪，继续初始化。"
                 )
                 self._providers_ready = True
 
@@ -311,7 +225,7 @@ class PluginInitializer:
                         if not self._initialization_complete:
                             await self._complete_initialization()
                 except Exception as e:
-                    logger.error(f"重试初始化失败: {e}", exc_info=True)
+                    logger.error(f"{tag('init')} 重试初始化失败: {e}", exc_info=True)
                     self._initialization_failed = True
                     self._initialization_error = str(e)
                 break
@@ -326,7 +240,7 @@ class PluginInitializer:
             if not self.llm_provider:
                 missing.append("LLM Provider（请配置语言模型）")
             logger.error(
-                f"以下 Provider 在 {self._provider_check_attempts} 次尝试后仍未就绪，初始化失败: "
+                f"{tag('init')} 以下 Provider 在 {self._provider_check_attempts} 次尝试后仍未就绪，初始化失败: "
                 f"{', '.join(missing) if missing else '未知'}"
             )
             self._initialization_failed = True
@@ -345,9 +259,9 @@ class PluginInitializer:
             if provider and isinstance(provider, EmbeddingProvider):
                 self.embedding_provider = provider
                 if not silent:
-                    logger.info(f"成功从配置加载 Embedding Provider: {emb_id}")
+                    logger.info(f"{tag('init')} 成功从配置加载 Embedding Provider: {emb_id}")
             elif provider and not silent:
-                logger.warning(f"Provider {emb_id} 不是 EmbeddingProvider 类型")
+                logger.warning(f"{tag('init')} Provider {emb_id} 不是 EmbeddingProvider 类型")
 
         if not self.embedding_provider:
             embedding_providers = self.context.get_all_embedding_providers()
@@ -359,11 +273,11 @@ class PluginInitializer:
                         "id",
                         self.embedding_provider.provider_config.get("id", "unknown"),
                     )
-                    logger.info(f"未指定 Embedding Provider，使用默认的: {provider_id}")
+                    logger.info(f"{tag('init')} 未指定 Embedding Provider，使用默认的: {provider_id}")
             else:
                 self.embedding_provider = None
                 if not silent:
-                    logger.debug("没有可用的 Embedding Provider")
+                    logger.debug(f"{tag('init')} 没有可用的 Embedding Provider")
 
         # 初始化 LLM Provider
         self.llm_provider = None
@@ -373,10 +287,10 @@ class PluginInitializer:
             if provider and isinstance(provider, Provider):
                 self.llm_provider = provider
                 if not silent:
-                    logger.info(f"成功从配置加载 LLM Provider: {llm_id}")
+                    logger.info(f"{tag('init')} 成功从配置加载 LLM Provider: {llm_id}")
             elif provider and not silent:
                 logger.warning(
-                    f"Provider {llm_id} 不是聊天 Provider 类型，已忽略该配置。"
+                    f"{tag('init')} Provider {llm_id} 不是聊天 Provider 类型，已忽略该配置。"
                 )
 
         if not self.llm_provider:
@@ -388,16 +302,16 @@ class PluginInitializer:
                 if default_provider and not isinstance(default_provider, Provider):
                     if not silent:
                         logger.warning(
-                            "AstrBot 默认 Provider 类型不正确，期望聊天 Provider。"
+                            f"{tag('init')} AstrBot 默认 Provider 类型不正确，期望聊天 Provider。"
                         )
                     self.llm_provider = None
                 else:
                     self.llm_provider = default_provider
                 if not silent and self.llm_provider:
-                    logger.info("使用 AstrBot 当前默认的 LLM Provider。")
+                    logger.info(f"{tag('init')} 使用 AstrBot 当前默认的 LLM Provider。")
             except (ValueError, Exception) as e:
                 if not silent:
-                    logger.debug(f"获取默认 LLM Provider 失败: {e}")
+                    logger.debug(f"{tag('init')} 获取默认 LLM Provider 失败: {e}")
                 self.llm_provider = None
 
     def _get_provider_by_id(self, provider_id: str, *, silent: bool):
@@ -413,151 +327,30 @@ class PluginInitializer:
         return None
 
     def _check_faiss_runtime(self) -> None:
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", "import faiss"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise InitializationError(
-                "FAISS 运行时检查失败，无法安全初始化向量数据库。"
-                "请确认 faiss-cpu 已正确安装，或改用兼容当前 CPU 的 FAISS 包。"
-            ) from exc
-
-        if result.returncode == 0:
-            return
-
-        details = _faiss_error_details(result)
-        if _is_faiss_binding_mismatch(details):
-            version = _installed_faiss_version()
-            raise InitializationError(
-                "FAISS 初始化失败：Python 封装与二进制扩展不匹配"
-                f"（检测到 faiss-cpu {version}）。这不是 Embedding Provider 配置问题。"
-                "AstrBot Desktop 用户请升级或修复内置 Python 环境；"
-                "请避免 faiss-cpu 1.14.2，并在同一环境中干净重装兼容版本"
-                "（建议 1.14.3 或更高版本）。"
-                f"{' 原始错误: ' + details if details else ''}"
-            )
-
-        if not _should_try_faiss_generic(result):
-            raise InitializationError(
-                "FAISS 初始化失败，faiss-cpu 无法在当前 Python 环境中加载。"
-                "请检查安装是否完整，并确保 Python 封装与二进制扩展来自同一版本。"
-                f"{' 原始错误: ' + details if details else ''}"
-            )
-
-        # Some faiss-cpu wheels select an optimized extension that is incompatible
-        # with the current CPU. Probe the generic extension before changing this process.
-        generic_env = os.environ.copy()
-        generic_env["FAISS_OPT_LEVEL"] = "generic"
-        try:
-            generic_result = subprocess.run(
-                [sys.executable, "-c", "import faiss"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                env=generic_env,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            generic_result = None
-
-        if generic_result is not None and generic_result.returncode == 0:
-            os.environ["FAISS_OPT_LEVEL"] = "generic"
-            logger.warning(
-                "FAISS 默认优化扩展加载失败，已回退到 generic 指令集兼容模式。"
-            )
-            return
-
-        if generic_result is not None:
-            generic_details = _faiss_error_details(generic_result)
-            if generic_details and generic_details != details:
-                details = f"{details}；generic 模式: {generic_details}".strip("；")
-        raise InitializationError(
-            "FAISS 初始化失败，当前 CPU 或运行环境可能不兼容 faiss-cpu。"
-            "已尝试 generic 指令集兼容模式；请重新安装兼容版本的 FAISS，"
-            "或更换运行环境。"
-            f"{' 原始错误: ' + details if details else ''}"
-        )
+        self._get_faiss_bootstrap().check_runtime()
 
     def _load_faiss_vec_db_class(self):
         global FaissVecDB
         if FaissVecDB is not None:
             return FaissVecDB
+        loaded_class = self._get_faiss_bootstrap().load_vec_db_class()
+        FaissVecDB = loaded_class
+        return loaded_class
 
-        self._check_faiss_runtime()
-        try:
-            import faiss as _faiss
-
-            _orig_read = _faiss.read_index
-            _orig_write = _faiss.write_index
-
-            def _patched_read_index(path: str, *args, **kwargs):
-                if isinstance(path, (str, bytes, os.PathLike)) and _needs_bridge(path):
-                    tmp = _make_temp_file("_faiss_read")
-                    try:
-                        shutil.copy2(path, tmp)
-                        return _orig_read(tmp, *args, **kwargs)
-                    finally:
-                        if os.path.exists(tmp):
-                            try:
-                                os.remove(tmp)
-                            except OSError:
-                                pass
-                return _orig_read(path, *args, **kwargs)
-
-            def _patched_write_index(index, path, *args, **kwargs) -> None:
-                # 仅在第二个参数为路径类对象 且 Windows 非 ASCII 时桥接；
-                # 否则原样转发（如 VectorIOWriter / FILE* 等非路径对象）
-                if isinstance(path, (str, bytes, os.PathLike)) and _needs_bridge(path):
-                    dirname = os.path.dirname(path)
-                    if dirname:
-                        os.makedirs(dirname, exist_ok=True)
-                    tmp = _make_temp_file("_faiss_write")
-                    try:
-                        _orig_write(index, tmp, *args, **kwargs)
-                        # os.replace 原子覆盖，同卷 rename 跨卷 copy+delete
-                        try:
-                            os.replace(tmp, path)
-                        except OSError:
-                            shutil.copy2(tmp, path)
-                            try:
-                                os.remove(tmp)
-                            except OSError:
-                                pass
-                    finally:
-                        if os.path.exists(tmp):
-                            try:
-                                os.remove(tmp)
-                            except OSError:
-                                pass
-                    return
-                _orig_write(index, path, *args, **kwargs)
-
-            _faiss.read_index = _patched_read_index
-            _faiss.write_index = _patched_write_index
-
-            from astrbot.core.db.vec_db.faiss_impl.vec_db import (
-                FaissVecDB as LoadedFaissVecDB,
-            )
-        except (ImportError, ModuleNotFoundError, SystemError, OSError) as exc:
-            raise InitializationError(
-                "FAISS 初始化失败，无法加载 AstrBot FaissVecDB。"
-                "请检查 faiss-cpu 安装状态和 CPU 指令集兼容性。"
-            ) from exc
-
-        FaissVecDB = LoadedFaissVecDB
-        return LoadedFaissVecDB
+    def _get_faiss_bootstrap(self) -> FaissBootstrapService:
+        """兼容未经过 __init__ 构造的测试/恢复实例。"""
+        service = getattr(self, "_faiss_bootstrap", None)
+        if service is None:
+            service = FaissBootstrapService()
+            self._faiss_bootstrap = service
+        return service
 
     async def _complete_initialization(self):
         """完成完整的初始化流程"""
         if self._initialization_complete:
             return
 
-        logger.info("开始完整初始化流程...")
+        logger.info(f"{tag('init')} 开始完整初始化流程...")
 
         try:
             # 初始化数据库
@@ -568,19 +361,36 @@ class PluginInitializer:
             graph_index_path = data_dir_path / "livingmemory_graph.index"
             graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
 
+            # 新安装时 preflight 不创建空数据库；在正式初始化阶段准备迁移管理器。
+            if self.db_migration is None:
+                self.db_migration = DBMigration(str(db_path))
+
             if not self.embedding_provider:
                 raise ProviderNotReadyError("Embedding Provider 未初始化")
             if not self.llm_provider or not isinstance(self.llm_provider, Provider):
                 raise ProviderNotReadyError("LLM Provider 未初始化或类型不正确")
 
+            # 在 FAISS 打开或改写主数据库前再次验证版本，覆盖 Provider 等待期间
+            # 数据库文件被替换的极端情况。
+            await self._check_and_migrate_database()
+
             faiss_vec_db_cls = self._load_faiss_vec_db_class()
 
-            # 检查索引文件维度与当前 embedding provider 维度是否一致
-            await self._check_and_fix_dimension_mismatch(str(index_path))
+            # 在 FaissVecDB 打开正式索引前校验 SQLite/FAISS/Provider 一致性。
+            # 需要修复时只构建影子索引，完整验证后才原子切换。
+            index_specs = [
+                EmbeddingIndexSpec("document", db_path, index_path),
+            ]
             if graph_memory_enabled:
-                self._graph_index_requires_rebuild = (
-                    await self._check_and_fix_dimension_mismatch(str(graph_index_path))
+                index_specs.append(
+                    EmbeddingIndexSpec(
+                        "graph",
+                        graph_doc_path,
+                        graph_index_path,
+                        vector_schema="graph-entry-v1",
+                    )
                 )
+            await self._prepare_embedding_indexes(index_specs)
 
             self.db = faiss_vec_db_cls(
                 str(db_path),
@@ -596,21 +406,13 @@ class PluginInitializer:
                     self.embedding_provider,
                 )
                 await self.graph_db.initialize()
-            logger.info(f"数据库已初始化。数据目录: {self.data_dir}")
-
-            # 初始化数据库迁移管理器
-            self.db_migration = DBMigration(str(db_path))
-
-            # 检查并执行数据库迁移
-            if self.config_manager.get("migration_settings.auto_migrate", True):
-                await self._check_and_migrate_database()
+            logger.info(f"{tag('init')} 数据库已初始化。数据目录: {self.data_dir}")
 
             # 初始化MemoryEngine
             stopwords_dir = data_dir_path / "stopwords"
             stopwords_dir.mkdir(parents=True, exist_ok=True)
 
             memory_engine_config = {
-                "rrf_k": self.config_manager.get("fusion_strategy.rrf_k", 60),
                 "decay_rate": self.config_manager.get(
                     "importance_decay.decay_rate", 0.01
                 ),
@@ -626,8 +428,11 @@ class PluginInitializer:
                 "protected_importance_threshold": self.config_manager.get(
                     "importance_decay.protected_importance_threshold", 1.0
                 ),
-                "importance_weight": self.config_manager.get(
-                    "recall_engine.importance_weight", 1.0
+                "search_cache_ttl_seconds": self.config_manager.get(
+                    "recall_engine.search_cache_ttl_seconds", 45.0
+                ),
+                "search_cache_max_size": self.config_manager.get(
+                    "recall_engine.search_cache_max_size", 256
                 ),
                 "min_importance_for_retrieval": self.config_manager.get(
                     "recall_engine.min_importance_for_retrieval", 0.0
@@ -636,7 +441,7 @@ class PluginInitializer:
                     "recall_engine.min_similarity_for_retrieval", 0.0
                 ),
                 "recent_memory_count": self.config_manager.get(
-                    "recall_engine.recent_memory_count", 2
+                    "recall_engine.recent_memory_count", 0
                 ),
                 "recent_memory_max_age_hours": self.config_manager.get(
                     "recall_engine.recent_memory_max_age_hours", 72
@@ -644,29 +449,11 @@ class PluginInitializer:
                 "memory_type_filter": self.config_manager.get(
                     "recall_engine.memory_type_filter", "all"
                 ),
-                "search_cache_enabled": self.config_manager.get(
-                    "recall_engine.search_cache_enabled", True
-                ),
-                "search_cache_ttl_seconds": self.config_manager.get(
-                    "recall_engine.search_cache_ttl_seconds", 45.0
-                ),
-                "search_cache_max_size": self.config_manager.get(
-                    "recall_engine.search_cache_max_size", 256
-                ),
-                "fallback_enabled": self.config_manager.get(
-                    "recall_engine.fallback_to_vector", True
-                ),
                 "cleanup_days_threshold": self.config_manager.get(
-                    "forgetting_agent.cleanup_days_threshold", 30
+                    "maintenance.cleanup_days_threshold", 30
                 ),
                 "cleanup_importance_threshold": self.config_manager.get(
-                    "forgetting_agent.cleanup_importance_threshold", 0.3
-                ),
-                "auto_cleanup_enabled": self.config_manager.get(
-                    "forgetting_agent.auto_cleanup_enabled", True
-                ),
-                "auto_archived_enabled": self.config_manager.get(
-                    "forgetting_agent.auto_archived_enabled", False
+                    "maintenance.cleanup_importance_threshold", 0.3
                 ),
                 "stopwords_path": str(stopwords_dir),
                 "graph_memory_enabled": graph_memory_enabled,
@@ -712,30 +499,6 @@ class PluginInitializer:
                 "atom_purge_delay_days": self.config_manager.get(
                     "graph_memory.atom_purge_delay_days", 30.0
                 ),
-                "index_rebuild_batch_size": self.config_manager.get(
-                    "index_rebuild_settings.batch_size", 50
-                ),
-                "index_rebuild_embedding_batch_size": self.config_manager.get(
-                    "index_rebuild_settings.embedding_batch_size", 8
-                ),
-                "index_rebuild_tasks_limit": self.config_manager.get(
-                    "index_rebuild_settings.tasks_limit", 1
-                ),
-                "index_rebuild_max_retries": self.config_manager.get(
-                    "index_rebuild_settings.max_retries", 5
-                ),
-                "index_rebuild_retry_base_delay": self.config_manager.get(
-                    "index_rebuild_settings.retry_base_delay", 30.0
-                ),
-                "index_rebuild_batch_delay": self.config_manager.get(
-                    "index_rebuild_settings.batch_delay", 5.0
-                ),
-                "index_rebuild_request_delay": self.config_manager.get(
-                    "index_rebuild_settings.request_delay", 5.0
-                ),
-                "index_rebuild_max_failure_ratio": self.config_manager.get(
-                    "index_rebuild_settings.max_failure_ratio", 0.02
-                ),
             }
 
             self.memory_engine = MemoryEngine(
@@ -746,27 +509,15 @@ class PluginInitializer:
                 config=memory_engine_config,
             )
             await self.memory_engine.initialize()
-            logger.info("MemoryEngine 已初始化")
+            logger.info(f"{tag('init')} MemoryEngine 已初始化")
 
             # 初始化 ConversationManager
             conversation_db_path = data_dir_path / "conversations.db"
             conversation_store = ConversationStore(str(conversation_db_path))
             await conversation_store.initialize()
 
-            session_config = self.config_manager.session_manager
-            self.conversation_manager = ConversationManager(
-                store=conversation_store,
-                max_cache_size=session_config.get("max_sessions", 100),
-                context_window_size=session_config.get("context_window_size", 50),
-                session_ttl=session_config.get("session_ttl", 3600),
-                identity_aliases=self.config_manager.get(
-                    "access_control.identity_aliases", ""
-                ),
-            )
-            logger.info("ConversationManager 已初始化")
-
-            # 自动修复 message_count 不一致问题
-            await self._repair_message_counts(conversation_store)
+            self.conversation_manager = ConversationManager(store=conversation_store)
+            logger.info(f"{tag('init')} ConversationManager 已初始化")
 
             # 初始化 MemoryProcessor
             # 注意：MemoryProcessor 不直接持有 llm_provider 实例引用，
@@ -779,16 +530,9 @@ class PluginInitializer:
                 llm_provider=llm_id if llm_id else None,
                 config={
                     "atom_enabled": memory_engine_config["atom_enabled"],
-                    "include_source_time_tags": self.config_manager.get(
-                        "reflection_engine.include_source_time_tags", True
-                    ),
                 },
             )
-            logger.info("MemoryProcessor 已初始化")
-
-            # 初始化索引验证器并自动重建索引
-            self.index_validator = IndexValidator(str(db_path), self.db)
-            await self._auto_rebuild_index_if_needed()
+            logger.info(f"{tag('init')} MemoryProcessor 已初始化")
 
             # 异步初始化 TextProcessor
             if self.memory_engine and hasattr(self.memory_engine, "text_processor"):
@@ -796,306 +540,84 @@ class PluginInitializer:
                     self.memory_engine.text_processor, "async_init"
                 ):
                     await self.memory_engine.text_processor.async_init()
-                    logger.info("TextProcessor 停用词已加载")
+                    logger.info(f"{tag('init')} TextProcessor 停用词已加载")
 
             # 启动重要性衰减调度器
+            # 维护任务由 maintenance 段统一控制：
+            # - cleanup_days_threshold == 0：关闭自动清理
+            # - backup_keep_days == 0：关闭自动备份
             decay_rate = self.config_manager.get("importance_decay.decay_rate", 0.01)
-            auto_cleanup_enabled = self.config_manager.get(
-                "forgetting_agent.auto_cleanup_enabled", True
+            cleanup_days = self.config_manager.get(
+                "maintenance.cleanup_days_threshold", 30
             )
-            if self.memory_engine and (decay_rate > 0 or auto_cleanup_enabled):
-                backup_enabled = self.config_manager.get(
-                    "backup_settings.enabled", True
-                )
-                backup_keep_days = self.config_manager.get(
-                    "backup_settings.keep_days", 7
-                )
+            backup_keep_days = self.config_manager.get(
+                "maintenance.backup_keep_days", 7
+            )
+            if self.memory_engine and (decay_rate > 0 or cleanup_days > 0):
                 scheduler = DecayScheduler(
                     memory_engine=self.memory_engine,
                     decay_rate=decay_rate,
                     data_dir=self.data_dir,
                     db_migration=self.db_migration,
-                    backup_enabled=backup_enabled,
+                    backup_enabled=backup_keep_days > 0,
                     backup_keep_days=backup_keep_days,
                 )
                 await scheduler.start()
                 self.decay_scheduler = scheduler
-                logger.info("DecayScheduler 已启动")
+                logger.info(
+                    f"{tag('init')} DecayScheduler 已启动 "
+                    f"(cleanup_days={cleanup_days}, backup_keep_days={backup_keep_days})"
+                )
 
             # 标记初始化完成
             self._initialization_complete = True
-            logger.info("LivingMemory 插件初始化成功。")
+            logger.info(f"{tag('init')} LivingMemory 插件初始化成功。")
 
         except Exception as e:
-            logger.error(f"完整初始化流程失败: {e}", exc_info=True)
+            logger.error(f"{tag('init')} 完整初始化流程失败: {e}", exc_info=True)
             self._initialization_failed = True
             self._initialization_error = str(e)
             raise InitializationError(f"初始化失败: {e}") from e
 
-    async def _check_and_migrate_database(self):
-        """检查并执行数据库迁移"""
+    async def _preflight_database_compatibility(self) -> None:
+        """在创建 FAISS/SQLite 运行组件前验证已有主数据库版本。"""
+        db_path = Path(self.data_dir) / "livingmemory.db"
+        if not db_path.exists():
+            return
+        if self.db_migration is None:
+            self.db_migration = DBMigration(str(db_path))
+        await self._check_and_migrate_database()
+
+    async def _check_and_migrate_database(self) -> None:
+        """检查并执行数据库迁移；失败时必须阻断初始化。"""
         try:
             if not self.db_migration:
-                logger.warning("数据库迁移管理器未初始化")
-                return
+                raise InitializationError("数据库迁移管理器未初始化")
 
             needs_migration = await self.db_migration.needs_migration()
 
             if not needs_migration:
-                logger.info("数据库版本已是最新，无需迁移")
+                logger.info(f"{tag('init')} 数据库版本已是最新，无需迁移")
                 return
 
-            logger.info("检测到旧版本数据库，开始自动迁移。")
-
-            if self.config_manager.get("migration_settings.create_backup", True):
-                backup_path = await self.db_migration.create_backup()
-                if backup_path:
-                    logger.info(f"数据库备份已创建: {backup_path}")
+            logger.info(f"{tag('init')} 检测到旧版本数据库，开始自动迁移。")
 
             result = await self.db_migration.migrate(progress_callback=None)
 
             if result.get("success"):
-                logger.info(f"数据库迁移结果: {result.get('message')}")
-                logger.info(f"   耗时: {result.get('duration', 0):.2f}秒")
+                logger.info(f"{tag('init')} 数据库迁移结果: {result.get('message')}")
+                logger.info(f"{tag('init')}    耗时: {result.get('duration', 0):.2f}秒")
             else:
-                logger.error(f"数据库迁移失败: {result.get('message')}")
-
-        except Exception as e:
-            logger.error(f"数据库迁移检查失败: {e}", exc_info=True)
-
-    async def _auto_rebuild_index_if_needed(self):
-        """Schedule index checking without blocking core plugin readiness."""
-        if self._index_maintenance_task and not self._index_maintenance_task.done():
-            return
-        if not self.index_validator or not self.memory_engine:
-            return
-
-        self._set_index_maintenance_status(
-            state="checking",
-            reason="startup consistency check",
-            current=0,
-            total=0,
-            message="正在检查索引一致性",
-            started_at=time.time(),
-            finished_at=None,
-            result=None,
-        )
-        self._index_maintenance_task = asyncio.create_task(
-            self._run_index_maintenance()
-        )
-        self._index_maintenance_task.add_done_callback(self._on_index_maintenance_done)
-
-    def _set_index_maintenance_status(self, **updates: Any) -> None:
-        self._index_maintenance_status.update(updates)
-        if self.memory_engine is not None:
-            self.memory_engine.index_maintenance_status = dict(
-                self._index_maintenance_status
-            )
-
-    @property
-    def index_maintenance_status(self) -> dict[str, Any]:
-        return dict(self._index_maintenance_status)
-
-    def _on_index_maintenance_done(self, task: asyncio.Task) -> None:
-        if self._index_maintenance_task is task:
-            self._index_maintenance_task = None
-        if task.cancelled():
-            return
-        try:
-            exception = task.exception()
-        except Exception:
-            return
-        if exception:
-            logger.error(f"索引维护任务异常退出: {exception}", exc_info=exception)
-
-    async def _run_index_maintenance(self) -> None:
-        """Check and repair indexes while the plugin remains available."""
-        try:
-            if not self.index_validator or not self.memory_engine:
-                return
-
-            fingerprint_changed = False
-            check_fingerprint = getattr(
-                self.index_validator, "provider_fingerprint_changed", None
-            )
-            if callable(check_fingerprint):
-                fingerprint_changed = bool(await check_fingerprint())
-            if fingerprint_changed:
-                status = await self.index_validator.check_consistency()
-                await self._run_scheduled_index_rebuild(
-                    "Embedding Provider 指纹已变化",
-                    status.documents_count,
-                    force_full_vector=True,
-                    rebuild_graph=True,
-                )
-                return
-
-            # 检查v1迁移状态
-            (
-                needs_migration_rebuild,
-                pending_count,
-            ) = await self.index_validator.get_migration_status()
-
-            if needs_migration_rebuild:
-                reason = f"v1 迁移数据需要重建索引（{pending_count} 条文档）"
-                await self._run_scheduled_index_rebuild(reason, pending_count)
-                return
-
-            # 检查索引一致性
-            status = await self.index_validator.check_consistency()
-
-            if not status.is_consistent and status.needs_rebuild:
-                logger.warning(f"检测到索引不一致: {status.reason}")
-                await self._run_scheduled_index_rebuild(
-                    status.reason, status.documents_count
-                )
-            else:
-                logger.info(f"索引一致性检查通过: {status.reason}")
-                graph_result = None
-                if self._graph_index_requires_rebuild:
-                    graph_result = await self._run_graph_index_rebuild()
-                self._set_index_maintenance_status(
-                    state="ready",
-                    reason=status.reason,
-                    current=status.documents_count,
-                    total=status.documents_count,
-                    message=(
-                        "索引一致性检查通过，图谱索引已重建"
-                        if graph_result is not None
-                        else "索引一致性检查通过"
-                    ),
-                    finished_at=time.time(),
-                    result=(
-                        {"success": True, "graph_rebuild": graph_result}
-                        if graph_result is not None
-                        else None
-                    ),
-                )
+                message = str(result.get("message") or "数据库迁移失败")
+                raise InitializationError(message)
 
         except asyncio.CancelledError:
-            self._set_index_maintenance_status(
-                state="cancelled",
-                message="索引维护已取消",
-                finished_at=time.time(),
-            )
+            raise
+        except InitializationError:
             raise
         except Exception as e:
-            logger.error(f"自动重建索引失败: {e}", exc_info=True)
-            self._set_index_maintenance_status(
-                state="failed",
-                message=str(e),
-                finished_at=time.time(),
-                result={"success": False, "error": str(e)},
-            )
-
-    async def _run_scheduled_index_rebuild(
-        self,
-        reason: str,
-        expected_total: int,
-        *,
-        force_full_vector: bool = False,
-        rebuild_graph: bool = False,
-    ) -> None:
-        if not self.index_validator or not self.memory_engine:
-            return
-
-        self._set_index_maintenance_status(
-            state="rebuilding",
-            reason=reason,
-            current=0,
-            total=max(0, int(expected_total)),
-            message="开始后台重建索引",
-        )
-        logger.info(f"开始后台索引维护: {reason}")
-
-        async def update_progress(current: int, total: int, message: str) -> None:
-            self._set_index_maintenance_status(
-                current=max(0, int(current)),
-                total=max(0, int(total)),
-                message=message,
-            )
-
-        rebuild_kwargs: dict[str, Any] = {"progress_callback": update_progress}
-        if force_full_vector:
-            rebuild_kwargs["force_full_vector"] = True
-        result = await self.index_validator.rebuild_indexes(
-            self.memory_engine, **rebuild_kwargs
-        )
-        success = bool(result.get("success"))
-        partial = bool(result.get("partial"))
-
-        check_consistency = getattr(self.index_validator, "check_consistency", None)
-        if success and callable(check_consistency):
-            final_status = await check_consistency()
-            if not final_status.is_consistent and final_status.needs_rebuild:
-                logger.info(
-                    "索引维护期间检测到并发写入，执行一次收尾补偿: "
-                    f"{final_status.reason}"
-                )
-                reconciliation = await self.index_validator.rebuild_indexes(
-                    self.memory_engine,
-                    progress_callback=update_progress,
-                )
-                result["reconciliation"] = dict(reconciliation)
-                success = bool(reconciliation.get("success"))
-                partial = partial or bool(reconciliation.get("partial"))
-                if success:
-                    final_status = await check_consistency()
-
-            if success and not final_status.is_consistent:
-                partial = True
-                result["post_check"] = {
-                    "consistent": False,
-                    "reason": final_status.reason,
-                }
-
-        if (
-            success
-            and not partial
-            and (rebuild_graph or self._graph_index_requires_rebuild)
-        ):
-            result["graph_rebuild"] = await self._run_graph_index_rebuild()
-
-        result["success"] = success
-        result["partial"] = partial
-        state = "partial" if success and partial else "ready" if success else "failed"
-        self._set_index_maintenance_status(
-            state=state,
-            current=int(result.get("processed", 0) or 0),
-            total=int(result.get("total", expected_total) or 0),
-            message=str(result.get("message") or "索引维护完成"),
-            finished_at=time.time(),
-            result=dict(result),
-        )
-        if success:
-            logger.info(
-                f"索引后台维护完成: 成功 {result.get('processed', 0)} 条, "
-                f"失败 {result.get('errors', 0)} 条"
-            )
-        else:
-            logger.error(f"索引后台维护失败: {result.get('message')}")
-
-    async def _run_graph_index_rebuild(self) -> dict[str, int]:
-        if self.memory_engine is None:
-            return {"rebuilt": 0, "skipped": 0}
-        self._set_index_maintenance_status(message="正在重建图谱索引")
-        result = await self.memory_engine.rebuild_graph_index()
-        self._graph_index_requires_rebuild = False
-        return result
-
-    async def _repair_message_counts(self, conversation_store: ConversationStore):
-        """修复会话表中 message_count 与实际消息数量不一致的问题"""
-        try:
-            logger.info("开始检查并修复 message_count 一致性。")
-            fixed_sessions = await conversation_store.sync_message_counts()
-
-            if fixed_sessions:
-                logger.info(f"已修复 {len(fixed_sessions)} 个会话的 message_count")
-            else:
-                logger.debug("所有会话的 message_count 均正确")
-
-        except Exception as e:
-            logger.error(f"修复 message_count 失败: {e}", exc_info=True)
+            logger.error(f"{tag('init')} 数据库迁移检查失败: {e}", exc_info=True)
+            raise InitializationError(f"数据库迁移检查失败: {e}") from e
 
     @property
     def is_initialized(self) -> bool:
@@ -1132,91 +654,27 @@ class PluginInitializer:
         start_time = time.time()
         while not self._initialization_complete and not self._initialization_failed:
             if time.time() - start_time > timeout:
-                logger.error(f"等待插件初始化超时（{timeout}秒）")
+                logger.error(f"{tag('init')} 等待插件初始化超时（{timeout}秒）")
                 return False
             await asyncio.sleep(0.2)
 
         return self._initialization_complete
 
-    async def _check_and_fix_dimension_mismatch(self, index_path: str) -> bool:
-        """
-        检查 FAISS 索引维度与当前 embedding provider 维度是否一致
-
-        当用户更换 embedding provider 后，旧索引的维度可能与新模型不匹配，
-        导致 FAISS 插入时报错 "assert d == self.d"。
-        此方法检测并自动删除不兼容的旧索引，让系统重建。
-
-        Args:
-            index_path: FAISS 索引文件路径
-        """
-        if not os.path.exists(index_path):
-            return False
-
-        # 空文件不是有效索引，直接删除让 initialize() 重建，避免 faiss 抛异常
-        try:
-            if os.path.getsize(index_path) == 0:
-                os.remove(index_path)
-                logger.debug(f"已删除空索引文件: {_sanitize_path(index_path)}")
-                return True
-        except OSError:
-            pass
-
-        try:
-            import faiss  # noqa: F401
-        except (ImportError, ModuleNotFoundError, SystemError, OSError) as exc:
-            raise InitializationError(
-                "FAISS 初始化失败，无法读取索引文件。"
-                "请检查 faiss-cpu 安装状态和 CPU 指令集兼容性。"
-            ) from exc
-
-        # 读取索引文件 — 仅在 FAISS I/O 失败时进入坏索引处理
-        try:
-            old_index = self._faiss_read_index_safe(index_path)
-        except InitializationError:
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            # 文件在 os.path.exists 和 faiss.read_index 之间消失（如被外部进程删除），
-            # 这不是坏文件，不需要隔离，让 initialize() 自动重建即可
-            if "No such file" in error_msg or "could not open" in error_msg:
-                logger.debug(
-                    f"FAISS 索引文件({_sanitize_path(index_path)})在检查时不可访问，将由 initialize() 重建: {e}"
-                )
-                return False
-            # 真正的坏文件：直接删除（系统会自动重建），避免累积 .corrupt_* 文件
-            try:
-                os.remove(index_path)
-                logger.error(
-                    f"FAISS 索引文件已损坏并被删除: {_sanitize_path(index_path)}。"
-                    "系统将创建空索引，并在初始化后尝试分批重建。",
-                    exc_info=True,
-                )
-            except OSError:
-                logger.error(
-                    f"检查索引维度时出错，且删除坏索引失败: {e}",
-                    exc_info=True,
-                )
-            return True
-
-        # 对比维度 — 放在坏索引处理之外，避免 embedding_provider 异常误删健康索引
-        old_dim = old_index.d
-        new_dim = self.embedding_provider.get_dim()  # type: ignore
-
-        if old_dim != new_dim:
-            logger.warning(
-                f"检测到 FAISS 索引维度不匹配: 索引维度={old_dim}, "
-                f"当前 Embedding Provider 维度={new_dim}"
+    async def _prepare_embedding_indexes(
+        self,
+        specs: list[EmbeddingIndexSpec],
+    ) -> None:
+        """启动前准备与当前 Provider 一致的主/图向量索引。"""
+        if self.embedding_provider is None:
+            raise ProviderNotReadyError("Embedding Provider 未初始化")
+        service = getattr(self, "_embedding_index_bootstrap", None)
+        if service is None:
+            service = EmbeddingIndexBootstrapService(
+                Path(self.data_dir) / "embedding_index_state.json",
+                faiss_bootstrap=self._get_faiss_bootstrap(),
             )
-            logger.warning(
-                "这通常由 Embedding 模型切换导致。旧索引将被删除，系统会自动重建索引。"
-            )
-
-            os.remove(index_path)
-            logger.info(f"已删除不兼容的旧索引文件: {_sanitize_path(index_path)}")
-            logger.info("注意: 向量检索功能将暂时不可用，直到重新导入记忆数据。")
-            return True
-
-        return False
+            self._embedding_index_bootstrap = service
+        await service.prepare(specs, self.embedding_provider)
 
     @staticmethod
     def _faiss_read_index_safe(index_path: str):
@@ -1224,22 +682,7 @@ class PluginInitializer:
 
         monkey-patch 已覆盖全局 faiss.read_index，此方法作为显式后备。
         """
-        if not _needs_bridge(index_path):
-            import faiss
-
-            return faiss.read_index(index_path)
-        tmp = _make_temp_file("_faiss_read")
-        try:
-            shutil.copy2(index_path, tmp)
-            import faiss
-
-            return faiss.read_index(tmp)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+        return _FAISS_BOOTSTRAP_COMPAT.faiss_read_index_safe(index_path)
 
     async def stop_scheduler(self) -> None:
         """停止衰减调度器"""
@@ -1249,14 +692,6 @@ class PluginInitializer:
 
     async def stop_background_tasks(self) -> None:
         """停止初始化阶段的后台任务（如Provider重试）"""
-        if self._index_maintenance_task and not self._index_maintenance_task.done():
-            self._index_maintenance_task.cancel()
-            try:
-                await self._index_maintenance_task
-            except asyncio.CancelledError:
-                pass
-        self._index_maintenance_task = None
-
         if self._retry_task and not self._retry_task.done():
             self._retry_task.cancel()
             try:

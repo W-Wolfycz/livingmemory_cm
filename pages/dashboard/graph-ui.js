@@ -70,11 +70,16 @@
         var qs = path.substring(qi + 1);
         var params = {};
         new URLSearchParams(qs).forEach(function(v, k) { params[k] = v; });
+        if (window.lmPersonaId && !params.persona_id) params.persona_id = window.lmPersonaId;
         return unwrapGraphData(await bridge.apiGet(buildEndpoint(base), params));
       }
-      return unwrapGraphData(await bridge.apiGet(buildEndpoint(path), {}));
+      var getParams = {};
+      if (window.lmPersonaId) getParams.persona_id = window.lmPersonaId;
+      return unwrapGraphData(await bridge.apiGet(buildEndpoint(path), getParams));
     }
-    return unwrapGraphData(await bridge.apiPost(buildEndpoint(path), options.body || {}));
+    var body = Object.assign({}, options.body || {});
+    if (window.lmPersonaId && !body.persona_id) body.persona_id = window.lmPersonaId;
+    return unwrapGraphData(await bridge.apiPost(buildEndpoint(path), body));
   }
 
   function unwrapGraphData(response) {
@@ -137,20 +142,17 @@
       setCanvasMessage(window.t("graph2d.moduleFail"), false);
     }
 
-    window.addEventListener("languagechange", function() {
-      initLabels();
-      if (state.payload) renderLegend(state.payload);
-      if (!state.payload && dom.canvasState && dom.canvasState.textContent) {
-        setCanvasMessage(window.t("graph.canvasDefault"), false);
-      }
-    });
-
     /* app.js starts loading after the host Bridge reports ready. */
   }
 
   /* Expose for app.js lazy-load */
   window.ensureGraphScene = function() {
     if (!state.hasLoadedOverview && !state.isLoading) fetchOverview();
+  };
+
+  window.refreshGraphForPersona = function() {
+    state.hasLoadedOverview = false;
+    if (!state.isLoading) fetchOverview();
   };
 
   /* ================================================================
@@ -181,7 +183,10 @@
     setCanvasMessage(window.t("graph.loadingOverview"), true);
     try {
       var filters = getFilters();
-      var params = new URLSearchParams({ full_graph: "true" });
+      var params = new URLSearchParams(Object.assign(
+        { full_graph: "true" },
+        EXPANDED_GRAPH_LIMITS
+      ));
       if (filters.session_id) params.set("session_id", filters.session_id);
       var qs = params.toString();
       var payload = await requestGraph("/graph/overview" + (qs ? "?" + qs : ""));

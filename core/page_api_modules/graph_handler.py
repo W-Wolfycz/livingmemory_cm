@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from quart import request
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 if TYPE_CHECKING:
     from .utils import PageApiUtils
@@ -46,7 +46,6 @@ class GraphHandler:
         查询参数:
             - session_id: 会话ID过滤（可选）
             - persona_id: 人格ID过滤（可选）
-            - full_graph: 返回作用域内完整图谱（默认false）
             - limit_memories: 记忆数量限制（默认12，最大24）
             - limit_entries: 入口数量限制（默认36，最大80）
             - limit_nodes: 节点数量限制（默认48，最大80）
@@ -58,12 +57,6 @@ class GraphHandler:
         args = request.args
         session_id = self.utils.optional_text(args.get("session_id"))
         persona_id = self.utils.optional_text(args.get("persona_id"))
-        full_graph = str(args.get("full_graph", "false")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
 
         try:
             limit_memories = max(1, min(int(args.get("limit_memories", 12)), 24))
@@ -96,20 +89,14 @@ class GraphHandler:
                     )
                 )
 
-            if full_graph:
-                snapshot = await graph_store.get_full_graph_snapshot(
-                    session_id=session_id,
-                    persona_id=persona_id,
-                )
-            else:
-                snapshot = await graph_store.get_graph_snapshot(
-                    session_id=session_id,
-                    persona_id=persona_id,
-                    limit_memories=limit_memories,
-                    limit_entries=limit_entries,
-                    limit_nodes=limit_nodes,
-                    limit_edges=limit_edges,
-                )
+            snapshot = await graph_store.get_graph_snapshot(
+                session_id=session_id,
+                persona_id=persona_id,
+                limit_memories=limit_memories,
+                limit_entries=limit_entries,
+                limit_nodes=limit_nodes,
+                limit_edges=limit_edges,
+            )
             return self.utils.ok(
                 self.utils.build_graph_view_payload(
                     snapshot,
@@ -123,7 +110,7 @@ class GraphHandler:
                 )
             )
         except Exception as exc:
-            logger.error(f"[PageAPI] 获取图谱概览失败: {exc}", exc_info=True)
+            logger.error(f"{tag('page')} 获取图谱概览失败: {exc}", exc_info=True)
             return self.utils.error(str(exc))
 
     async def query_graph(self, memory_engine) -> dict[str, Any]:
@@ -356,5 +343,5 @@ class GraphHandler:
                 )
             )
         except Exception as exc:
-            logger.error(f"[PageAPI] 图谱查询失败: {exc}", exc_info=True)
+            logger.error(f"{tag('page')} 图谱查询失败: {exc}", exc_info=True)
             return self.utils.error(str(exc))

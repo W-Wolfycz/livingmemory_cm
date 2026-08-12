@@ -3,13 +3,12 @@
 封装AstrBot的FaissVecDB,提供统一的检索接口
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
+from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
+
+from ...log import logger, tag
 
 _TRUNCATED_CONTENT_MARKER = "\n...[中间内容已截断]...\n"
 
@@ -56,11 +55,11 @@ async def delete_faiss_documents_by_ids(
         offset=0,
         limit=len(unique_ids),
     )
-    deletable = [doc for doc in documents if doc.get("doc_id")]
+    deletable = [document for document in documents if document.get("doc_id")]
     if not deletable:
         return []
 
-    found_ids = [int(doc["id"]) for doc in deletable]
+    found_ids = [int(document["id"]) for document in deletable]
     await embedding_delete(found_ids)
     for document in deletable:
         await delete_by_uuid(document["doc_id"])
@@ -154,10 +153,8 @@ class VectorRetriever:
         _MAX_CONTENT_CHARS = 4000
         insert_content = content
         if len(insert_content) > _MAX_CONTENT_CHARS:
-            from astrbot.api import logger as _logger
-
-            _logger.warning(
-                f"[VectorRetriever] 记忆内容过长 ({len(insert_content)} 字符)，"
+            logger.warning(
+                f"{tag('retrieval')} 记忆内容过长 ({len(insert_content)} 字符)，"
                 f"保留开头和结尾并压缩至 {_MAX_CONTENT_CHARS} 字符"
             )
             insert_content = self._fit_content_for_embedding(
@@ -196,10 +193,8 @@ class VectorRetriever:
         # 大多数 embedding 模型限制在 8192 tokens 以内，按字符数保守截断
         _MAX_QUERY_CHARS = 2000
         if len(processed_query) > _MAX_QUERY_CHARS:
-            from astrbot.api import logger as _logger
-
-            _logger.warning(
-                f"[VectorRetriever] 查询文本过长 ({len(processed_query)} 字符)，"
+            logger.warning(
+                f"{tag('retrieval')} 查询文本过长 ({len(processed_query)} 字符)，"
                 f"截断至 {_MAX_QUERY_CHARS} 字符以避免 token 超限"
             )
             processed_query = processed_query[:_MAX_QUERY_CHARS]
@@ -213,7 +208,7 @@ class VectorRetriever:
 
         # 执行向量检索
         # fetch_k设置为k*2以确保过滤后有足够的结果
-        fetch_k = k * 4 if metadata_filters else k * 2
+        fetch_k = k * 2 if metadata_filters else k
 
         faiss_results = await self.faiss_db.retrieve(
             query=processed_query,
@@ -229,11 +224,6 @@ class VectorRetriever:
             # FaissVecDB返回的Result对象包含similarity和data
             # data是包含id, text, metadata的字典
             doc_data = result.data
-            metadata = doc_data.get("metadata")
-            if isinstance(metadata, dict) and str(
-                metadata.get("status") or "active"
-            ) != "active":
-                continue
             results.append(
                 VectorResult(
                     doc_id=doc_data["id"],
@@ -243,7 +233,7 @@ class VectorRetriever:
                 )
             )
 
-        return results[:k]
+        return results
 
     async def _get_uuid_from_id(self, doc_id: int) -> str | None:
         """
@@ -259,7 +249,7 @@ class VectorRetriever:
         if doc_id in self._id_cache:
             return self._id_cache[doc_id]
 
-        from astrbot.api import logger
+        from ...log import logger, tag
 
         try:
             doc_storage = self.faiss_db.document_storage
@@ -279,7 +269,7 @@ class VectorRetriever:
             return uuid_doc_id
 
         except Exception as e:
-            logger.error(f"[UUID查询] 失败 (doc_id={doc_id}): {e}")
+            logger.error(f"{tag('retrieval')} [UUID查询] 失败 (doc_id={doc_id}): {e}")
             return None
 
     async def update_metadata(self, doc_id: int, metadata: dict[str, Any]) -> bool:
@@ -295,7 +285,7 @@ class VectorRetriever:
         """
         import json
 
-        from astrbot.api import logger
+        from ...log import logger, tag
 
         try:
             doc_storage = self.faiss_db.document_storage
@@ -306,7 +296,7 @@ class VectorRetriever:
             )
 
             if not docs or len(docs) == 0:
-                logger.warning(f"[元数据更新] 文档不存在 (doc_id={doc_id})")
+                logger.warning(f"{tag('retrieval')} [元数据更新] 文档不存在 (doc_id={doc_id})")
                 return False
 
             doc = docs[0]
@@ -338,13 +328,13 @@ class VectorRetriever:
                     },
                 )
 
-            logger.debug(f"[元数据更新] 成功 (doc_id={doc_id})")
+            logger.debug(f"{tag('retrieval')} [元数据更新] 成功 (doc_id={doc_id})")
             return True
 
         except Exception as e:
-            from astrbot.api import logger
+            from ...log import logger, tag
 
-            logger.error(f"[元数据更新] 失败 (doc_id={doc_id}): {e}", exc_info=True)
+            logger.error(f"{tag('retrieval')} [元数据更新] 失败 (doc_id={doc_id}): {e}", exc_info=True)
             return False
 
     async def delete_document(self, doc_id: int) -> bool:
@@ -357,14 +347,14 @@ class VectorRetriever:
         Returns:
             bool: 是否成功删除
         """
-        from astrbot.api import logger
+        from ...log import logger, tag
 
         try:
             # 优化3: 使用缓存的UUID查询方法
             uuid_doc_id = await self._get_uuid_from_id(doc_id)
 
             if not uuid_doc_id:
-                logger.warning(f"[向量删除] 文档不存在或缺少UUID (doc_id={doc_id})")
+                logger.warning(f"{tag('retrieval')} [向量删除] 文档不存在或缺少UUID (doc_id={doc_id})")
                 return False
 
             # 使用 UUID 调用 FaissVecDB.delete()
@@ -374,13 +364,13 @@ class VectorRetriever:
             # 从缓存中移除
             self._id_cache.pop(doc_id, None)
 
-            logger.debug(f"[向量删除] 成功删除 (doc_id={doc_id}, uuid={uuid_doc_id})")
+            logger.debug(f"{tag('retrieval')} [向量删除] 成功删除 (doc_id={doc_id}, uuid={uuid_doc_id})")
             return True
 
         except Exception as e:
-            from astrbot.api import logger
+            from ...log import logger, tag
 
-            logger.error(f"[向量删除] 失败 (doc_id={doc_id}): {e}", exc_info=True)
+            logger.error(f"{tag('retrieval')} [向量删除] 失败 (doc_id={doc_id}): {e}", exc_info=True)
             return False
 
     async def delete_documents(self, doc_ids: list[int]) -> list[int]:

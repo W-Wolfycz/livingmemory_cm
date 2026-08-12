@@ -1,5 +1,5 @@
-name: astrbot_plugin_livingmemory
-author: lxfight
-version: 2.5.7
-description: 为 AstrBot 打造的、拥有完整记忆生命周期的智能长期记忆插件。(v2.0重构版）
-repo: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory
+name: livingmemory_cm
+author: Wolfycz
+version: 2.5.7-cm
+description: 基于 astrbot_plugin_livingmemory 的 CM-only 单路径维护版（需配合 chat_memory context_takeover）
+repo: https://github.com/W-Wolfycz/livingmemory_cm

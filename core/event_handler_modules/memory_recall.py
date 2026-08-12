@@ -4,21 +4,19 @@
 """
 
 import asyncio
-import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from astrbot.api import logger
+from ...log import log_ref, logger, tag
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
-from ..memory_scope import is_event_memory_allowed, resolve_memory_scope
 from ..utils import (
     OperationContext,
     format_memories_for_fake_tool_call,
     format_memories_for_injection,
+    get_cm_plugin,
     get_persona_id,
 )
 
@@ -60,47 +58,22 @@ class MemoryRecall:
         self.message_utils = message_utils
         self.injection_adapter = injection_adapter
 
-    @staticmethod
-    def _message_timestamp_seconds(value) -> float | None:
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-        elif isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return None
-            try:
-                timestamp = float(stripped)
-            except ValueError:
-                try:
-                    timestamp = datetime.fromisoformat(
-                        stripped.replace("Z", "+00:00")
-                    ).timestamp()
-                except ValueError:
-                    return None
-        else:
-            return None
-
-        if timestamp > 100_000_000_000:
-            timestamp /= 1000.0
-        return timestamp if timestamp > 0 else None
-
     async def handle_memory_recall(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
         """Query and inject long-term memory before LLM request"""
         try:
-            if not is_event_memory_allowed(self.config_manager, event):
-                logger.debug("当前事件不在记忆白名单中，跳过记忆召回")
-                return
             session_id = event.unified_msg_origin
-            logger.debug(f"[DEBUG-Recall] 获取到 unified_msg_origin: {session_id}")
+            session_ref = log_ref(session_id, "session")
+            logger.debug(f"{tag('recall')} 获取到会话引用: {session_ref}")
 
             # 检测异常session_id
             if session_id and (
                 "Error:" in session_id or "error:" in session_id.lower()
             ):
                 logger.warning(
-                    f"[{session_id}] 检测到异常的session_id，这可能导致记忆功能异常。"
+                    f"{tag('recall')} [{session_ref}] 检测到异常会话引用，"
+                    "这可能导致记忆功能异常。"
                 )
 
             async with OperationContext("记忆召回", session_id):
@@ -112,65 +85,37 @@ class MemoryRecall:
                 has_extra_parts = bool(extra_parts)
 
                 if not has_prompt_text and not has_extra_parts:
-                    logger.debug(f"[{session_id}] 请求中无可用用户内容，跳过记忆召回")
+                    logger.debug(f"{tag('recall')} [{session_ref}] 请求中无可用用户内容，跳过记忆召回")
                     return
 
                 normalized = self._normalize_text_only_context_parts(req, session_id)
                 if normalized > 0:
-                    logger.info(f"[{session_id}] 已归一化 {normalized} 条纯文本历史消息")
+                    logger.debug(f"{tag('recall')} [{session_ref}] 已归一化 {normalized} 条纯文本历史消息")
 
-                # 自动删除旧的注入记忆
-                if self.config_manager.get("recall_engine.auto_remove_injected", True):
-                    removed = self._remove_injected_memories_from_context(
-                        req, session_id
+                # 自动删除旧的注入记忆（恒开）
+                # extra_user_content 路径通过 mark_as_temp(_no_save=True) 已天然不持久化，
+                # 此处对它无副作用；user_message_*/fake_tool_call 路径需要主动清理。
+                removed = self._remove_injected_memories_from_context(req, session_id)
+                removed += self._remove_fake_tool_call_from_context(req, session_id)
+                if removed > 0:
+                    logger.debug(
+                        f"{tag('recall')} [{session_ref}] 已清理 {removed} 处历史记忆注入片段"
                     )
-                    removed += self._remove_fake_tool_call_from_context(req, session_id)
-                    if removed > 0:
-                        logger.info(
-                            f"[{session_id}] 已清理 {removed} 处历史记忆注入片段"
-                        )
 
-                # 先提取用户消息（消息存储和召回都需要）
+                # 先提取用户消息（召回查询需要）
                 actual_query = await self.message_utils.get_event_message_str(event)
 
-                request_query = (
-                    prompt_text.strip() if isinstance(prompt_text, str) else ""
-                )
-
-                # 存储用户消息（仅私聊），无论是否启用召回都需要
-                is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
-                if not is_group and actual_query:
-                    message_to_store = request_query
-                    if not message_to_store:
-                        message_to_store = (
-                            await self.message_utils.extract_message_content(event, req)
-                        )
-                    if not message_to_store:
-                        message_to_store = actual_query.strip()
-                    await self.conversation_manager.add_message_from_event(
-                        event=event,
-                        role="user",
-                        content=message_to_store,
-                    )
-                    await self.message_utils.enforce_message_limit(session_id)
-
-                # 若 top_k <= 0，跳过记忆检索和注入，但上述清理和消息存储已执行
+                # 若 top_k <= 0，跳过记忆检索和注入，但上述清理已执行
                 top_k = self.config_manager.get("recall_engine.top_k", 5)
                 if top_k <= 0:
-                    logger.info(
-                        f"[{session_id}] top_k={top_k} <= 0，跳过记忆检索和注入"
+                    logger.debug(
+                        f"{tag('recall')} [{session_ref}] top_k={top_k} <= 0，跳过记忆检索和注入"
                     )
                     return
 
                 if not actual_query:
-                    logger.warning(f"[{session_id}] 原始用户消息为空，跳过记忆召回")
+                    logger.warning(f"{tag('recall')} [{session_ref}] 原始用户消息为空，跳过记忆召回")
                     return
-
-                # 获取过滤配置
-                filtering_config = self.config_manager.filtering_settings
-                use_persona_filtering = filtering_config.get(
-                    "use_persona_filtering", True
-                )
 
                 # 获取 persona_id，与 AstrBot 主流程保持一致的三级优先级：
                 # 1. session_service_config（最高）
@@ -180,61 +125,30 @@ class MemoryRecall:
                 # 因此不能直接依赖 req.system_prompt 已注入人格，需自行走完整优先级。
                 persona_id = await get_persona_id(self.context, event)
 
-                recall_session_id = resolve_memory_scope(self.config_manager, event)
-                recall_persona_id = persona_id if use_persona_filtering else None
+                # 人格/会话过滤恒开（CM-only 单路径：CM 已隔离短期窗口，
+                # LM 长期记忆同样按 session/persona 隔离，无需额外开关）
+                recall_session_id = session_id
+                recall_persona_id = persona_id
 
-                # 使用原始用户输入作为召回关键字
+                # 当前发言始终是召回主体。历史只从 CM 公开 API 读取
+                # 当前用户最近的完整 user/assistant 问答，用于指代消歧。
                 query_for_search = actual_query
-
-                # 上下文扩展：拼接最近2轮对话作为查询，提升检索精准度
-                if self.config_manager.get(
-                    "recall_engine.inject_with_recent_context", False
-                ):
-                    try:
-                        recent_messages = (
-                            await self.conversation_manager.get_context(
-                                session_id,
-                                max_messages=5,
-                                format_for_llm=False,
-                            )
-                        )
-                        if recent_messages and len(recent_messages) > 1:
-                            # recent_messages 按 timestamp DESC 排列（最新在前）
-                            # 跳过索引0（当前消息），取后续消息作为扩展上下文
-                            context_parts = []
-                            max_age_seconds = self.config_manager.get(
-                                "recall_engine.recent_context_max_age_seconds", 7200
-                            )
-                            now = time.time()
-                            skipped_by_age = 0
-                            for msg in reversed(recent_messages[1:]):
-                                if max_age_seconds > 0:
-                                    timestamp = self._message_timestamp_seconds(
-                                        msg.get("timestamp")
-                                    )
-                                    if (
-                                        timestamp is None
-                                        or now - timestamp > max_age_seconds
-                                    ):
-                                        skipped_by_age += 1
-                                        continue
-                                content = msg.get("content", "")
-                                if content and content.strip():
-                                    context_parts.append(content.strip())
-                            if context_parts:
-                                expanded = " | ".join(context_parts)
-                                query_for_search = expanded + " " + actual_query
-                                logger.info(
-                                    f"[{session_id}] 上下文扩展查询: "
-                                    f"{len(context_parts)}条历史消息 + 当前消息，"
-                                    f"按时间跳过={skipped_by_age}条"
-                                )
-                    except Exception as e:
-                        logger.warning(f"[{session_id}] 获取上下文扩展失败: {e}")
+                try:
+                    query_for_search = await self._build_recall_query(
+                        event=event,
+                        actual_query=actual_query,
+                        persona_id=persona_id or "",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"{tag('recall')} [{session_ref}] 构建 CM 用户历史召回查询失败，"
+                        f"回退当前发言: {e}"
+                    )
 
                 # 执行记忆召回
-                logger.info(
-                    f"[{session_id}] 开始记忆召回，查询='{query_for_search[:80]}...'"
+                logger.debug(
+                    f"{tag('recall')} [{session_ref}] 开始记忆召回，"
+                    f"查询长度={len(query_for_search)}"
                 )
 
                 recalled_memories = await self.memory_engine.search_memories(
@@ -245,8 +159,8 @@ class MemoryRecall:
                 )
 
                 if recalled_memories:
-                    logger.info(
-                        f"[{session_id}] 检索到 {len(recalled_memories)} 条记忆"
+                    logger.debug(
+                        f"{tag('recall')} [{session_ref}] 检索到 {len(recalled_memories)} 条记忆"
                     )
 
                     # 格式化并注入记忆
@@ -264,9 +178,9 @@ class MemoryRecall:
                     # 输出详细记忆信息
                     for i, mem in enumerate(recalled_memories, 1):
                         logger.debug(
-                            f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
+                            f"{tag('recall')} [{session_ref}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
                             f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
-                            f"内容={mem.content[:100]}..."
+                            f"内容长度={len(mem.content or '')}"
                         )
 
                     # 根据配置选择注入方式（含 Provider 兼容降级）
@@ -274,15 +188,12 @@ class MemoryRecall:
                         "recall_engine.injection_method", "extra_user_content"
                     )
                     provider = None
-                    if configured_method in (
-                        "fake_tool_call",
-                        "fake_tool_call_deepseek_v4",
-                    ):
+                    if configured_method in ("fake_tool_call",):
                         try:
                             provider = self.context.get_using_provider(session_id)
                         except Exception as e:
                             logger.warning(
-                                f"[{session_id}] 获取当前 Provider 失败，"
+                                f"{tag('recall')} [{session_ref}] 获取当前 Provider 失败，"
                                 f"将按无 Provider 继续解析注入模式: {e}"
                             )
                     injection_method, fallback_reason = (
@@ -290,34 +201,47 @@ class MemoryRecall:
                     )
                     if fallback_reason:
                         logger.warning(
-                            f"[{session_id}] 注入模式从 {configured_method} 降级为 "
+                        f"{tag('recall')} [{session_ref}] 注入模式从 {configured_method} 降级为 "
                             f"{injection_method}: {fallback_reason}"
                         )
 
-                    memory_str = format_memories_for_injection(memory_list)
+                    memory_str = format_memories_for_injection(
+                        memory_list,
+                        max_memories=self.config_manager.get(
+                            "recall_engine.injection_max_memories", 3
+                        ),
+                        max_chars=self.config_manager.get(
+                            "recall_engine.injection_max_chars", 3200
+                        ),
+                    )
+                    if not memory_str:
+                        logger.debug(
+                            f"{tag('recall')} [{session_ref}] 候选记忆去重/预算筛选后为空"
+                        )
+                        return
 
                     if injection_method == "user_message_before":
                         req.prompt = memory_str + "\n\n" + (req.prompt or "")
                         logger.info(
-                            f"[{session_id}] 成功向用户消息前注入 {len(recalled_memories)} 条记忆"
+                            f"{tag('recall')} [{session_ref}] 成功向用户消息前注入 {len(recalled_memories)} 条记忆"
                         )
                     elif injection_method == "user_message_after":
                         req.prompt = (req.prompt or "") + "\n\n" + memory_str
                         logger.info(
-                            f"[{session_id}] 成功向用户消息后注入 {len(recalled_memories)} 条记忆"
+                            f"{tag('recall')} [{session_ref}] 成功向用户消息后注入 {len(recalled_memories)} 条记忆"
                         )
                     elif injection_method == "fake_tool_call":
                         fake_messages = format_memories_for_fake_tool_call(
                             memory_list,
                             query=actual_query,
                             k=self.config_manager.get("recall_engine.top_k", 5),
-                            session_filtered=recall_session_id is not None,
-                            persona_filtered=use_persona_filtering,
+                            session_filtered=True,
+                            persona_filtered=True,
                         )
                         if fake_messages:
                             req.contexts.extend(fake_messages)
                             logger.info(
-                                f"[{session_id}] 成功以伪造工具调用方式注入 "
+                                f"{tag('recall')} [{session_ref}] 成功以伪造工具调用方式注入 "
                                 f"{len(recalled_memories)} 条记忆"
                             )
                     else:
@@ -327,16 +251,117 @@ class MemoryRecall:
                             TextPart(text=memory_str).mark_as_temp()
                         )
                         logger.info(
-                            f"[{session_id}] 成功向用户消息末尾注入 "
+                            f"{tag('recall')} [{session_ref}] 成功向用户消息末尾注入 "
                             f"{len(recalled_memories)} 条记忆"
                         )
                 else:
-                    logger.info(f"[{session_id}] 未找到相关记忆")
+                    logger.debug(f"{tag('recall')} [{session_ref}] 未找到相关记忆")
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+            logger.error(f"{tag('recall')} 处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+
+    async def _build_recall_query(
+        self,
+        *,
+        event: AstrMessageEvent,
+        actual_query: str,
+        persona_id: str,
+    ) -> str:
+        """以当前发言为主体，附加当前用户最近的 CM 完整问答作为消歧上下文。"""
+        rounds_limit = int(
+            self.config_manager.get("recall_engine.query_context_rounds", 2) or 0
+        )
+        max_chars = int(
+            self.config_manager.get("recall_engine.query_context_max_chars", 800)
+            or 0
+        )
+        if rounds_limit <= 0 or max_chars <= 0:
+            return actual_query
+
+        cm_plugin = get_cm_plugin(self.context)
+        if cm_plugin is None or not hasattr(cm_plugin, "query_rounds"):
+            return actual_query
+
+        umo = event.unified_msg_origin
+        user_id = str(event.get_sender_id() or "")
+        if not umo or not user_id:
+            return actual_query
+        cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        if not cid:
+            return actual_query
+
+        max_age_seconds = max(
+            0,
+            int(
+                self.config_manager.get(
+                    "recall_engine.query_context_max_age_seconds",
+                    0,
+                )
+                or 0
+            ),
+        )
+        since = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+            if max_age_seconds > 0
+            else None
+        )
+
+        rounds = await cm_plugin.query_rounds(
+            umo=umo,
+            conversation_id=cid,
+            user_id=user_id,
+            limit_rounds=rounds_limit,
+            # 召回消歧只需要“该用户发言 + Bot 对该发言的完整回复”，
+            # 不跟随 full_group/cross_session 的混合消息窗口。
+            llm_status="llm_success",
+            persona_id=persona_id,
+            since=since,
+        )
+        if not rounds:
+            return actual_query
+
+        history_lines: list[str] = []
+        used = 0
+        for round_messages in reversed(rounds):
+            round_lines: list[str] = []
+            for message in round_messages:
+                role = message.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = str(message.get("content") or "").strip()
+                if text:
+                    label = "用户" if role == "user" else "助手"
+                    round_lines.append(f"{label}：{text}")
+            round_text = "\n".join(round_lines)
+            if not round_text:
+                continue
+            separator_length = 1 if history_lines else 0
+            remaining = max_chars - used - separator_length
+            if remaining <= 0:
+                break
+            if len(round_text) > remaining:
+                if remaining > 40:
+                    history_lines.append(round_text[-remaining:])
+                break
+            history_lines.append(round_text)
+            used += separator_length + len(round_text)
+
+        if not history_lines:
+            return actual_query
+        history_lines.reverse()
+        history = "\n".join(history_lines)
+        logger.debug(
+            f"{tag('recall')} [{log_ref(umo, 'umo')}] 召回查询包含当前发言 + "
+            f"{min(len(rounds), rounds_limit)} 轮当前用户 CM 问答（{len(history)}字符）"
+        )
+        # 当前发言置于首尾各一次，明确其为 embedding 查询主体。
+        return (
+            f"当前用户发言：{actual_query}\n"
+            f"最近相关问答（仅用于指代消歧）：\n{history}\n"
+            f"需要检索的当前发言：{actual_query}"
+        )
 
     def _remove_injected_memories_from_context(
         self, req: ProviderRequest, session_id: str
@@ -426,7 +451,10 @@ class MemoryRecall:
             normalized += 1
 
         if normalized:
-            logger.debug(f"[{session_id}] 已归一化 {normalized} 条纯文本历史 content parts")
+            logger.debug(
+                f"{tag('recall')} [{log_ref(session_id, 'session')}] 已归一化 "
+                f"{normalized} 条纯文本历史 content parts"
+            )
         return normalized
 
     def _remove_fake_tool_call_from_context(

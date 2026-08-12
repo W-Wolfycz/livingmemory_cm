@@ -2,7 +2,6 @@
   "common": {
     "yes": "是",
     "no": "否",
-    "none": "无",
     "never": "从未",
     "unknown_error": "未知错误"
   },
@@ -15,20 +14,51 @@
     },
     "component_not_ready": "{command} 执行失败：{component}未初始化。\n请先执行 /lmem status 检查插件状态；如状态异常请查看启动日志。",
     "suggestions": {
-      "status": ["确认数据库文件可读写","确认记忆引擎已完成初始化","查看日志中的异常堆栈定位具体模块"],
-      "search": ["确认关键词不为空且长度合理","确认数据库和索引文件存在且可读写","检查日志中是否有检索组件初始化失败信息"],
-      "forget": ["确认记忆 ID 存在且属于当前可访问数据","确认数据库未被其他进程长时间占用","查看日志中的删除调用堆栈"],
-      "rebuild_index": ["确认 Embedding Provider 已可用","确认数据库文件与索引文件可读写","根据日志定位失败文档后重试重建"],
-      "rebuild_graph": ["确认图记忆功能已启用","确认数据库与索引文件可读写","查看日志定位具体失败文档"],
-      "summarize": ["确认当前会话至少有 2 条未总结消息","确认 LLM Provider 可正常响应","检查日志中的 summary 处理堆栈"],
-      "reset": ["确认会话 ID 有效且会话存储可访问","确认数据库未被占用","查看日志中的 clear_session 调用堆栈"],
-      "cleanup": ["确认当前会话存在可读取的历史记录","确认对话存储可读写","查看日志中的 cleanup 调用堆栈"]
+      "status": [
+        "确认数据库文件可读写",
+        "确认记忆引擎已完成初始化",
+        "查看日志中的异常堆栈定位具体模块"
+      ],
+      "search": [
+        "确认关键词不为空且长度合理",
+        "确认数据库和索引文件存在且可读写",
+        "检查日志中是否有检索组件初始化失败信息"
+      ],
+      "forget": [
+        "确认记忆 ID 存在且属于当前可访问数据",
+        "确认数据库未被其他进程长时间占用",
+        "查看日志中的删除调用堆栈"
+      ],
+      "rebuild_graph": [
+        "确认图记忆功能已启用",
+        "确认数据库与索引文件可读写",
+        "查看日志定位具体失败文档"
+      ],
+      "reset": [
+        "确认会话 ID 有效且会话存储可访问",
+        "确认数据库未被占用",
+        "查看日志中的 clear_session 调用堆栈"
+      ],
+      "cleanup": [
+        "确认当前会话存在可读取的历史记录",
+        "确认对话存储可读写",
+        "查看日志中的 cleanup 调用堆栈"
+      ]
     }
   },
   "status": {
     "action_name": "获取状态",
     "report": "LivingMemory 状态报告\n\n总记忆数: {total}\n会话数: {session_count}\n最后更新: {last_update}\n数据库大小: {db_size:.2f} MB\n\n可用操作:\n- /lmem search <关键词>",
-    "index_maintenance": "\n\n索引维护: {state} ({current}/{total})\n{message}"
+    "graph_index": "\n\n图向量索引: {state}\n- 总向量: {total}\n- 记忆级向量: {memory}\n- 旧 entry 级向量: {legacy}\n- 未引用向量: {orphan}\n- 缺少向量的来源记忆: {missing}",
+    "graph_states": {
+      "disabled": "未启用",
+      "current": "当前格式",
+      "rebuild_required": "需要迁移（执行 /lmem rebuild-graph）",
+      "rebuilding": "正在安全重建",
+      "switched": "已切换到新代",
+      "failed": "上次重建失败，旧代仍保留",
+      "cancelled": "上次重建已取消，旧代仍保留"
+    }
   },
   "search": {
     "action_name": "搜索",
@@ -47,31 +77,13 @@
     "success": "已删除记忆 #{id}。",
     "not_found": "删除失败：记忆 #{id} 不存在。\n请先使用 /lmem search 或 WebUI 确认记忆 ID。"
   },
-  "rebuild_index": {
-    "action_name": "重建索引",
-    "checking": "开始检查索引状态...",
-    "ok": "索引状态正常: {reason}",
-    "status_template": "当前索引状态:\n• Documents表: {doc_count} 条\n• BM25索引: {bm25_count} 条\n• 向量索引: {vec_count} 条\n• 问题: {reason}\n\n开始重建索引...",
-    "partial_notice": "\n注意: 本次重建存在少量失败，失败率 {ratio:.2%}，未超过安全阈值。可稍后再次执行 /lmem rebuild-index 补齐。",
-    "result_template": "索引重建完成。\n\n处理结果:\n• 成功: {success} 条\n• 失败: {failed} 条\n• 总计: {total} 条\n• 向量处理模式: {vector_mode}\n• 新索引切换: {switched}\n{partial_notice}\n\n现在可以继续使用召回功能。",
-    "failed": "索引重建失败。\n错误详情: {message}\n请查看日志确认失败原因后重试 /lmem rebuild-index。"
-  },
   "rebuild_graph": {
     "action_name": "重建图记忆",
-    "starting": "开始重建图记忆索引，这可能需要一些时间...",
-    "success": "图记忆重建完成。\n\n• 重建: {rebuilt} 条\n• 跳过: {skipped} 条"
+    "starting": "开始安全重建图记忆索引。新代完整生成并回放并发写入后才会切换；失败时保留旧代。这可能需要一些时间和 Embedding 调用...",
+    "success": "图记忆重建完成，已切换为每条来源记忆一个聚合向量。\n\n• 重建: {rebuilt} 条\n• 跳过: {skipped} 条"
   },
   "webui": {
     "guide": "LivingMemory 管理界面\n\n请通过 AstrBot 官方 WebUI 访问:\n• 打开 AstrBot 仪表盘\n• 进入 插件 -> LivingMemory -> Pages -> dashboard\n\n提示:\n• 插件页面复用 AstrBot 登录态，无需额外登录\n• 需要 AstrBot >= 4.24.2 版本支持\n\n可在界面中执行:\n• 记忆编辑与管理\n• 可视化统计分析\n• 图谱浏览与召回调试\n• 数据迁移与索引维护"
-  },
-  "summarize": {
-    "action_name": "记忆总结",
-    "access_denied": "当前用户或会话不在长期记忆白名单中。",
-    "invalid_count": "总结消息条数必须是大于等于 2 的整数。",
-    "no_new": "当前没有需要总结的新对话。\n当前消息总数: {total}\n已总结到消息序号: {index}",
-    "starting": "开始手动总结记忆...\n消息范围: [{start}:{end}]，共 {count} 条",
-    "fetch_failed": "获取消息失败：未读取到可总结的消息。\n请确认当前会话存在历史消息后重试。",
-    "success": "记忆总结完成。\n重要性: {importance:.2f}\n主题: {topics}\n已更新总结进度至第 {count} 条消息"
   },
   "reset": {
     "action_name": "重置记忆上下文",
@@ -91,7 +103,7 @@
     "notice_exec": "AstrBot 对话历史已更新，记忆注入片段已清理。"
   },
   "help": {
-    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-index       重建索引（修复索引不一致）\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem summarize [message_count]  立即总结，或重新总结最近指定条数的消息\n/lmem reset               重置当前会话记忆上下文\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 索引不一致时执行 rebuild-index\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n更多信息: https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory"
+    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem reset               重置当前会话记忆上下文\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n源代码（AGPL-3.0）: https://github.com/W-Wolfycz/livingmemory_cm"
   },
   "init": {
     "ready": "插件已就绪。可使用 /lmem help 查看可用命令。",

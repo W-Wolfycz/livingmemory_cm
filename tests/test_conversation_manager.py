@@ -1,224 +1,266 @@
-"""
-Tests for ConversationManager behaviors.
+"""ConversationManager 单元测试（CM-only 单路径版）。
+
+ConversationManager 在 CM-only fork 中仅维护会话元数据
+（如 last_summarized_timestamp），不再做消息写入/读取/缓存。
+
+测试覆盖：
+- create_or_get_session：存在则返回，不存在则创建
+- get_session_info：返回 Session 或 None
+- get_recent_sessions：透传 store
+- clear_session：删除消息 + 重置元数据
+- update_session_metadata：session 不存在时 warning + no-op；存在则合并写入
+- get_session_metadata：session 不存在返回 default；存在返回值或 default
+- reset_session_metadata：清空 metadata dict 并持久化
+
+测试通过 fake store（不依赖 aiosqlite），隔离 SQL 层。
 """
 
-from pathlib import Path
-from types import SimpleNamespace
+from __future__ import annotations
+
+import asyncio
+from typing import Any
 
 import pytest
-from astrbot_plugin_livingmemory.core.managers.conversation_manager import (
-    ConversationManager,
+
+from livingmemory_cm.core.managers.conversation_manager import ConversationManager
+from livingmemory_cm.core.models.conversation_models import (
+    Message,
+    Session,
+    deserialize_from_json,
+    serialize_to_json,
 )
-from astrbot_plugin_livingmemory.storage.conversation_store import ConversationStore
-
-from astrbot.api.platform import MessageType
 
 
-class _DummyEvent:
-    def __init__(
-        self,
-        session_id: str,
-        group: bool = False,
-        self_id: str = "bot-1",
-    ):
-        self.unified_msg_origin = session_id
-        self._group = group
-        self.self_id = self_id
-        self.sender_id = "u1"
-        self.sender_name = "Tester"
+class FakeStore:
+    """内存版 ConversationStore，仅实现 ConversationManager 依赖的方法。"""
 
-    def get_sender_id(self):
-        return "u1"
+    def __init__(self) -> None:
+        self.sessions: dict[str, Session] = {}
+        self.deleted_messages: list[str] = []
 
-    def get_sender_name(self):
-        return "Tester"
+    async def get_session(self, session_id: str) -> Session | None:
+        return self.sessions.get(session_id)
 
-    def get_self_id(self):
-        return self.self_id
-
-    def get_platform_id(self):
-        return "test-instance"
-
-    def get_message_type(self):
-        return MessageType.GROUP_MESSAGE if self._group else MessageType.FRIEND_MESSAGE
-
-    def get_platform_name(self):
-        return "test"
-
-
-class _DummyTelegramEvent(_DummyEvent):
-    def __init__(
-        self,
-        session_id: str,
-        first_name: str | None = None,
-        last_name: str | None = None,
-        user_id: int = 12345,
-    ):
-        super().__init__(session_id, group=False)
-        self.sender_id = str(user_id)
-        raw_user = SimpleNamespace(
-            id=user_id,
-            username=None,
-            first_name=first_name,
-            last_name=last_name,
+    async def create_session(self, session_id: str, platform: str) -> Session:
+        session = Session(
+            id=len(self.sessions) + 1,
+            session_id=session_id,
+            platform=platform,
+            created_at=0.0,
+            last_active_at=0.0,
+            message_count=0,
+            participants=[],
+            metadata={},
         )
-        self.message_obj = SimpleNamespace(
-            sender=SimpleNamespace(user_id=str(user_id), nickname="Unknown"),
-            raw_message=SimpleNamespace(
-                message=SimpleNamespace(from_user=raw_user),
-                effective_user=raw_user,
-            ),
-        )
+        self.sessions[session_id] = session
+        return session
 
-    def get_sender_id(self):
-        return self.sender_id
+    async def update_session_activity(self, session_id: str) -> None:
+        if session_id in self.sessions:
+            self.sessions[session_id].last_active_at = 999.0
 
-    def get_sender_name(self):
-        return "Unknown"
+    async def get_recent_sessions(self, limit: int = 10) -> list[Session]:
+        return list(self.sessions.values())[:limit]
 
-    def get_platform_name(self):
-        return "telegram"
+    async def delete_session_messages(self, session_id: str) -> int:
+        self.deleted_messages.append(session_id)
+        return 0
 
 
-@pytest.mark.asyncio
-async def test_conversation_manager_add_and_get_context(tmp_path: Path):
-    db_path = tmp_path / "cm.db"
-    store = ConversationStore(str(db_path))
-    await store.initialize()
-    manager = ConversationManager(store=store, max_cache_size=2, context_window_size=10)
+@pytest.fixture
+def store() -> FakeStore:
+    return FakeStore()
 
-    event = _DummyEvent("test:private:s1", group=False)
-    user_message = await manager.add_message_from_event(
-        event, role="user", content="hello"
+
+@pytest.fixture
+def manager(store: FakeStore) -> ConversationManager:
+    return ConversationManager(store=store)
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def test_create_or_get_session_creates_new(store: FakeStore, manager: ConversationManager) -> None:
+    session = _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
+    assert session.session_id == "s1"
+    assert session.platform == "aiocqhttp"
+    assert "s1" in store.sessions
+
+
+def test_create_or_get_session_returns_existing_and_updates_activity(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
+    original_active = store.sessions["s1"].last_active_at
+
+    result = _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
+    assert result.session_id == "s1"
+    assert store.sessions["s1"].last_active_at != original_active
+
+
+def test_get_session_info_returns_none_when_missing(manager: ConversationManager) -> None:
+    result = _run(manager.get_session_info("nonexistent"))
+    assert result is None
+
+
+def test_get_session_info_returns_session_when_exists(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
+    result = _run(manager.get_session_info("s1"))
+    assert result is not None
+    assert result.session_id == "s1"
+
+
+def test_get_recent_sessions_passes_limit(store: FakeStore, manager: ConversationManager) -> None:
+    for i in range(3):
+        _run(manager.create_or_get_session(f"s{i}", platform="p"))
+    result = _run(manager.get_recent_sessions(limit=2))
+    assert len(result) == 2
+
+
+def test_clear_session_deletes_messages_and_resets_metadata(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="p"))
+    _run(manager.update_session_metadata("s1", "last_summarized_timestamp", "2026-01-01 00:00:00"))
+    assert store.sessions["s1"].metadata != {}
+
+    _run(manager.clear_session("s1"))
+
+    assert "s1" in store.deleted_messages
+    assert store.sessions["s1"].metadata == {}
+
+
+def test_update_session_metadata_no_op_when_session_missing(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.update_session_metadata("nonexistent", "key", "value"))
+    assert store.sessions == {}
+
+
+def test_update_session_metadata_merges_existing_keys(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="p"))
+    _run(manager.update_session_metadata("s1", "last_summarized_timestamp", "T1"))
+    _run(manager.update_session_metadata("s1", "other_key", "V2"))
+
+    md = store.sessions["s1"].metadata
+    assert md["last_summarized_timestamp"] == "T1"
+    assert md["other_key"] == "V2"
+
+
+def test_get_session_metadata_returns_default_when_session_missing(
+    manager: ConversationManager
+) -> None:
+    result = _run(manager.get_session_metadata("nonexistent", "key", "fallback"))
+    assert result == "fallback"
+
+
+def test_get_session_metadata_returns_default_when_key_missing(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="p"))
+    result = _run(manager.get_session_metadata("s1", "missing", "default"))
+    assert result == "default"
+
+
+def test_get_session_metadata_returns_value_when_present(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="p"))
+    _run(manager.update_session_metadata("s1", "last_summarized_timestamp", "T1"))
+    result = _run(manager.get_session_metadata("s1", "last_summarized_timestamp"))
+    assert result == "T1"
+
+
+def test_reset_session_metadata_clears_dict(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.create_or_get_session("s1", platform="p"))
+    _run(manager.update_session_metadata("s1", "k1", "v1"))
+    _run(manager.update_session_metadata("s1", "k2", "v2"))
+
+    _run(manager.reset_session_metadata("s1"))
+
+    assert store.sessions["s1"].metadata == {}
+
+
+def test_reset_session_metadata_no_op_when_missing(
+    store: FakeStore, manager: ConversationManager
+) -> None:
+    _run(manager.reset_session_metadata("nonexistent"))
+    assert store.sessions == {}
+
+
+def test_message_roundtrip_and_llm_format() -> None:
+    message = Message(
+        id=1,
+        session_id="s1",
+        role="assistant",
+        content="hello",
+        sender_id="bot",
+        sender_name="Bot",
+        group_id="g1",
+        platform="test",
+        metadata={"is_bot_message": True},
     )
-    assistant_message = await manager.add_message_from_event(
-        event, role="assistant", content="world"
+
+    restored = Message.from_dict(message.to_dict())
+    formatted = restored.format_for_llm(include_sender_name=True)
+
+    assert restored.content == "hello"
+    assert formatted["role"] == "assistant"
+    assert "[Bot:" in formatted["content"]
+
+
+def test_message_multimodal_content_is_normalized_for_llm() -> None:
+    message = Message(
+        id=1,
+        session_id="s1",
+        role="user",
+        content=[
+            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+            {"type": "text", "text": "图片里的日程是下午三点"},
+        ],
+        sender_id="u1",
+        sender_name="Alice",
+        group_id="g1",
+        platform="test",
+        metadata={},
     )
 
-    assert user_message.sender_id == "u1"
-    assert user_message.sender_name == "Tester"
-    assert assistant_message.sender_id == "bot-1"
-    assert assistant_message.sender_name == "bot-1"
-    assert assistant_message.metadata == {"is_bot_message": True}
+    formatted = message.format_for_llm(include_sender_name=True)["content"]
 
-    context = await manager.get_context("test:private:s1")
-    assert len(context) == 2
-    assert context[0]["role"] == "user"
-
-    messages = await manager.get_messages("test:private:s1", limit=10)
-    assert len(messages) == 2
-
-    session = await manager.get_session_info("test:private:s1")
-    assert session is not None
-    assert session.message_count == 2
-
-    await store.close()
+    assert "图片里的日程是下午三点" in formatted
+    assert "image_url" not in formatted
+    assert "example.test" not in formatted
 
 
-@pytest.mark.asyncio
-async def test_private_assistant_uses_explicit_bot_fallback_without_self_id(
-    tmp_path: Path,
-):
-    store = ConversationStore(str(tmp_path / "bot-fallback.db"))
-    await store.initialize()
-    manager = ConversationManager(store=store)
-    event = _DummyEvent("test:private:s-fallback", self_id="")
-
-    message = await manager.add_message_from_event(
-        event, role="assistant", content="world"
+def test_message_image_only_content_uses_placeholder() -> None:
+    message = Message(
+        id=1,
+        session_id="s1",
+        role="user",
+        content=[
+            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+        ],
+        sender_id="u1",
+        sender_name="Alice",
+        group_id=None,
+        platform="test",
+        metadata={},
     )
 
-    assert message.sender_id == "bot:test-instance"
-    assert message.sender_name == "Bot"
-    assert message.group_id is None
-    await store.close()
+    assert message.format_for_llm(include_sender_name=True)["content"] == "[图片消息]"
+    assert message.to_dict()["content"] == "[图片消息]"
 
 
-@pytest.mark.asyncio
-async def test_group_assistant_replaces_user_name_with_bot_name(tmp_path: Path):
-    store = ConversationStore(str(tmp_path / "group-bot.db"))
-    await store.initialize()
-    manager = ConversationManager(store=store)
-    event = _DummyEvent("test:group:g1", group=True)
-    event.bot_name = "LivingMemory Bot"
+def test_conversation_json_helpers() -> None:
+    raw = serialize_to_json({"a": 1})
 
-    message = await manager.add_message_from_event(
-        event, role="assistant", content="world"
-    )
-
-    assert message.sender_id == "bot-1"
-    assert message.sender_name == "LivingMemory Bot"
-    assert message.group_id == "test:group:g1"
-    await store.close()
-
-
-@pytest.mark.asyncio
-async def test_conversation_manager_range_and_metadata(tmp_path: Path):
-    db_path = tmp_path / "cm2.db"
-    store = ConversationStore(str(db_path))
-    await store.initialize()
-    manager = ConversationManager(store=store, max_cache_size=2, context_window_size=10)
-
-    event = _DummyEvent("test:private:s2", group=False)
-    for i in range(6):
-        role = "user" if i % 2 == 0 else "assistant"
-        await manager.add_message_from_event(event, role=role, content=f"m-{i}")
-
-    rng = await manager.get_messages_range(
-        "test:private:s2", start_index=2, end_index=5
-    )
-    assert [m.content for m in rng] == ["m-2", "m-3", "m-4"]
-
-    await manager.update_session_metadata("test:private:s2", "last_summarized_index", 3)
-    assert (
-        await manager.get_session_metadata(
-            "test:private:s2", "last_summarized_index", default=0
-        )
-        == 3
-    )
-
-    await manager.clear_session("test:private:s2")
-    assert await store.get_message_count("test:private:s2") == 0
-
-    await store.close()
-
-
-@pytest.mark.asyncio
-async def test_conversation_manager_resolves_telegram_name_without_username(
-    tmp_path: Path,
-):
-    db_path = tmp_path / "telegram.db"
-    store = ConversationStore(str(db_path))
-    await store.initialize()
-    manager = ConversationManager(store=store, max_cache_size=2, context_window_size=10)
-
-    event = _DummyTelegramEvent(
-        "telegram:private:s3",
-        first_name="Alice",
-        last_name="Lee",
-        user_id=67890,
-    )
-    message = await manager.add_message_from_event(event, role="user", content="hello")
-
-    assert message.sender_id == "67890"
-    assert message.sender_name == "Alice Lee"
-
-    await store.close()
-
-
-@pytest.mark.asyncio
-async def test_conversation_manager_falls_back_to_sender_id_for_unknown_name(
-    tmp_path: Path,
-):
-    db_path = tmp_path / "telegram-id.db"
-    store = ConversationStore(str(db_path))
-    await store.initialize()
-    manager = ConversationManager(store=store, max_cache_size=2, context_window_size=10)
-
-    event = _DummyTelegramEvent("telegram:private:s4", user_id=24680)
-    message = await manager.add_message_from_event(event, role="user", content="hello")
-
-    assert message.sender_id == "24680"
-    assert message.sender_name == "24680"
-
-    await store.close()
+    assert isinstance(raw, str)
+    assert deserialize_from_json(raw)["a"] == 1
+    assert deserialize_from_json(None, default={}) == {}

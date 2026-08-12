@@ -4,7 +4,9 @@
 
 from typing import TYPE_CHECKING, Any
 
-from astrbot.api import logger
+from quart import request
+
+from ...log import logger, tag
 
 if TYPE_CHECKING:
     from .utils import PageApiUtils
@@ -39,8 +41,9 @@ class StatsHandler:
         Returns:
             包含统计信息的字典
         """
+        persona_id = self.utils.optional_text(request.args.get("persona_id"))
         try:
-            stats = await memory_engine.get_statistics()
+            stats = await memory_engine.get_statistics(persona_id=persona_id)
 
             # 使用专用的 COUNT(*) 统计，确保显示完整图谱总数
             graph_store = self.utils.get_graph_store(memory_engine)
@@ -103,5 +106,5 @@ class StatsHandler:
 
             return self.utils.ok(stats)
         except Exception as exc:
-            logger.error(f"[PageAPI] 获取统计信息失败: {exc}", exc_info=True)
+            logger.error(f"{tag('page')} 获取统计信息失败: {exc}", exc_info=True)
             return self.utils.error(str(exc))

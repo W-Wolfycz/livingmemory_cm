@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from quart import request
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 if TYPE_CHECKING:
     from .utils import PageApiUtils
@@ -48,6 +48,7 @@ class RecallHandler:
             return self.utils.error("k 必须是整数")
 
         session_id = self.utils.optional_text(payload.get("session_id"))
+        persona_id = self.utils.optional_text(payload.get("persona_id"))
 
         try:
             start_time = time.time()
@@ -55,11 +56,11 @@ class RecallHandler:
                 query=query_text,
                 k=k,
                 session_id=session_id,
-                persona_id=None,
+                persona_id=persona_id,
             )
             elapsed_time = (time.time() - start_time) * 1000
         except Exception as exc:
-            logger.error(f"[PageAPI] 召回测试失败: {exc}", exc_info=True)
+            logger.error(f"{tag('page')} 召回测试失败: {exc}", exc_info=True)
             return self.utils.error(str(exc))
 
         formatted_results = []
@@ -98,6 +99,7 @@ class RecallHandler:
                 "query": query_text,
                 "k": k,
                 "session_id_filter": session_id,
+                "persona_id_filter": persona_id,
                 "elapsed_time_ms": round(elapsed_time, 2),
             }
         )

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 from ..models.conversation_models import Message
 from ..models.memory_atom import MemoryAtom
@@ -35,7 +35,7 @@ class MemoryProcessor:
         初始化记忆处理器
 
         Args:
-            context: AstrBot上下文,用于获取人格管理器
+            context: AstrBot 上下文，用于动态解析 LLM Provider；不读取 Persona Prompt
             llm_provider: LLM Provider 实例或 Provider ID 字符串。
                           传入实例时直接使用（测试用）；传入字符串时动态解析。
                           留空则使用AstrBot默认Provider。
@@ -88,195 +88,58 @@ class MemoryProcessor:
         return None
 
     def _load_prompts(self) -> None:
-        """从 PromptManager 加载提示词模板（支持用户自定义覆盖）"""
-        try:
-            from ..prompts.prompt_manager import get_prompt_manager
-
-            mgr = get_prompt_manager()
-            if mgr is not None:
-                self.private_chat_prompt = mgr.get_prompt("private_chat_prompt")
-                self.group_chat_prompt = mgr.get_prompt("group_chat_prompt")
-                logger.info("[MemoryProcessor] 通过 PromptManager 加载提示词模板成功")
-            else:
-                self._load_prompts_fallback()
-        except Exception as e:
-            logger.error(f"[MemoryProcessor] 通过 PromptManager 加载提示词失败: {e}")
-            self._load_prompts_fallback()
-
-    def _get_chat_prompt(self, is_group_chat: bool) -> str:
-        """每次处理时从 PromptManager 实时读取，确保 WebUI 保存后立即生效。"""
-        try:
-            from ..prompts.prompt_manager import get_prompt_manager
-
-            mgr = get_prompt_manager()
-            if mgr is not None:
-                prompt_id = "group_chat_prompt" if is_group_chat else "private_chat_prompt"
-                return mgr.get_prompt(prompt_id)
-        except Exception:
-            pass
-        return self.group_chat_prompt if is_group_chat else self.private_chat_prompt
-
-    def _load_prompts_fallback(self) -> None:
-        """后备加载：直接从文件读取提示词"""
+        """从外部文件加载提示词模板"""
         prompt_dir = Path(__file__).parent.parent / "prompts"
 
         try:
+            # 加载私聊提示词
             private_prompt_file = prompt_dir / "private_chat_prompt.txt"
             with open(private_prompt_file, encoding="utf-8") as f:
                 self.private_chat_prompt = f.read()
 
+            # 加载群聊提示词
             group_prompt_file = prompt_dir / "group_chat_prompt.txt"
             with open(group_prompt_file, encoding="utf-8") as f:
                 self.group_chat_prompt = f.read()
 
-            logger.info("[MemoryProcessor] 提示词模板加载成功（后备模式）")
+            logger.info(f"{tag('processor')} 提示词模板加载成功")
 
         except Exception as e:
-            logger.error(f"[MemoryProcessor] 加载提示词模板失败: {e}")
-            self.private_chat_prompt = """分析以下对话并生成JSON格式的记忆:
+            logger.error(f"{tag('processor')} 加载提示词模板失败: {e}")
+            # 使用简单的后备提示词（注意：使用 replace 替换，无需转义大括号）
+            self.private_chat_prompt = """分析以下对话并生成JSON格式的长期记忆:
 {conversation}
 
 输出格式:
-{"summary": "摘要", "topics": ["主题"], "key_facts": ["事实"], "sentiment": "neutral", "importance": 0.5}
+{"memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
 """
-            self.group_chat_prompt = """分析以下群聊对话并生成JSON格式的记忆:
+            self.group_chat_prompt = """分析以下群聊对话并生成JSON格式的长期记忆:
 {conversation}
 
 输出格式:
-{"summary": "摘要", "topics": ["主题"], "key_facts": ["事实"], "participants": ["参与者"], "sentiment": "neutral", "importance": 0.5}
+{"memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "participants": ["参与者"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
 """
 
     async def _build_system_prompt_with_persona(self, persona_id: str | None) -> str:
-        """
-        构建包含人格提示的 system_prompt
+        """构建中性的事实萃取提示词。
 
-        Args:
-            persona_id: 人格ID
-
-        Returns:
-            str: 包含人格提示的 system_prompt
+        ``persona_id`` 只用于存储和召回分区。保留参数与方法名是为了兼容旧
+        调用方；萃取阶段不读取 Persona Prompt，也不模仿角色语气。
         """
         current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        # 尝试从 PromptManager 获取基础 system prompt
-        try:
-            from ..prompts.prompt_manager import get_prompt_manager
-
-            mgr = get_prompt_manager()
-            if mgr is not None:
-                base_prompt = mgr.get_prompt("memory_system_prompt_base").replace(
-                    "{current_date}", current_date
-                )
-            else:
-                base_prompt = self._build_base_prompt_fallback(current_date)
-        except Exception:
-            base_prompt = self._build_base_prompt_fallback(current_date)
-
-        if not persona_id:
-            logger.debug("[MemoryProcessor] 未指定人格ID，使用基础提示词")
-            return base_prompt
-
-        if not self.context:
-            logger.debug("[MemoryProcessor] Context 未设置，使用基础提示词")
-            return base_prompt
-
-        try:
-            persona_manager = getattr(self.context, "persona_manager", None)
-            if not persona_manager:
-                logger.warning(
-                    "[MemoryProcessor] persona_manager 不可用，使用基础提示词"
-                )
-                return base_prompt
-
-            persona = await persona_manager.get_persona(persona_id)
-            if not persona:
-                logger.warning(
-                    f"[MemoryProcessor] 人格 '{persona_id}' 不存在，使用基础提示词"
-                )
-                return base_prompt
-
-            if not persona.system_prompt:
-                logger.debug(
-                    f"[MemoryProcessor] 人格 '{persona_id}' 无 system_prompt，使用基础提示词"
-                )
-                return base_prompt
-
-            persona_prompt = persona.system_prompt.strip()
-            if not persona_prompt:
-                logger.debug(
-                    f"[MemoryProcessor] 人格 '{persona_id}' 的 system_prompt 为空，使用基础提示词"
-                )
-                return base_prompt
-
-            logger.info(
-                f"[MemoryProcessor] 成功加载人格 '{persona_id}' 的提示词 "
-                f"(长度={len(persona_prompt)}字符)"
+        if persona_id:
+            logger.debug(
+                f"{tag('processor')} persona_id 仅用于分区，不注入萃取提示词"
             )
-            logger.debug(f"[MemoryProcessor] 人格提示词预览: {persona_prompt[:100]}...")
-
-            # 使用 PromptManager 模板构建增强提示词
-            try:
-                if mgr is not None:
-                    enhanced_template = mgr.get_prompt(
-                        "memory_system_prompt_with_persona"
-                    )
-                    enhanced_prompt = (
-                        enhanced_template.replace("{base_prompt}", base_prompt)
-                        .replace("{persona_prompt}", persona_prompt)
-                        .replace("{current_date}", current_date)
-                    )
-                else:
-                    enhanced_prompt = self._build_enhanced_prompt_fallback(
-                        base_prompt, persona_prompt, current_date
-                    )
-            except Exception:
-                enhanced_prompt = self._build_enhanced_prompt_fallback(
-                    base_prompt, persona_prompt, current_date
-                )
-
-            return enhanced_prompt
-
-        except ValueError as e:
-            logger.warning(f"[MemoryProcessor] 人格 '{persona_id}' 不存在: {e}")
-            return base_prompt
-        except Exception as e:
-            logger.error(
-                f"[MemoryProcessor] 获取人格提示词时发生错误: {e}", exc_info=True
-            )
-            return base_prompt
-
-    @staticmethod
-    def _build_base_prompt_fallback(current_date: str) -> str:
-        """后备基础 system prompt（当 PromptManager 不可用时）"""
         return (
-            "你正在总结对话记忆。请严格按照JSON格式输出。\n"
+            "你是长期记忆事实萃取器。请严格按照 JSON 格式输出。\n"
             f"当前日期时间: {current_date}\n"
-            "重要: 请将对话中出现的相对时间表达（如\u201c今天\u201d、"
-            "\u201c明天\u201d、\u201c昨天\u201d、"
-            "\u201c下周\u201d、\u201c上个月\u201d等）"
-            "转换为具体日期后再写入记忆，以便未来查阅时仍能准确理解时间信息。"
-        )
-
-    @staticmethod
-    def _build_enhanced_prompt_fallback(
-        base_prompt: str, persona_prompt: str, current_date: str
-    ) -> str:
-        """后备增强 system prompt（当 PromptManager 不可用时）"""
-        return (
-            f"{base_prompt}\n\n"
-            f"## 你的人格设定\n"
-            f"{persona_prompt}\n\n"
-            f"## 记忆总结要求\n"
-            f"在总结对话记忆时,你需要:\n"
-            f"1. **保持你的人格特色**: 使用符合上述人格设定的语气、用词习惯和表达方式\n"
-            f'2. **第一人称视角**: 以"我"的视角回顾对话,不要说"bot"、"助手"等第三人称\n'
-            f"3. **体现你的关注点**: 根据你的人格特点,侧重记录你会关注的信息\n"
-            f"4. **自然真实**: 让记忆读起来像是你本人在回忆这段对话,而不是机械的客观描述\n"
-            f"5. **时间转换**: 将对话中的相对时间（今天、明天、下周等）转换为具体日期（当前日期: {current_date}）\n\n"
-            f"例如:\n"
-            f'- 如果你是活泼可爱的性格,记忆中可以使用"呀"、"呢"、"~"等语气词\n'
-            f"- 如果你是专业严谨的性格,记忆应该用词准确、逻辑清晰、格式规范\n"
-            f"- 如果你是幽默风趣的性格,记忆中可以包含轻松的表达和有趣的观察"
+            "只提取对未来有用、能够由对话支持的事实。使用中性、简洁、第三人称或"
+            "直接事实表述；不得模仿任何角色人格、语气或文风，不得文学化补写。\n"
+            "必须区分消息前缀中的具体发言者和 Bot，不得把不同人的行为合并。\n"
+            "将今天、明天、昨天、下周等相对时间转换为可长期理解的绝对日期。\n"
+            "一次输入可按主题或连续事件拆成 0 至 5 条记忆；没有持久价值时输出"
+            " {\"memories\": []}。"
         )
 
     async def _call_llm_with_retry(
@@ -309,7 +172,7 @@ class MemoryProcessor:
                     raise
                 wait_time = (2**attempt) + random.uniform(0, 1)
                 logger.warning(
-                    f"[MemoryProcessor] LLM 调用失败，{wait_time:.1f}s 后重试 "
+                    f"{tag('processor')} LLM 调用失败，{wait_time:.1f}s 后重试 "
                     f"({attempt + 1}/{max_retries}): {e}"
                 )
                 await asyncio.sleep(wait_time)
@@ -368,12 +231,12 @@ class MemoryProcessor:
         persona_id: str | None = None,
     ) -> tuple[str, dict[str, Any], float]:
         """
-        处理对话历史,生成结构化记忆
+        兼容旧调用：处理对话历史并返回第一条结构化记忆。
 
         Args:
             messages: 消息列表(Message对象)
             is_group_chat: 是否为群聊
-            persona_id: 人格ID,用于获取人格提示词
+            persona_id: 人格分区 ID，不注入萃取提示词
 
         Returns:
             tuple: (content, metadata, importance)
@@ -384,115 +247,83 @@ class MemoryProcessor:
         Raises:
             Exception: 处理失败时抛出异常
         """
+        memories = await self.process_conversation_batch(
+            messages=messages,
+            is_group_chat=is_group_chat,
+            persona_id=persona_id,
+        )
+        if not memories:
+            raise ValueError("本批对话没有可持久化的长期记忆")
+        return memories[0]
+
+    async def process_conversation_batch(
+        self,
+        messages: list[Message],
+        is_group_chat: bool = False,
+        persona_id: str | None = None,
+    ) -> list[tuple[str, dict[str, Any], float]]:
+        """一次 LLM 萃取生成 0 至 5 条主题记忆，每条可包含多条事实。"""
         if not messages:
             raise ValueError("消息列表不能为空")
 
-        # 1. 格式化对话历史
         conversation_text = self._format_conversation(messages)
-
-        # 2. 选择合适的提示词模板（每次从 PromptManager 读取，确保 WebUI 保存后立即生效）
-        # 使用 replace 而非 format，避免对话内容中的大括号导致解析错误
         current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-        prompt = self._get_chat_prompt(is_group_chat).replace(
-            "{conversation}", conversation_text
-        ).replace("{current_date}", current_date)
-
-        # 3. 调用LLM生成结构化记忆
+        template = self.group_chat_prompt if is_group_chat else self.private_chat_prompt
+        prompt = template.replace("{conversation}", conversation_text).replace(
+            "{current_date}", current_date
+        )
         conversation_type = "群聊" if is_group_chat else "私聊"
+
         try:
-            logger.info(
-                f"[MemoryProcessor] 准备调用 LLM，对话类型={conversation_type}, 消息数={len(messages)}"
-            )
-            logger.debug(f"[MemoryProcessor] Prompt 模板长度={len(prompt)}")
             logger.debug(
-                f"[MemoryProcessor] 发送给LLM的对话内容（前500字符）:\n{conversation_text[:500]}"
+                f"{tag('processor')} 准备调用 LLM，对话类型={conversation_type}, "
+                f"消息数={len(messages)}"
+            )
+            logger.debug(
+                f"{tag('processor')} Prompt 长度={len(prompt)}，"
+                f"对话文本长度={len(conversation_text)}"
             )
 
-            # 构建 system_prompt，嵌入人格提示
             system_prompt = await self._build_system_prompt_with_persona(persona_id)
-            logger.debug(f"[MemoryProcessor] System Prompt: {system_prompt[:200]}...")
-
+            logger.debug(
+                f"{tag('processor')} System Prompt 已生成，长度={len(system_prompt)}"
+            )
             llm_response_text = await self._call_llm_with_retry(
                 prompt=prompt,
                 system_prompt=system_prompt,
             )
-
-            logger.info(
-                f"[MemoryProcessor]  LLM 响应成功，响应长度={len(llm_response_text)}"
-            )
-            logger.debug(f"[MemoryProcessor] LLM 原始响应内容:\n{llm_response_text}")
-
-            # 4. 解析LLM响应
-            structured_data = self._parse_llm_response(llm_response_text, is_group_chat)
-
-            # 4.5 质量校验
-            quality = self._validate_summary_quality(structured_data)
-            if quality == "low":
-                logger.warning(
-                    "[MemoryProcessor] 总结质量不达标（low），将标记但仍写入"
-                )
-            structured_data["_quality"] = quality
-
-            # 5. 构建存储格式
-            fallback_excerpt = (
-                conversation_text[:200] + "..."
-                if len(conversation_text) > 200
-                else conversation_text
-            )
-            content, metadata = self._build_storage_format(
-                fallback_excerpt, structured_data, is_group_chat
-            )
-            metadata["participant_identities"] = self._extract_participant_identities(
-                messages
-            )
-            content = self._apply_source_time_tags(content, metadata, messages)
-            # 将质量标记写入 metadata
-            metadata["summary_quality"] = structured_data.get("_quality", "normal")
-
-            importance = float(structured_data.get("importance", 0.5))
-
-            logger.info(
-                f"[MemoryProcessor]  成功生成结构化记忆: 摘要={structured_data.get('summary', '')[:50]}..., "
-                f"主题={structured_data.get('topics', [])}, "
-                f"重要性={importance}, 类型={conversation_type}"
-            )
             logger.debug(
-                f"[MemoryProcessor] 生成的记忆内容（前200字符）:\n{content[:200]}"
+                f"{tag('processor')} LLM 响应成功，响应长度={len(llm_response_text)}"
             )
 
-            return content, metadata, importance
+            structured_memories = self._parse_llm_response_batch(
+                llm_response_text, is_group_chat
+            )
+            participant_identities = self._extract_participant_identities(messages)
+            results: list[tuple[str, dict[str, Any], float]] = []
+            for index, structured_data in enumerate(structured_memories, 1):
+                quality = self._validate_summary_quality(structured_data)
+                if quality == "low":
+                    logger.warning(
+                        f"{tag('processor')} 第 {index} 条记忆质量不达标（low），"
+                        "将标记但仍写入"
+                    )
+                structured_data["_quality"] = quality
+                content, metadata = self._build_storage_format(
+                    conversation_text, structured_data, is_group_chat
+                )
+                metadata["participant_identities"] = participant_identities
+                metadata["summary_quality"] = quality
+                importance = float(structured_data.get("importance", 0.5))
+                results.append((content, metadata, importance))
 
+            logger.debug(
+                f"{tag('processor')} {conversation_type}批次生成 {len(results)} 条长期记忆"
+            )
+            return results
         except Exception as e:
-            logger.error(f"[MemoryProcessor] 处理对话历史失败: {e}", exc_info=True)
-            # 不再降级处理，直接向上抛出异常，由调用方处理重试逻辑
+            logger.error(f"{tag('processor')} 处理对话历史失败: {e}", exc_info=True)
             raise
-
-    def _apply_source_time_tags(
-        self,
-        content: str,
-        metadata: dict[str, Any],
-        messages: list[Message],
-    ) -> str:
-        """Attach source dates without asking the LLM to infer them."""
-        if not self.config.get("include_source_time_tags", True) or not messages:
-            return content
-
-        timestamps = sorted(float(message.timestamp) for message in messages)
-        start = datetime.fromtimestamp(timestamps[0]).astimezone()
-        end = datetime.fromtimestamp(timestamps[-1]).astimezone()
-        dates = sorted(
-            {
-                datetime.fromtimestamp(value).strftime("%Y-%m-%d")
-                for value in timestamps
-            }
-        )
-        label = dates[0] if len(dates) == 1 else f"{dates[0]} - {dates[-1]}"
-
-        metadata["time_tags"] = dates
-        metadata["source_time_start"] = start.isoformat()
-        metadata["source_time_end"] = end.isoformat()
-        metadata["source_time_label"] = label
-        return content
 
     def _format_conversation(self, messages: list[Message]) -> str:
         """
@@ -507,31 +338,23 @@ class MemoryProcessor:
 
         formatted_lines = []
         for i, msg in enumerate(messages):
+            content_text = self._message_content_to_text(msg.content)
             logger.debug(
-                f"[_format_conversation] 消息#{i}: "
-                f"sender_id={msg.sender_id}, sender_name={msg.sender_name}, "
-                f"role={msg.role}, group_id={msg.group_id}"
+                f"{tag('processor')} [_format_conversation] 消息#{i}: "
+                f"role={msg.role}, group={bool(msg.group_id)}, "
+                f"content_length={len(content_text)}"
             )
 
-            content_text = self._message_content_to_text(msg.content)
             sender_info = self._format_sender_info(msg)
             formatted_line = f"{sender_info} {content_text}".rstrip()
             formatted_lines.append(formatted_line)
-            if msg.group_id:
-                logger.debug(
-                    f"[_format_conversation] 消息#{i} 格式化结果(群聊): {formatted_line[:100]}..."
-                )
-            else:
-                logger.debug(
-                    f"[_format_conversation] 消息#{i} 格式化结果(私聊): {sender_info[:50]}..."
-                )
         return "\n".join(formatted_lines)
 
     @staticmethod
     def _extract_participant_identities(
         messages: list[Message],
     ) -> list[dict[str, Any]]:
-        """Build stable graph identities from message sender IDs, not LLM names."""
+        """Build stable graph identities from CM sender IDs and aliases."""
         identities: dict[str, dict[str, Any]] = {}
         for message in messages:
             if message.role == "system":
@@ -546,7 +369,6 @@ class MemoryProcessor:
                 message.metadata.get("is_bot_message", False)
                 or message.role == "assistant"
             )
-
             identity = identities.setdefault(
                 identity_key,
                 {
@@ -562,7 +384,6 @@ class MemoryProcessor:
             identity["is_bot"] = bool(identity["is_bot"] or is_bot)
             if display_name not in identity["aliases"]:
                 identity["aliases"].append(display_name)
-
         return list(identities.values())
 
     @staticmethod
@@ -572,15 +393,65 @@ class MemoryProcessor:
         is_bot = msg.metadata.get("is_bot_message", False) or msg.role == "assistant"
         if is_bot:
             return f"[Bot: {display_name} | ID: {msg.sender_id} | {time_str}]"
+        relation = msg.metadata.get("speaker_relation")
+        if msg.group_id and relation == "current_user":
+            return f"[当前发言者: {display_name} | ID: {msg.sender_id} | {time_str}]"
+        if msg.group_id and relation == "other_user":
+            return f"[其他发言者: {display_name} | ID: {msg.sender_id} | {time_str}]"
         return f"[{display_name} | ID: {msg.sender_id} | {time_str}]"
 
     @classmethod
     def _message_content_to_text(cls, content: Any) -> str:
         return Message.content_to_text(content)
 
-    @classmethod
-    def _message_part_to_text(cls, part: Any) -> tuple[str, bool]:
-        return Message._content_part_to_text(part)
+    def _parse_llm_response_batch(
+        self, response_text: str, is_group_chat: bool
+    ) -> list[dict[str, Any]]:
+        """解析新版 ``{"memories": [...]}``，并兼容旧版单记忆 JSON。"""
+        cleaned_text = response_text.strip()
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        elif cleaned_text.startswith("```"):
+            cleaned_text = cleaned_text[3:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+        cleaned_text = cleaned_text.strip()
+
+        try:
+            payload = json.loads(cleaned_text)
+            return self._normalize_batch_payload(payload, is_group_chat)
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            logger.warning(f"{tag('processor')} 批量 JSON 解析失败: {exc}")
+
+        try:
+            payload = json.loads(self._try_fix_json(response_text))
+            return self._normalize_batch_payload(payload, is_group_chat)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            legacy = self._extract_by_regex(response_text, is_group_chat)
+            return [self._normalize_parsed_data(legacy, is_group_chat)]
+
+    def _normalize_batch_payload(
+        self, payload: Any, is_group_chat: bool
+    ) -> list[dict[str, Any]]:
+        if isinstance(payload, dict) and "memories" in payload:
+            raw_memories = payload.get("memories")
+            if not isinstance(raw_memories, list):
+                raise ValueError("memories 必须是数组")
+        elif isinstance(payload, dict):
+            # 兼容 cm.2 及更早 Prompt 的单记忆 JSON。
+            raw_memories = [payload]
+        elif isinstance(payload, list):
+            raw_memories = payload
+        else:
+            raise ValueError("LLM 响应必须是 JSON 对象或数组")
+
+        normalized: list[dict[str, Any]] = []
+        for item in raw_memories[:5]:
+            if not isinstance(item, dict):
+                logger.warning(f"{tag('processor')} 跳过非对象记忆项")
+                continue
+            normalized.append(self._normalize_parsed_data(dict(item), is_group_chat))
+        return normalized
 
     def _parse_llm_response(
         self, response_text: str, is_group_chat: bool
@@ -595,29 +466,29 @@ class MemoryProcessor:
         Returns:
             解析后的字典数据
         """
-        logger.debug(f"[MemoryProcessor] 开始解析 LLM 响应，长度={len(response_text)}")
+        logger.debug(f"{tag('processor')} 开始解析 LLM 响应，长度={len(response_text)}")
 
         try:
             # 尝试直接解析JSON
             # 先清理可能的markdown代码块标记
             cleaned_text = response_text.strip()
             logger.debug(
-                f"[MemoryProcessor] 清理前的响应文本（前100字符）: {response_text[:100]}"
+                f"{tag('processor')} 清理前响应长度={len(response_text)}"
             )
 
             if cleaned_text.startswith("```json"):
                 cleaned_text = cleaned_text[7:]
-                logger.debug("[MemoryProcessor] 移除了 ```json 标记")
+                logger.debug(f"{tag('processor')} 移除了 ```json 标记")
             if cleaned_text.startswith("```"):
                 cleaned_text = cleaned_text[3:]
-                logger.debug("[MemoryProcessor] 移除了 ``` 标记")
+                logger.debug(f"{tag('processor')} 移除了 ``` 标记")
             if cleaned_text.endswith("```"):
                 cleaned_text = cleaned_text[:-3]
-                logger.debug("[MemoryProcessor] 移除了结尾 ``` 标记")
+                logger.debug(f"{tag('processor')} 移除了结尾 ``` 标记")
             cleaned_text = cleaned_text.strip()
 
             logger.debug(
-                f"[MemoryProcessor] 清理后准备解析的 JSON（前500字符）:\n{cleaned_text[:500]}"
+                f"{tag('processor')} 清理后 JSON 长度={len(cleaned_text)}"
             )
 
             # 解析JSON
@@ -626,12 +497,12 @@ class MemoryProcessor:
             # 类型检查：确保解析结果是 dict
             if not isinstance(data, dict):
                 logger.warning(
-                    f"[MemoryProcessor] JSON 解析结果不是 dict，类型为 {type(data).__name__}"
+                    f"{tag('processor')} JSON 解析结果不是 dict，类型为 {type(data).__name__}"
                 )
                 raise ValueError(f"期望 dict 类型，实际为 {type(data).__name__}")
 
-            logger.info("[MemoryProcessor] JSON 解析成功")
-            logger.debug(f"[MemoryProcessor] 解析得到的字段: {list(data.keys())}")
+            logger.debug(f"{tag('processor')} JSON 解析成功")
+            logger.debug(f"{tag('processor')} 解析得到的字段: {list(data.keys())}")
 
             # 验证必需字段 - 简化后的字段列表
             required_fields = [
@@ -647,70 +518,66 @@ class MemoryProcessor:
             for field in required_fields:
                 if field not in data:
                     logger.warning(
-                        f"[MemoryProcessor] LLM 响应缺少字段: {field}, 使用默认值"
+                        f"{tag('processor')} LLM 响应缺少字段: {field}, 使用默认值"
                     )
                     data[field] = self._get_default_value(field)
 
             # 数据类型校验和规范化
             data["summary"] = str(data.get("summary", ""))
-            logger.debug(f"[MemoryProcessor] 提取 summary: {data['summary'][:100]}...")
-
-            data["canonical_summary"] = str(
-                data.get("canonical_summary") or ""
-            ).strip()
+            logger.debug(f"{tag('processor')} 提取 summary: {data['summary']}")
 
             data["topics"] = self._ensure_list(data.get("topics", []))[:5]
             logger.debug(
-                f"[MemoryProcessor] 提取 topics ({len(data['topics'])} 个): {data['topics']}"
+                f"{tag('processor')} 提取 topics ({len(data['topics'])} 个): {data['topics']}"
             )
 
             data["key_facts"] = self._ensure_list(data.get("key_facts", []))[:5]
             logger.debug(
-                f"[MemoryProcessor] 提取 key_facts ({len(data['key_facts'])} 个): {data['key_facts']}"
+                f"{tag('processor')} 提取 key_facts ({len(data['key_facts'])} 个): {data['key_facts']}"
             )
 
             data["sentiment"] = self._validate_sentiment(
                 data.get("sentiment", "neutral")
             )
-            logger.debug(f"[MemoryProcessor] 提取 sentiment: {data['sentiment']}")
+            logger.debug(f"{tag('processor')} 提取 sentiment: {data['sentiment']}")
 
             data["importance"] = self._validate_importance(data.get("importance", 0.5))
-            logger.debug(f"[MemoryProcessor] 提取 importance: {data['importance']}")
+            logger.debug(f"{tag('processor')} 提取 importance: {data['importance']}")
 
             if is_group_chat:
                 data["participants"] = self._ensure_list(data.get("participants", []))
                 logger.debug(
-                    f"[MemoryProcessor] 提取 participants ({len(data['participants'])} 个): {data['participants']}"
+                    f"{tag('processor')} 提取 participants ({len(data['participants'])} 个): {data['participants']}"
                 )
 
             return data
 
         except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"[MemoryProcessor]  JSON 解析失败: {e}")
+            logger.warning(f"{tag('processor')} JSON 解析失败: {e}")
             logger.debug(
-                f"[MemoryProcessor] 解析失败的内容（前200字符）: {response_text[:200]}"
+                f"{tag('processor')} 解析失败的内容:\n{response_text}"
             )
 
             # 尝试修复 JSON 后再解析
-            logger.info("[MemoryProcessor] 尝试修复 JSON 后重新解析")
+            logger.debug(f"{tag('processor')} 尝试修复 JSON 后重新解析")
             try:
                 fixed_text = self._try_fix_json(response_text)
                 data = json.loads(fixed_text)
                 if isinstance(data, dict):
-                    logger.info("[MemoryProcessor] JSON 修复后解析成功")
+                    logger.debug(f"{tag('processor')} JSON 修复后解析成功")
                     return self._normalize_parsed_data(data, is_group_chat)
             except (json.JSONDecodeError, ValueError) as fix_err:
-                logger.debug(f"[MemoryProcessor] JSON 修复后仍无法解析: {fix_err}")
+                logger.debug(f"{tag('processor')} JSON 修复后仍无法解析: {fix_err}")
 
-            logger.info("[MemoryProcessor] 尝试使用正则表达式提取 JSON")
+            logger.debug(f"{tag('processor')} 尝试使用正则表达式提取 JSON")
             # 尝试正则提取
             return self._extract_by_regex(response_text, is_group_chat)
         except Exception as e:
             logger.error(
-                f"[MemoryProcessor]  解析 LLM 响应时发生异常: {e}", exc_info=True
+                f"{tag('processor')} 解析 LLM 响应时发生异常: {e}", exc_info=True
             )
             logger.debug(
-                f"[MemoryProcessor] 异常发生时的响应内容: {response_text[:200]}"
+                f"{tag('processor')} 异常发生时的响应内容:\n{response_text}"
             )
             return self._get_default_structured_data(is_group_chat)
 
@@ -725,7 +592,7 @@ class MemoryProcessor:
         Returns:
             提取的结构化数据
         """
-        logger.debug("[MemoryProcessor] 开始使用正则表达式提取结构化数据")
+        logger.debug(f"{tag('processor')} 开始使用正则表达式提取结构化数据")
         data = self._get_default_structured_data(is_group_chat)
 
         try:
@@ -734,19 +601,19 @@ class MemoryProcessor:
                 r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL
             )
             logger.debug(
-                f"[MemoryProcessor] 正则匹配到 {len(json_matches)} 个可能的 JSON 块"
+                f"{tag('processor')} 正则匹配到 {len(json_matches)} 个可能的 JSON 块"
             )
 
             for i, match in enumerate(json_matches):
                 logger.debug(
-                    f"[MemoryProcessor] JSON 块 #{i + 1} (前200字符): {match[:200]}..."
+                    f"{tag('processor')} JSON 块 #{i + 1}:\n{match}"
                 )
                 try:
                     # 尝试解析每个匹配的块
                     parsed = json.loads(match)
                     if "summary" in parsed:
-                        logger.info(
-                            f"[MemoryProcessor]  成功从第 {i + 1} 个 JSON 块中解析数据"
+                        logger.debug(
+                            f"{tag('processor')} 成功从第 {i + 1} 个 JSON 块中解析数据"
                         )
                         data = parsed
                         break
@@ -755,14 +622,14 @@ class MemoryProcessor:
 
             # 如果没有找到完整的 JSON，尝试单独提取字段
             if data == self._get_default_structured_data(is_group_chat):
-                logger.debug("[MemoryProcessor] 未找到完整 JSON，尝试提取单独字段")
+                logger.debug(f"{tag('processor')} 未找到完整 JSON，尝试提取单独字段")
 
                 # 提取summary
                 summary_match = re.search(r'"summary"\s*:\s*"([^"]+)"', text)
                 if summary_match:
                     data["summary"] = summary_match.group(1)
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 summary: {data['summary'][:50]}..."
+                        f"{tag('processor')} 正则提取 summary: {data['summary']}"
                     )
 
                 # 提取importance
@@ -770,7 +637,7 @@ class MemoryProcessor:
                 if importance_match:
                     data["importance"] = float(importance_match.group(1))
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 importance: {data['importance']}"
+                        f"{tag('processor')} 正则提取 importance: {data['importance']}"
                     )
 
                 # 提取sentiment
@@ -778,7 +645,7 @@ class MemoryProcessor:
                 if sentiment_match:
                     data["sentiment"] = sentiment_match.group(1)
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 sentiment: {data['sentiment']}"
+                        f"{tag('processor')} 正则提取 sentiment: {data['sentiment']}"
                     )
 
                 # 提取 topics 数组
@@ -787,7 +654,7 @@ class MemoryProcessor:
                     topics_str = topics_match.group(1)
                     topics = re.findall(r'"([^"]+)"', topics_str)
                     data["topics"] = topics[:5]
-                    logger.debug(f"[MemoryProcessor] 正则提取 topics: {data['topics']}")
+                    logger.debug(f"{tag('processor')} 正则提取 topics: {data['topics']}")
 
                 # 提取 key_facts 数组
                 facts_match = re.search(r'"key_facts"\s*:\s*\[(.*?)\]', text, re.DOTALL)
@@ -796,15 +663,15 @@ class MemoryProcessor:
                     facts = re.findall(r'"([^"]+)"', facts_str)
                     data["key_facts"] = facts[:5]
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 key_facts: {data['key_facts']}"
+                        f"{tag('processor')} 正则提取 key_facts: {data['key_facts']}"
                     )
 
-            logger.info(
-                f"[MemoryProcessor] 正则提取完成，提取到的字段: {list(data.keys())}"
+            logger.debug(
+                f"{tag('processor')} 正则提取完成，提取到的字段: {list(data.keys())}"
             )
 
         except Exception as e:
-            logger.error(f"[MemoryProcessor]  正则提取失败: {e}", exc_info=True)
+            logger.error(f"{tag('processor')} 正则提取失败: {e}", exc_info=True)
 
         return data
 
@@ -825,44 +692,54 @@ class MemoryProcessor:
         Returns:
             (content, metadata) 元组
         """
-        summary = str(structured_data.get("summary", "")).strip()
+        summary = str(structured_data.get("summary", "") or "").strip()
         key_facts = structured_data.get("key_facts", [])
+        topics = structured_data.get("topics", [])
+        participants = structured_data.get("participants", [])
+        event_time = str(structured_data.get("event_time", "") or "").strip()
 
-        # 检索内容恒为 summary + key_facts 的富文本：content 是 BM25/FAISS 的
-        # 索引语料，也是 Agent 主动召回工具直接返回给 LLM 的内容，必须保证信息
-        # 密度。不依赖模型输出的压缩摘要，也不退化为纯事实的机械拼接。
-        # （自动注入链路优先使用 metadata 中的 persona_summary，不受此影响。）
-        rich_parts = [summary] if summary else []
+        # v3 canonical 完全由中性结构字段组成，不再混入 Persona 文风。
+        canonical_parts: list[str] = []
+        if event_time:
+            canonical_parts.append(f"事件时间：{event_time}")
+        if participants:
+            canonical_parts.append(
+                "参与者：" + "、".join(str(item) for item in participants[:8])
+            )
+        if topics:
+            canonical_parts.append("主题：" + "、".join(str(item) for item in topics[:5]))
         if key_facts:
-            rich_parts.append("；".join(str(f) for f in key_facts[:5] if f))
-        rich_content = " | ".join(rich_parts)
+            canonical_parts.append(
+                "事实：" + "；".join(str(fact) for fact in key_facts[:5])
+            )
+        if summary:
+            canonical_parts.append(f"摘要：{summary}")
+        canonical_summary = " | ".join(canonical_parts)
 
-        content = rich_content if rich_content else fallback_excerpt
-
-        # canonical_summary：自定义提示词若输出了该字段则保留（供图抽取等使用），
-        # 否则回退为与 content 一致的富文本，保持 v2 metadata 结构兼容。
-        canonical_summary = str(structured_data.get("canonical_summary") or "").strip()
-        if not canonical_summary:
-            canonical_summary = rich_content
+        # content 字段使用 canonical_summary，提升检索稳定性
+        if canonical_summary:
+            content = canonical_summary
+        else:
+            content = fallback_excerpt
 
         # metadata字段:存储结构化信息
         # 注意：不要在这里设置 create_time 和 last_access_time
         # 这些字段会由 MemoryEngine.add_memory() 自动添加
         metadata = {
-            "topics": structured_data.get("topics", []),
+            "topics": topics,
             "key_facts": key_facts,
+            "event_time": event_time,
             "sentiment": structured_data.get("sentiment", "neutral"),
             "interaction_type": "group_chat" if is_group_chat else "private_chat",
-            # 双通道：canonical_summary 供图抽取等中性文本消费方使用，
-            # persona_summary 保留人格风格摘要供面板展示
+            "neutral_summary": summary,
             "canonical_summary": canonical_summary,
-            "persona_summary": summary,
-            "summary_schema_version": "v2",
+            # persona_summary 仅作为旧记录兼容字段；v3 新记录不再生成。
+            "summary_schema_version": "v3",
             # summary_quality 由 process_conversation 中的 SummaryValidator 覆盖写入
         }
 
         if is_group_chat and "participants" in structured_data:
-            metadata["participants"] = structured_data["participants"]
+            metadata["participants"] = participants
 
         return content, metadata
 
@@ -877,7 +754,14 @@ class MemoryProcessor:
         Returns:
             规范化后的字典
         """
-        required_fields = ["summary", "topics", "key_facts", "sentiment", "importance"]
+        required_fields = [
+            "summary",
+            "topics",
+            "key_facts",
+            "event_time",
+            "sentiment",
+            "importance",
+        ]
         if is_group_chat:
             required_fields.append("participants")
 
@@ -886,9 +770,9 @@ class MemoryProcessor:
                 data[field] = self._get_default_value(field)
 
         data["summary"] = str(data.get("summary", ""))
-        data["canonical_summary"] = str(data.get("canonical_summary") or "").strip()
         data["topics"] = self._ensure_list(data.get("topics", []))[:5]
         data["key_facts"] = self._ensure_list(data.get("key_facts", []))[:5]
+        data["event_time"] = str(data.get("event_time", "") or "").strip()
         data["sentiment"] = self._validate_sentiment(data.get("sentiment", "neutral"))
         data["importance"] = self._validate_importance(data.get("importance", 0.5))
 
@@ -949,9 +833,9 @@ class MemoryProcessor:
         """获取字段的默认值"""
         defaults = {
             "summary": "",
-            "canonical_summary": "",
             "topics": [],
             "key_facts": [],
+            "event_time": "",
             "participants": [],
             "sentiment": "neutral",
             "importance": 0.5,
@@ -962,9 +846,9 @@ class MemoryProcessor:
         """获取默认的结构化数据"""
         data = {
             "summary": "对话记录",
-            "canonical_summary": "",
             "topics": [],
             "key_facts": [],
+            "event_time": "",
             "sentiment": "neutral",
             "importance": 0.5,
         }
@@ -1030,7 +914,7 @@ class MemoryProcessor:
             return []
         topics = metadata.get("topics", [])
         participants = metadata.get("participants", [])
-        atoms = classify_atoms(
+        return classify_atoms(
             key_facts=key_facts,
             topics=topics,
             participants=participants,
@@ -1038,5 +922,3 @@ class MemoryProcessor:
             session_id=session_id,
             persona_id=persona_id,
         )
-        metadata["atom_types"] = sorted({atom.atom_type.value for atom in atoms})
-        return atoms

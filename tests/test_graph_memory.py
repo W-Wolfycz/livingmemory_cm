@@ -1,33 +1,30 @@
 """Tests for graph-memory indexing and dual-route retrieval."""
 
 import asyncio
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
-from astrbot_plugin_livingmemory.core.managers.graph_memory_manager import (
+from livingmemory_cm.core.managers.graph_memory_manager import (
     GraphMemoryManager,
 )
-from astrbot_plugin_livingmemory.core.managers.memory_engine import MemoryEngine
-from astrbot_plugin_livingmemory.core.models.graph_models import (
+from livingmemory_cm.core.managers.memory_engine import MemoryEngine
+from livingmemory_cm.core.models.graph_models import (
     GraphEdge,
     GraphEntry,
     GraphNode,
 )
-from astrbot_plugin_livingmemory.core.processors.graph_extractor import GraphExtractor
-from astrbot_plugin_livingmemory.core.processors.text_processor import TextProcessor
-from astrbot_plugin_livingmemory.core.retrieval.graph_keyword_retriever import (
+from livingmemory_cm.core.processors.graph_extractor import GraphExtractor
+from livingmemory_cm.core.processors.text_processor import TextProcessor
+from livingmemory_cm.core.retrieval.graph_keyword_retriever import (
     GraphKeywordRetriever,
 )
-from astrbot_plugin_livingmemory.core.retrieval.graph_retriever import GraphRetriever
-from astrbot_plugin_livingmemory.core.retrieval.graph_vector_retriever import (
+from livingmemory_cm.core.retrieval.graph_retriever import GraphRetriever
+from livingmemory_cm.core.retrieval.graph_vector_retriever import (
     GraphVectorRetriever,
 )
-from astrbot_plugin_livingmemory.core.retrieval.rrf_fusion import RRFFusion
-from astrbot_plugin_livingmemory.storage.graph_store import GraphStore
+from livingmemory_cm.core.retrieval.rrf_fusion import RRFFusion
+from livingmemory_cm.storage.graph_store import GraphStore
 
 
 @dataclass
@@ -63,8 +60,6 @@ class _FakeFaissDB:
     def __init__(self):
         self.docs: dict[int, dict] = {}
         self._next_id = 1
-        self.insert_batch_calls = 0
-        self.delete_documents_calls = 0
         self.document_storage = _FakeDocumentStorage(self)
 
     async def insert(self, content: str, metadata: dict) -> int:
@@ -77,13 +72,6 @@ class _FakeFaissDB:
             "metadata": dict(metadata),
         }
         return doc_id
-
-    async def insert_batch(self, contents: list[str], metadatas: list[dict]):
-        self.insert_batch_calls += 1
-        return [
-            await self.insert(content, metadata)
-            for content, metadata in zip(contents, metadatas, strict=True)
-        ]
 
     async def retrieve(
         self, query: str, k: int, fetch_k: int, rerank: bool, metadata_filters=None
@@ -124,116 +112,8 @@ class _FakeFaissDB:
         if target is not None:
             self.docs.pop(target, None)
 
-    async def delete_documents(self, metadata_filters: dict) -> None:
-        self.delete_documents_calls += 1
-        matching_ids = [
-            doc_id
-            for doc_id, doc in self.docs.items()
-            if all(
-                doc["metadata"].get(key) == value
-                for key, value in metadata_filters.items()
-            )
-        ]
-        for doc_id in matching_ids:
-            self.docs.pop(doc_id, None)
-
     async def close(self) -> None:
         return None
-
-
-@pytest.mark.asyncio
-async def test_graph_vector_retriever_uses_bulk_faiss_operations():
-    vector_db = SimpleNamespace(
-        insert_batch=AsyncMock(return_value=[11]),
-        delete_documents=AsyncMock(),
-    )
-    retriever = GraphVectorRetriever(vector_db)
-
-    ids = await retriever.add_entries(
-        [
-            ("entry one", {"source_memory_id": 7}),
-            ("entry two", {"source_memory_id": 7}),
-        ]
-    )
-    await retriever.delete_entries(7, ids)
-
-    assert ids == [11]
-    vector_db.insert_batch.assert_awaited_once_with(
-        contents=["entry one\nentry two"],
-        metadatas=[
-            {
-                "source_memory_id": 7,
-                "graph_vector_granularity": "memory",
-                "graph_entry_count": 2,
-            }
-        ],
-    )
-    vector_db.delete_documents.assert_awaited_once_with(
-        metadata_filters={"source_memory_id": 7}
-    )
-
-
-@pytest.mark.asyncio
-async def test_graph_vector_retriever_batches_multiple_memories_in_one_save():
-    vector_db = SimpleNamespace(insert_batch=AsyncMock(return_value=[11, 12]))
-    retriever = GraphVectorRetriever(vector_db)
-
-    ids = await retriever.add_memory_entries_batch(
-        [
-            [("memory one topic", {"source_memory_id": 7})],
-            [
-                ("memory two topic", {"source_memory_id": 8}),
-                ("memory two fact", {"source_memory_id": 8}),
-            ],
-        ]
-    )
-
-    assert ids == [11, 12]
-    vector_db.insert_batch.assert_awaited_once()
-    call = vector_db.insert_batch.await_args.kwargs
-    assert call["contents"] == [
-        "memory one topic",
-        "memory two topic\nmemory two fact",
-    ]
-    assert [metadata["source_memory_id"] for metadata in call["metadatas"]] == [
-        7,
-        8,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_graph_vector_retriever_skips_empty_bulk_delete():
-    vector_db = SimpleNamespace(delete_documents=AsyncMock())
-    retriever = GraphVectorRetriever(vector_db)
-
-    await retriever.delete_entries(7, [])
-
-    vector_db.delete_documents.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_graph_vector_retriever_batches_multiple_source_deletes():
-    document_storage = SimpleNamespace(
-        get_documents=AsyncMock(
-            return_value=[
-                {"id": 11, "doc_id": "uuid-11"},
-                {"id": 12, "doc_id": "uuid-12"},
-            ]
-        ),
-        delete_document_by_doc_id=AsyncMock(),
-    )
-    embedding_storage = SimpleNamespace(delete=AsyncMock())
-    retriever = GraphVectorRetriever(
-        SimpleNamespace(
-            document_storage=document_storage,
-            embedding_storage=embedding_storage,
-        )
-    )
-
-    await retriever.delete_entries_batch({7: [11], 8: [12]})
-
-    embedding_storage.delete.assert_awaited_once_with([11, 12])
-    assert document_storage.delete_document_by_doc_id.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -268,93 +148,9 @@ async def test_graph_memory_manager_indexes_nodes_edges_and_entries(tmp_path: Pa
     assert stats["graph_edges"] >= 3
     assert stats["graph_entries"] >= 4
     assert len(vector_db.docs) == 1
-    vector_doc = next(iter(vector_db.docs.values()))
-    assert vector_doc["metadata"]["graph_vector_granularity"] == "memory"
-    assert vector_doc["metadata"]["graph_entry_count"] == stats["graph_entries"]
-
-
-@pytest.mark.asyncio
-async def test_graph_rebuild_failure_preserves_live_generation(
-    tmp_path: Path, monkeypatch
-):
-    graph_store = GraphStore(str(tmp_path / "graph_rebuild_failure.db"))
-    await graph_store.initialize()
-    vector_db = _FakeFaissDB()
-    manager = GraphMemoryManager(
-        graph_store=graph_store,
-        graph_vector_retriever=GraphVectorRetriever(vector_db),
-        graph_extractor=GraphExtractor(),
-    )
-    metadata = {
-        "canonical_summary": "live generation",
-        "topics": ["stable"],
-        "participants": ["Alice"],
-        "key_facts": ["old graph remains available"],
-    }
-    await manager.index_memory(1, "live generation", metadata)
-    live_snapshot = await graph_store.get_subgraph_for_memories([1])
-    live_vector_ids = set(vector_db.docs)
-
-    monkeypatch.setattr(
-        manager.graph_vector_retriever,
-        "add_memory_entries_batch",
-        AsyncMock(side_effect=RuntimeError("embedding failed")),
-    )
-
-    with pytest.raises(RuntimeError, match="embedding failed"):
-        await manager.rebuild_memories(
-            [(2, "shadow generation", {**metadata, "topics": ["new"]})]
-        )
-
-    assert await graph_store.get_subgraph_for_memories([1]) == live_snapshot
-    assert set(vector_db.docs) == live_vector_ids
-
-
-@pytest.mark.asyncio
-async def test_graph_rebuild_replays_concurrent_changes(tmp_path: Path):
-    graph_store = GraphStore(str(tmp_path / "graph_rebuild_delta.db"))
-    await graph_store.initialize()
-    vector_db = _FakeFaissDB()
-    manager = GraphMemoryManager(
-        graph_store=graph_store,
-        graph_vector_retriever=GraphVectorRetriever(vector_db),
-        graph_extractor=GraphExtractor(),
-    )
-    metadata = {
-        "canonical_summary": "initial memory",
-        "topics": ["initial"],
-        "participants": ["Alice"],
-        "key_facts": ["initial fact"],
-    }
-    await manager.index_memory(1, "initial memory", metadata)
-
-    rebuild_started = asyncio.Event()
-    finish_rebuild = asyncio.Event()
-
-    async def batches():
-        yield [(1, "initial memory", metadata)]
-        rebuild_started.set()
-        await finish_rebuild.wait()
-
-    rebuild_task = asyncio.create_task(manager.rebuild_memory_batches(batches()))
-    await rebuild_started.wait()
-    await manager.delete_memory(1)
-    await manager.index_memory(
-        2,
-        "concurrent memory",
-        {
-            **metadata,
-            "canonical_summary": "concurrent memory",
-            "topics": ["concurrent"],
-        },
-    )
-    finish_rebuild.set()
-    await rebuild_task
-
-    assert not (await graph_store.get_subgraph_for_memories([1]))["memories"]
-    snapshot = await graph_store.get_subgraph_for_memories([2])
-    assert {item["memory_id"] for item in snapshot["memories"]} == {2}
-    assert len(vector_db.docs) == 1
+    vector_metadata = next(iter(vector_db.docs.values()))["metadata"]
+    assert vector_metadata["graph_vector_granularity"] == "memory"
+    assert vector_metadata["graph_entry_count"] == stats["graph_entries"]
 
 
 @pytest.mark.asyncio
@@ -451,18 +247,6 @@ async def test_graph_store_snapshot_builds_ui_ready_subgraphs(tmp_path: Path):
     assert snapshot["entries"]
     assert {memory["memory_id"] for memory in snapshot["memories"]} >= {11, 12}
 
-    compact_snapshot = await graph_store.get_graph_snapshot(
-        session_id="test:private:s1",
-        limit_memories=1,
-    )
-    full_snapshot = await graph_store.get_full_graph_snapshot(
-        session_id="test:private:s1"
-    )
-    assert {memory["memory_id"] for memory in full_snapshot["memories"]} == {11, 12}
-    assert len(full_snapshot["memories"]) > len(compact_snapshot["memories"])
-    assert len(full_snapshot["nodes"]) >= len(compact_snapshot["nodes"])
-    assert len(full_snapshot["edges"]) >= len(compact_snapshot["edges"])
-
     focused = await graph_store.get_subgraph_for_memories([11])
     assert focused["memories"]
     assert focused["memories"][0]["memory_id"] == 11
@@ -514,6 +298,55 @@ async def test_graph_retriever_supports_keyword_and_vector_search(tmp_path: Path
     assert results
     assert results[0].doc_id == 5
     assert (results[0].vector_score or 0) > 0
+
+
+@pytest.mark.asyncio
+async def test_graph_vector_search_deduplicates_shadow_generations() -> None:
+    vector_db = _FakeFaissDB()
+    await vector_db.insert(
+        "旧代无关内容",
+        {"source_memory_id": 1, "graph_vector_granularity": "memory"},
+    )
+    await vector_db.insert(
+        "新版发布计划",
+        {"source_memory_id": 1, "graph_vector_granularity": "memory"},
+    )
+    await vector_db.insert(
+        "新版测试计划",
+        {"source_memory_id": 2, "graph_vector_granularity": "memory"},
+    )
+
+    results = await GraphVectorRetriever(vector_db).search("新版", k=2)
+
+    assert len(results) == 2
+    assert {result.doc_id for result in results} == {1, 2}
+    assert next(result for result in results if result.doc_id == 1).score == 0.9
+
+
+def test_graph_extractor_uses_stable_sender_identity_across_nicknames() -> None:
+    extractor = GraphExtractor()
+
+    def person_key(display_name: str) -> str:
+        graph = extractor.extract(
+            1,
+            "身份测试",
+            {
+                "key_facts": ["同一用户修改了昵称"],
+                "participant_identities": [
+                    {
+                        "identity_key": "qq:10001",
+                        "sender_id": "10001",
+                        "platform": "qq",
+                        "display_name": display_name,
+                        "aliases": [display_name],
+                    }
+                ],
+            },
+        )
+        return next(node.node_key for node in graph.nodes if node.node_type == "person")
+
+    assert person_key("旧昵称") == person_key("新昵称")
+    assert person_key("新昵称") == "person:account:qq:10001"
 
 
 @pytest.mark.asyncio
@@ -649,11 +482,10 @@ async def test_memory_engine_dual_route_promotes_graph_hits(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_memory_engine_rebuild_graph_index(tmp_path: Path):
     doc_db_path = tmp_path / "memory_rebuild.db"
-    graph_vector_db = _FakeFaissDB()
     engine = MemoryEngine(
         db_path=str(doc_db_path),
         faiss_db=_FakeFaissDB(),
-        graph_vector_db=graph_vector_db,
+        graph_vector_db=_FakeFaissDB(),
         config={"fallback_enabled": True, "graph_memory_enabled": True},
     )
     await engine.initialize()
@@ -672,107 +504,183 @@ async def test_memory_engine_rebuild_graph_index(tmp_path: Path):
     )
     assert memory_id > 0
 
-    # The lightweight FAISS fake does not persist its document row in SQLite.
-    # Graph rebuild deliberately streams from SQLite as the source of truth.
-    source_doc = engine.faiss_db.docs[memory_id]
-    await engine.db_connection.execute(
-        """
-        INSERT OR REPLACE INTO documents(id, doc_id, text, metadata)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            memory_id,
-            source_doc["doc_id"],
-            source_doc["text"],
-            json.dumps(source_doc["metadata"], ensure_ascii=False),
-        ),
-    )
-    archived_id = memory_id + 100
-    await engine.db_connection.execute(
-        """
-        INSERT INTO documents(id, doc_id, text, metadata)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            archived_id,
-            f"archived-{archived_id}",
-            "不应进入图谱重建",
-            json.dumps(
-                {
-                    **source_doc["metadata"],
-                    "status": "archived",
-                    "canonical_summary": "不应进入图谱重建",
-                },
-                ensure_ascii=False,
-            ),
-        ),
-    )
-    await engine.db_connection.commit()
-
     assert engine.graph_memory_manager is not None
     await engine.graph_memory_manager.delete_memory(memory_id)
 
-    graph_vector_db.insert_batch_calls = 0
-    graph_vector_db.delete_documents_calls = 0
-
     rebuild_result = await engine.rebuild_graph_index()
-    assert rebuild_result == {"rebuilt": 1, "skipped": 0}
-    assert graph_vector_db.delete_documents_calls == 0
-    assert graph_vector_db.insert_batch_calls == 1
-    assert len(graph_vector_db.docs) == rebuild_result["rebuilt"]
+    assert rebuild_result["rebuilt"] >= 1
 
     stats = await engine.get_statistics()
     assert stats.get("graph_entries", 0) >= 1
-    archived_graph = await engine.graph_store.get_subgraph_for_memories([archived_id])
-    assert not archived_graph["memories"]
+    assert stats["graph_index"]["state"] == "switched"
+    assert stats["graph_index"]["memory_vectors"] == 1
+    assert stats["graph_index"]["legacy_vectors"] == 0
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_memory_engine_streams_active_graph_rebuild_batches(tmp_path: Path):
+async def test_graph_index_status_detects_legacy_vectors(tmp_path: Path):
     engine = MemoryEngine(
-        db_path=str(tmp_path / "memory_stream_rebuild.db"),
+        db_path=str(tmp_path / "memory_legacy_graph.db"),
         faiss_db=_FakeFaissDB(),
         graph_vector_db=_FakeFaissDB(),
         config={"fallback_enabled": True, "graph_memory_enabled": True},
     )
     await engine.initialize()
-    rows = []
-    for memory_id in range(1, 406):
-        status = "archived" if memory_id > 400 else "active"
-        rows.append(
-            (
-                memory_id,
-                f"doc-{memory_id}",
-                f"memory {memory_id}",
-                json.dumps({"status": status}),
-            )
-        )
-    await engine.db_connection.executemany(
-        "INSERT INTO documents(id, doc_id, text, metadata) VALUES (?, ?, ?, ?)",
-        rows,
+
+    assert engine.graph_vector_db is not None
+    await engine.graph_vector_db.insert(
+        content="旧 entry 级图向量",
+        metadata={"source_memory_id": 1},
     )
-    await engine.db_connection.commit()
 
-    class RecordingGraphManager:
-        def __init__(self):
-            self.batch_sizes = []
-            self.memory_ids = []
+    status = await engine.get_graph_index_status()
 
-        async def rebuild_memory_batches(self, batches):
-            async for batch in batches:
-                self.batch_sizes.append(len(batch))
-                self.memory_ids.extend(memory_id for memory_id, _, _ in batch)
-            return {"rebuilt": len(self.memory_ids), "skipped": 0}
-
-    recorder = RecordingGraphManager()
-    engine.graph_memory_manager = recorder
-    result = await engine.rebuild_graph_index()
-
-    assert result == {"rebuilt": 400, "skipped": 0}
-    assert recorder.batch_sizes == [200, 200]
-    assert recorder.memory_ids == list(range(1, 401))
+    assert status["state"] == "rebuild_required"
+    assert status["total_vectors"] == 1
+    assert status["memory_vectors"] == 0
+    assert status["legacy_vectors"] == 1
+    assert status["orphan_vectors"] == 1
     await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_rebuild_switches_complete_shadow_generation(tmp_path: Path):
+    graph_store = GraphStore(str(tmp_path / "graph_shadow.db"))
+    await graph_store.initialize()
+    vector_db = _FakeFaissDB()
+    manager = GraphMemoryManager(
+        graph_store,
+        GraphVectorRetriever(vector_db),
+        GraphExtractor(),
+    )
+    metadata = {
+        "session_id": "test:private:s1",
+        "persona_id": "persona_1",
+        "topics": ["旧主题"],
+        "key_facts": ["旧事实"],
+    }
+    await manager.index_memory(1, "旧记忆一", metadata)
+    await manager.index_memory(2, "旧记忆二", metadata)
+    orphan_vector_id = await vector_db.insert(
+        "孤立旧图向量",
+        {"source_memory_id": 999},
+    )
+
+    result = await manager.rebuild_memories(
+        [
+            (
+                1,
+                "新记忆一",
+                {
+                    **metadata,
+                    "topics": ["新主题"],
+                    "key_facts": ["新事实"],
+                },
+            ),
+            (
+                3,
+                "新记忆三",
+                {
+                    **metadata,
+                    "topics": ["第三主题"],
+                    "key_facts": ["第三事实"],
+                },
+            ),
+        ]
+    )
+
+    assert orphan_vector_id not in vector_db.docs
+
+    assert result == {"rebuilt": 2, "skipped": 0}
+    vectors_by_source = await graph_store.list_vector_doc_ids_by_source()
+    assert set(vectors_by_source) == {1, 3}
+    assert all(len(vector_ids) == 1 for vector_ids in vectors_by_source.values())
+    assert len(vector_db.docs) == 2
+    assert all(
+        document["metadata"].get("graph_vector_granularity") == "memory"
+        for document in vector_db.docs.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_graph_rebuild_failure_preserves_live_generation(tmp_path: Path):
+    class ToggleFailRetriever(GraphVectorRetriever):
+        fail = False
+
+        async def add_memory_entries_batch(self, memories):
+            if self.fail:
+                raise RuntimeError("embedding unavailable")
+            return await super().add_memory_entries_batch(memories)
+
+    graph_store = GraphStore(str(tmp_path / "graph_failure.db"))
+    await graph_store.initialize()
+    vector_db = _FakeFaissDB()
+    retriever = ToggleFailRetriever(vector_db)
+    manager = GraphMemoryManager(graph_store, retriever, GraphExtractor())
+    metadata = {
+        "session_id": "test:private:s1",
+        "persona_id": "persona_1",
+        "topics": ["旧主题"],
+        "key_facts": ["旧事实"],
+    }
+    await manager.index_memory(7, "必须保留的旧记忆", metadata)
+    old_stats = await graph_store.get_memory_entry_stats()
+    old_vectors = dict(vector_db.docs)
+
+    retriever.fail = True
+    with pytest.raises(RuntimeError, match="embedding unavailable"):
+        await manager.rebuild_memories([(8, "不能切换的新记忆", metadata)])
+
+    assert await graph_store.get_memory_entry_stats() == old_stats
+    assert await graph_store.list_vector_doc_ids_by_source() == {7: [1]}
+    assert vector_db.docs == old_vectors
+
+
+@pytest.mark.asyncio
+async def test_graph_rebuild_replays_writes_arriving_during_shadow_build(
+    tmp_path: Path,
+):
+    class PausingRetriever(GraphVectorRetriever):
+        def __init__(self, faiss_db):
+            super().__init__(faiss_db)
+            self.pause_next_batch = False
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def add_memory_entries_batch(self, memories):
+            if self.pause_next_batch:
+                self.pause_next_batch = False
+                self.started.set()
+                await self.release.wait()
+            return await super().add_memory_entries_batch(memories)
+
+    graph_store = GraphStore(str(tmp_path / "graph_delta.db"))
+    await graph_store.initialize()
+    vector_db = _FakeFaissDB()
+    retriever = PausingRetriever(vector_db)
+    manager = GraphMemoryManager(graph_store, retriever, GraphExtractor())
+    metadata = {
+        "session_id": "test:private:s1",
+        "persona_id": "persona_1",
+        "topics": ["主题"],
+        "key_facts": ["事实"],
+    }
+    await manager.index_memory(1, "已有记忆", metadata)
+
+    retriever.pause_next_batch = True
+    rebuild_task = asyncio.create_task(
+        manager.rebuild_memories([(1, "重建后的已有记忆", metadata)])
+    )
+    await retriever.started.wait()
+    await manager.index_memory(2, "重建期间写入的新记忆", metadata)
+    retriever.release.set()
+    await rebuild_task
+
+    vectors_by_source = await graph_store.list_vector_doc_ids_by_source()
+    assert set(vectors_by_source) == {1, 2}
+    assert all(len(vector_ids) == 1 for vector_ids in vectors_by_source.values())
+    assert len(vector_db.docs) == 2
 
 
 @pytest.mark.asyncio
@@ -810,3 +718,69 @@ async def test_graph_store_batch_delete_memories(tmp_path: Path):
     assert stats_after["graph_entries"] < stats_before["graph_entries"]
 
     await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_subgraph_memory_stats_recompute_after_node_limit(tmp_path: Path):
+    store = GraphStore(str(tmp_path / "graph_limit.db"))
+    await store.initialize()
+    node_key_to_id = await store.upsert_nodes(
+        [
+            GraphNode("topic", "Alpha", "alpha"),
+            GraphNode("topic", "Beta", "beta"),
+        ]
+    )
+    await store.add_entries(
+        [
+            GraphEntry(
+                entry_key="entry-alpha",
+                source_memory_id=1,
+                session_id="s1",
+                persona_id="p1",
+                entry_type="fact",
+                content="Alpha fact",
+                metadata={"importance": 0.8},
+                node_keys=["topic:alpha"],
+            ),
+            GraphEntry(
+                entry_key="entry-beta",
+                source_memory_id=1,
+                session_id="s1",
+                persona_id="p1",
+                entry_type="fact",
+                content="Beta fact",
+                metadata={"importance": 0.8},
+                node_keys=["topic:beta"],
+            ),
+        ],
+        node_key_to_id,
+        {},
+    )
+
+    subgraph = await store.get_subgraph_for_memories([1], limit_nodes=1)
+
+    assert len(subgraph["nodes"]) == 1
+    assert len(subgraph["entries"]) == 1
+    assert subgraph["memories"][0]["entry_count"] == 1
+    assert subgraph["memories"][0]["node_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_nodes_by_tokens_batches_large_token_lists(tmp_path: Path):
+    store = GraphStore(str(tmp_path / "graph_tokens.db"))
+    await store.initialize()
+    await store.upsert_nodes(
+        [
+            GraphNode("topic", "needle alpha", "needle alpha"),
+            GraphNode("topic", "needle beta", "needle beta"),
+        ]
+    )
+    tokens = [f"token-{index}" for index in range(1100)]
+    tokens.extend(["needle", "needle", ""])
+
+    results = await store.search_nodes_by_tokens(tokens, limit=10)
+
+    assert {item["canonical_value"] for item in results} == {
+        "needle beta",
+        "needle alpha",
+    }

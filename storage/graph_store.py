@@ -228,9 +228,9 @@ class GraphStore:
     ) -> int:
         """Insert or update one graph edge and return its identifier.
 
-        Uses semantic_edge_key for cross-memory merging:
-        when the same semantic edge already exists (from a different memory),
-        confidence is updated via EMA and weight accumulates evidence.
+        Cross-memory merging: when the same semantic edge already exists
+        (from a different memory), confidence is updated via EMA and
+        weight accumulates evidence.
         """
         source_node_id = node_key_to_id[edge.source_key]
         target_node_id = node_key_to_id[edge.target_key]
@@ -513,23 +513,8 @@ class GraphStore:
             )
             await db.commit()
 
-    async def clear_all(self) -> list[int]:
-        """Clear every graph artifact and return referenced vector document IDs."""
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "SELECT DISTINCT vector_doc_id FROM graph_entries "
-                "WHERE vector_doc_id IS NOT NULL"
-            )
-            vector_doc_ids = [int(row[0]) for row in await cursor.fetchall()]
-            await db.execute("DELETE FROM livingmemory_graph_entries_fts")
-            await db.execute("DELETE FROM graph_entry_nodes")
-            await db.execute("DELETE FROM graph_entries")
-            await db.execute("DELETE FROM graph_edges")
-            await db.execute("DELETE FROM graph_nodes")
-            await db.commit()
-        return vector_doc_ids
-
     async def list_vector_doc_ids(self) -> list[int]:
+        """Return every vector document currently referenced by graph entries."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "SELECT DISTINCT vector_doc_id FROM graph_entries "
@@ -538,6 +523,7 @@ class GraphStore:
             return [int(row[0]) for row in await cursor.fetchall()]
 
     async def list_vector_doc_ids_by_source(self) -> dict[int, list[int]]:
+        """Group referenced vector document IDs by source memory."""
         async with self._connect() as db:
             cursor = await db.execute(
                 """
@@ -549,11 +535,22 @@ class GraphStore:
             )
             result: dict[int, list[int]] = {}
             for source_memory_id, vector_doc_id in await cursor.fetchall():
-                result.setdefault(int(source_memory_id), []).append(int(vector_doc_id))
+                result.setdefault(int(source_memory_id), []).append(
+                    int(vector_doc_id)
+                )
             return result
 
+    async def count_source_memories(self) -> int:
+        """Count source memories represented by graph entries."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(DISTINCT source_memory_id) FROM graph_entries"
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
     async def iter_memory_entry_groups(self, batch_size: int = 100):
-        """Yield graph-vector payloads grouped by source memory."""
+        """Yield bounded graph-vector payloads grouped by source memory."""
         last_memory_id = -1
         while True:
             async with self._connect() as db:
@@ -600,7 +597,7 @@ class GraphStore:
             last_memory_id = memory_ids[-1]
 
     async def replace_all_from(self, shadow_db_path: str) -> None:
-        """Atomically replace live graph tables from a fully built shadow DB."""
+        """Atomically replace live graph tables from a complete shadow DB."""
         async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = OFF")
             await db.execute("ATTACH DATABASE ? AS shadow_graph", (shadow_db_path,))
@@ -862,9 +859,7 @@ class GraphStore:
         rows_by_id: dict[int, aiosqlite.Row] = {}
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            for start in range(
-                0, len(normalized_tokens), self._NODE_TOKEN_QUERY_BATCH_SIZE
-            ):
+            for start in range(0, len(normalized_tokens), self._NODE_TOKEN_QUERY_BATCH_SIZE):
                 batch = normalized_tokens[
                     start : start + self._NODE_TOKEN_QUERY_BATCH_SIZE
                 ]
@@ -1361,152 +1356,6 @@ class GraphStore:
             limit_nodes=limit_nodes,
             limit_edges=limit_edges,
         )
-
-    async def get_full_graph_snapshot(
-        self,
-        session_id: str | None = None,
-        persona_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Return every graph node and edge represented in the selected scope."""
-        filters: list[str] = []
-        params: list[Any] = []
-        if session_id is not None:
-            filters.append("ge.session_id = ?")
-            params.append(session_id)
-        if persona_id is not None:
-            filters.append("ge.persona_id = ?")
-            params.append(persona_id)
-        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
-
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            node_cursor = await db.execute(
-                f"""
-                SELECT gn.id, gn.node_key, gn.node_type, gn.node_value,
-                       gn.canonical_value, gn.metadata,
-                       COUNT(DISTINCT ge.id) AS entry_count,
-                       COUNT(DISTINCT ge.source_memory_id) AS memory_count
-                FROM graph_nodes gn
-                JOIN graph_entry_nodes gen ON gen.node_id = gn.id
-                JOIN graph_entries ge ON ge.id = gen.entry_id
-                {where_clause}
-                GROUP BY gn.id
-                ORDER BY gn.id ASC
-                """,
-                tuple(params),
-            )
-            node_rows = await node_cursor.fetchall()
-
-            edge_cursor = await db.execute(
-                f"""
-                SELECT DISTINCT edge.id, edge.edge_key, edge.source_node_id,
-                                edge.target_node_id, edge.relation_type,
-                                edge.source_memory_id, edge.weight,
-                                edge.confidence, edge.status, edge.metadata
-                FROM graph_edges edge
-                JOIN graph_entries ge
-                  ON ge.source_memory_id = edge.source_memory_id
-                {where_clause}
-                ORDER BY edge.id ASC
-                """,
-                tuple(params),
-            )
-            edge_rows = await edge_cursor.fetchall()
-
-            memory_cursor = await db.execute(
-                f"""
-                SELECT ge.source_memory_id, ge.session_id, ge.persona_id,
-                       ge.content, ge.metadata
-                FROM graph_entries ge
-                JOIN (
-                    SELECT ge.source_memory_id, MAX(ge.id) AS latest_entry_id
-                    FROM graph_entries ge
-                    {where_clause}
-                    GROUP BY ge.source_memory_id
-                ) latest ON latest.latest_entry_id = ge.id
-                ORDER BY ge.source_memory_id ASC
-                """,
-                tuple(params),
-            )
-            memory_rows = await memory_cursor.fetchall()
-
-        node_map: dict[int, dict[str, Any]] = {}
-        for row in node_rows:
-            node_id = int(row["id"])
-            node_map[node_id] = {
-                "id": node_id,
-                "key": row["node_key"],
-                "type": row["node_type"],
-                "label": row["node_value"],
-                "canonical_value": row["canonical_value"],
-                "metadata": self._from_json(row["metadata"]),
-                "entry_count": int(row["entry_count"] or 0),
-                "memory_count": int(row["memory_count"] or 0),
-                "degree": 0,
-                "weight": 0.0,
-            }
-
-        edges: list[dict[str, Any]] = []
-        for row in edge_rows:
-            source = int(row["source_node_id"])
-            target = int(row["target_node_id"])
-            if source not in node_map or target not in node_map:
-                continue
-            edges.append(
-                {
-                    "id": int(row["id"]),
-                    "key": row["edge_key"],
-                    "source": source,
-                    "target": target,
-                    "relation_type": row["relation_type"],
-                    "memory_id": int(row["source_memory_id"]),
-                    "weight": float(row["weight"]),
-                    "confidence": float(row["confidence"]),
-                    "status": row["status"],
-                    "metadata": self._from_json(row["metadata"]),
-                }
-            )
-            node_map[source]["degree"] += 1
-            node_map[target]["degree"] += 1
-
-        for node in node_map.values():
-            node["weight"] = round(
-                node["entry_count"]
-                + node["memory_count"] * 0.75
-                + node["degree"] * 0.35,
-                4,
-            )
-
-        memories: list[dict[str, Any]] = []
-        for row in memory_rows:
-            metadata = self._from_json(row["metadata"])
-            summary = str(metadata.get("canonical_summary") or row["content"] or "")[
-                :500
-            ]
-            memories.append(
-                {
-                    "memory_id": int(row["source_memory_id"]),
-                    "summary": summary,
-                    "session_id": metadata.get("session_id") or row["session_id"],
-                    "persona_id": metadata.get("persona_id") or row["persona_id"],
-                    "importance": safe_float(metadata.get("importance"), 0.0),
-                }
-            )
-
-        nodes = sorted(
-            node_map.values(),
-            key=lambda item: (
-                -safe_float(item.get("weight"), 0.0),
-                -int(item.get("degree", 0)),
-                str(item.get("label", "")),
-            ),
-        )
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "entries": [],
-            "memories": memories,
-        }
 
     async def get_memory_entry_stats(self) -> dict[str, int]:
         """Return graph storage counts for status reporting."""

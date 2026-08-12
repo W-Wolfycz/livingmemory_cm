@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from astrbot.api import logger
+from ...log import logger, tag
 
 if TYPE_CHECKING:
     from ...storage.db_migration import DBMigration
@@ -82,7 +82,7 @@ class DecayScheduler:
                     content = await f.read()
             return json.loads(content)
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"[衰减调度] 加载状态文件失败: {e}")
+            logger.warning(f"{tag('decay')} [衰减调度] 加载状态文件失败: {e}")
             return {}
 
     async def _save_state(self, state: dict) -> None:
@@ -102,7 +102,7 @@ class DecayScheduler:
                 async with aiofiles.open(self._state_file, "w", encoding="utf-8") as f:
                     await f.write(content)
         except OSError as e:
-            logger.error(f"[衰减调度] 保存状态文件失败: {e}")
+            logger.error(f"{tag('decay')} [衰减调度] 保存状态文件失败: {e}")
 
     async def _get_last_decay_date(self) -> str | None:
         """获取上次衰减日期 (格式: YYYY-MM-DD)"""
@@ -150,17 +150,15 @@ class DecayScheduler:
                     self.decay_rate, days
                 )
                 logger.info(
-                    f"[衰减调度] 衰减完成，影响 {affected} 条记忆，衰减天数: {days}"
+                    f"{tag('decay')} [衰减调度] 衰减完成，影响 {affected} 条记忆，衰减天数: {days}"
                 )
             else:
-                logger.info("[衰减调度] 衰减率为0，跳过衰减")
+                logger.info(f"{tag('decay')} [衰减调度] 衰减率为0，跳过衰减")
 
-            # 每日衰减后可选执行一次旧记忆清理
-            if self.memory_engine.config.get("auto_cleanup_enabled", True):
+            # 每日衰减后按 cleanup_days_threshold 执行清理（0 视为关闭）
+            cleanup_days = self.memory_engine.config.get("cleanup_days_threshold", 30)
+            if cleanup_days > 0:
                 try:
-                    cleanup_days = self.memory_engine.config.get(
-                        "cleanup_days_threshold", 30
-                    )
                     cleanup_importance = self.memory_engine.config.get(
                         "cleanup_importance_threshold", 0.3
                     )
@@ -168,19 +166,10 @@ class DecayScheduler:
                         days_threshold=cleanup_days,
                         importance_threshold=cleanup_importance,
                     )
-                    action = (
-                        "归档"
-                        if self.memory_engine.config.get(
-                            "auto_archived_enabled", False
-                        )
-                        else "删除"
-                    )
-                    logger.info(
-                        f"[衰减调度] 自动清理完成，{action} {deleted} 条旧记忆"
-                    )
+                    logger.info(f"{tag('decay')} [衰减调度] 自动清理完成，删除 {deleted} 条旧记忆")
                 except Exception as cleanup_err:
                     logger.error(
-                        f"[衰减调度] 自动清理失败: {cleanup_err}", exc_info=True
+                        f"{tag('decay')} [衰减调度] 自动清理失败: {cleanup_err}", exc_info=True
                     )
 
             await self._set_last_decay_date(self._get_today_str())
@@ -194,21 +183,21 @@ class DecayScheduler:
                 if maintenance_result.get("success"):
                     reclaimed = int(maintenance_result.get("bytes_reclaimed", 0))
                     logger.info(
-                        f"[衰减调度] 存储维护完成，释放 {reclaimed / 1024 / 1024:.2f} MB"
+                        f"{tag('decay')} [衰减调度] 存储维护完成，释放 {reclaimed / 1024 / 1024:.2f} MB"
                     )
                 else:
                     logger.warning(
-                        f"[衰减调度] 存储维护失败: {maintenance_result.get('error')}"
+                        f"{tag('decay')} [衰减调度] 存储维护失败: {maintenance_result.get('error')}"
                     )
             except Exception as maintenance_err:
                 logger.warning(
-                    f"[衰减调度] 存储维护异常: {maintenance_err}",
+                    f"{tag('decay')} [衰减调度] 存储维护异常: {maintenance_err}",
                     exc_info=True,
                 )
 
             return True
         except Exception as e:
-            logger.error(f"[衰减调度] 执行衰减失败: {e}", exc_info=True)
+            logger.error(f"{tag('decay')} [衰减调度] 执行衰减失败: {e}", exc_info=True)
             return False
 
     async def _check_and_execute(self) -> None:
@@ -217,14 +206,14 @@ class DecayScheduler:
         last_date_str = await self._get_last_decay_date()
 
         if last_date_str == today_str:
-            logger.debug("[衰减调度] 今日已执行过衰减，跳过")
+            logger.debug(f"{tag('decay')} [衰减调度] 今日已执行过衰减，跳过")
             return
 
         missed_days = await self._calculate_missed_days()
         total_days = missed_days + 1
 
         if missed_days > 0:
-            logger.info(f"[衰减调度] 检测到错过 {missed_days} 天衰减，执行补偿")
+            logger.info(f"{tag('decay')} [衰减调度] 检测到错过 {missed_days} 天衰减，执行补偿")
 
         await self._execute_decay(total_days)
 
@@ -235,12 +224,12 @@ class DecayScheduler:
         try:
             backup_path = await self.db_migration.create_backup()
             if backup_path:
-                logger.info(f"[衰减调度] 每日备份完成: {backup_path}")
+                logger.info(f"{tag('decay')} [衰减调度] 每日备份完成: {backup_path}")
                 await self._cleanup_old_backups()
             else:
-                logger.warning("[衰减调度] 每日备份失败")
+                logger.warning(f"{tag('decay')} [衰减调度] 每日备份失败")
         except Exception as e:
-            logger.error(f"[衰减调度] 备份异常: {e}", exc_info=True)
+            logger.error(f"{tag('decay')} [衰减调度] 备份异常: {e}", exc_info=True)
 
     async def _cleanup_old_backups(self) -> None:
         """删除超过保留天数的旧备份文件"""
@@ -261,10 +250,10 @@ class DecayScheduler:
 
             if removed:
                 logger.info(
-                    f"[衰减调度] 清理过期备份 {removed} 个（保留 {self.backup_keep_days} 天）"
+                    f"{tag('decay')} [衰减调度] 清理过期备份 {removed} 个（保留 {self.backup_keep_days} 天）"
                 )
         except Exception as e:
-            logger.warning(f"[衰减调度] 清理旧备份失败: {e}")
+            logger.warning(f"{tag('decay')} [衰减调度] 清理旧备份失败: {e}")
 
     def _seconds_until_next_run(self) -> float:
         """计算距离下次执行的秒数"""
@@ -286,7 +275,7 @@ class DecayScheduler:
         while self._running:
             try:
                 wait_seconds = self._seconds_until_next_run()
-                logger.debug(f"[衰减调度] 下次执行在 {wait_seconds / 3600:.1f} 小时后")
+                logger.debug(f"{tag('decay')} [衰减调度] 下次执行在 {wait_seconds / 3600:.1f} 小时后")
 
                 await asyncio.sleep(wait_seconds)
 
@@ -296,16 +285,16 @@ class DecayScheduler:
                 await self._execute_decay(1)
 
             except asyncio.CancelledError:
-                logger.info("[衰减调度] 调度器被取消")
+                logger.info(f"{tag('decay')} [衰减调度] 调度器被取消")
                 break
             except Exception as e:
-                logger.error(f"[衰减调度] 循环异常: {e}", exc_info=True)
+                logger.error(f"{tag('decay')} [衰减调度] 循环异常: {e}", exc_info=True)
                 await asyncio.sleep(3600)
 
     async def start(self) -> None:
         """启动调度器"""
         if self._running:
-            logger.warning("[衰减调度] 调度器已在运行")
+            logger.warning(f"{tag('decay')} [衰减调度] 调度器已在运行")
             return
 
         self._running = True
@@ -314,7 +303,7 @@ class DecayScheduler:
 
         self._task = asyncio.create_task(self._scheduler_loop())
         logger.info(
-            f"[衰减调度] 调度器已启动 (衰减率: {self.decay_rate}, "
+            f"{tag('decay')} [衰减调度] 调度器已启动 (衰减率: {self.decay_rate}, "
             f"执行时间: {self.check_hour:02d}:{self.check_minute:02d})"
         )
 
@@ -330,4 +319,4 @@ class DecayScheduler:
                 pass
 
         self._task = None
-        logger.info("[衰减调度] 调度器已停止")
+        logger.info(f"{tag('decay')} [衰减调度] 调度器已停止")

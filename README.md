@@ -1,82 +1,102 @@
-<div align="center">
+# LivingMemoryCM
 
-<p><strong>中文</strong> &nbsp;/&nbsp; <a href="README_en.md">English</a> &nbsp;/&nbsp; <a href="README_ru.md">Русский</a></p>
+LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
+[astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)
+2.5.7 修改，并针对
+[chat_memory](https://github.com/W-Wolfycz/chat_memory) 的上下文接管模式维护。
+本项目是独立的 CM-only fork，不是上游官方发行版。
 
-<h1>LivingMemory</h1>
+- 当前版本：`2.5.7-cm`
+- 源码仓库：<https://github.com/W-Wolfycz/livingmemory_cm>
+- 许可证：GNU Affero General Public License v3.0（AGPL-3.0）
 
-<p><strong>为 AstrBot 构建的长期记忆：精准召回，并在每次对话中持续演化。</strong></p>
+> [!IMPORTANT]
+> 必须安装并启用 `chat_memory >= 1.1.1`，开启 `context_takeover`，并设置
+> `ct_limit_rounds > 0`；不满足条件时插件会拒绝启动。
 
-<p><sub>捕获 &nbsp;&nbsp; 检索 &nbsp;&nbsp; 连接 &nbsp;&nbsp; 演化</sub></p>
+## 项目特点
 
-<p>
-  <a href="https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/releases"><img src="https://img.shields.io/github/v/release/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory?style=flat-square&color=5f7f79" alt="最新版本"></a>
-  <img src="https://img.shields.io/badge/Python-3.10%2B-e9f1ef?style=flat-square&labelColor=263a36" alt="Python 3.10 或更高版本">
-  <img src="https://img.shields.io/badge/AstrBot-%3E%3D%204.24.2-f3eee4?style=flat-square&labelColor=544c3d" alt="AstrBot 4.24.2 或更高版本">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-f2e8e5?style=flat-square&labelColor=5b403a" alt="AGPL-3.0 许可证"></a>
-</p>
+- ChatMemory 负责短期上下文和原始消息归档，LivingMemoryCM 只维护长期记忆。
+- 文档路使用向量检索，图路使用关键词、图向量和 RRF 融合；不恢复上游 BM25 文档路。
+- 反思读取 ChatMemory 会话，使用严格复合游标、稳定批次 ID 和幂等写入，避免重试时重复落库。
+- 召回和反思按 session、persona 与用户身份隔离，支持近期对话消歧和可配置注入预算。
+- 记忆包含中性摘要、关键事实和独立记忆原子，支持 TTL、衰减、归档和图关系维护。
+- SQLite/FAISS 使用代际与 Embedding 指纹校验；索引重建采用影子存储，失败时保留旧索引。
+- Dashboard 采用中文单语言，保留 CM persona 筛选、批量编辑/删除和 2D 知识图谱。
+- 可选提供 `recall_long_term_memory` 与 `memorize_long_term_memory` 两个 Agent 工具。
 
-<img src="docs/public/images/retrieval-flow.svg" width="100%" alt="LivingMemory 双路检索流程">
+相较上游，本 fork 不提供 PromptManager、JSON/CSV 导入导出、原始来源编辑和上游自管
+conversation history。详细 CM 接口和取舍见
+[docs/CM_INTEGRATION.md](docs/CM_INTEGRATION.md)，完整运行流程和数据结构见
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-</div>
+## 安装与升级
 
-## 让记忆形成结构
+运行要求：
 
-<table>
-<tr>
-<td width="33%"><strong>精准召回</strong><br><br>BM25 与向量检索同时覆盖文档路和图路，最终通过融合排序收敛为可靠结果。</td>
-<td width="33%"><strong>动态上下文</strong><br><br>事实被拆分为独立记忆原子，分别拥有重要度、TTL、强化机制与时间衰减。</td>
-<td width="33%"><strong>全量可见</strong><br><br>通过社区结构与多级细节，在高性能画布中探索完整的记忆关系图谱。</td>
-</tr>
-</table>
+- AstrBot `>= 4.24.2`
+- `chat_memory >= 1.1.1`
+- 可用的 Embedding Provider 与 LLM Provider
 
-## 一套完整的记忆系统
+将 ZIP 中的 `livingmemory_cm` 文件夹放入 AstrBot 的 `data/plugins/`，然后在 AstrBot 中
+reload 或重启插件。AstrBot 会按 `requirements.txt` 安装插件依赖。
 
-| 召回 | 智能 | 控制 |
-| :--- | :--- | :--- |
-| **混合检索**<br>关键词与语义检索覆盖两条数据路径。 | **双通道总结**<br>事实信息与人格上下文保持独立价值。 | **安全操作**<br>自动备份、事务删除与重建失败回滚。 |
-| **Agent 原生工具**<br>`recall_long_term_memory` 与 `memorize_long_term_memory`。 | **时间感知图谱**<br>关系置信度随证据累积或消退动态变化。 | **专注的管理界面**<br>管理记忆、调试召回并检查完整图谱。 |
+Release 包不包含 `data/`、数据库、FAISS 索引或用户配置。升级时应保留部署端原有数据
+目录；插件检测到版本变化后会先执行版本备份。重要数据仍建议在升级前额外做一次离线备份。
 
-## 近期能力
+## 配置
 
-| 可恢复记忆 | 可控边界 | 在线维护 |
-| :--- | :--- | :--- |
-| **原文与归档**<br>重要记忆可保留来源消息，支持核验、重新总结；低价值记忆可归档并恢复，而非直接删除。 | **作用域与访问控制**<br>可按会话、用户或全局共享记忆，并通过强制隔离、白名单和身份别名明确边界。 | **安全索引重建**<br>启动检查和大规模修复在后台运行，使用分批重建、进度状态、失败回滚和影子索引切换。 |
+最常用的配置项：
 
-```mermaid
-flowchart LR
-    A[对话] --> B[总结]
-    B --> C[原子化与索引]
-    C --> D[混合召回]
-    D --> E[强化]
-    C --> F[衰减或过期]
-    E --> C
+- `provider_settings.embedding_provider_id`：Embedding Provider，留空使用 AstrBot 默认值。
+- `provider_settings.llm_provider_id`：LLM Provider，留空使用 AstrBot 默认值。
+- `recall_engine.injection_method`：长期记忆注入方式，默认 `extra_user_content`。
+- `recall_engine.query_context_rounds`：用于指代消歧的最近完整问答轮数，默认 `2`。
+- `reflection_engine.trigger_count`：反思触发数量；`0` 跟随 ChatMemory 配置。
+- `graph_memory.enabled`：启用知识图谱和图检索。
+- `maintenance.cleanup_days_threshold`、`backup_keep_days`：`0` 表示关闭对应维护任务。
+
+全部 8 个配置段、45 个配置项的作用和建议见
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+
+## 命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `/lmem status` | 查看记忆库、索引与图向量状态 |
+| `/lmem search <关键词> [数量]` | 搜索长期记忆 |
+| `/lmem forget <ID>` | 删除指定记忆 |
+| `/lmem rebuild-graph` | 使用影子存储安全重建图索引 |
+| `/lmem webui` | 查看 Dashboard 入口 |
+| `/lmem reset` | 重置当前会话的记忆上下文 |
+| `/lmem cleanup [preview\|exec]` | 预演或清理历史消息中的旧注入片段 |
+| `/lmem help` | 显示帮助和当前源码入口 |
+
+## 开发与验收边界
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-test.txt
+python tests\run_tests.py --astrbot-source "D:\path\to\AstrBot-source-root"
 ```
 
-## 三步开始
+本地测试只验证领域算法、状态机、存储协议和边界条件，不模拟完整 AstrBot。当前代码级
+回归为 `435 passed`；AstrBot reload、真实 Provider、平台发送、ChatMemory Hook 顺序和
+Dashboard 浏览器交互必须在部署端验收。完整说明见
+[docs/TESTING.md](docs/TESTING.md)。
 
-1. 从 AstrBot 插件市场安装，或将插件放入 `data/plugins`。
-2. 重载 AstrBot，进入 LivingMemory 配置页面。
-3. 选择下方两个 Provider；其余配置均提供实用默认值。
+## 更新记录
 
-| 配置项 | 用途 |
-| :--- | :--- |
-| `embedding_provider_id` | 嵌入模型；留空则使用 AstrBot 默认配置。 |
-| `llm_provider_id` | 总结模型；留空则使用 AstrBot 默认配置。 |
+本 fork 的公开变更位于 [CHANGELOG.md](CHANGELOG.md) 顶部；其后保留上游
+LivingMemory 的原始版本记录。
 
-可视化工作区入口为 `插件 -> LivingMemory -> Pages -> dashboard`。插件 Pages 需要 **AstrBot 4.24.2 或更高版本**。
+## 许可证与源码
 
-## 深入了解
+本项目继承上游 AGPL-3.0，完整条款见 [LICENSE](LICENSE)，fork 来源、主要修改和分发
+要求见 [NOTICE.md](NOTICE.md)。复制、修改、部署或分发时应保留这些文件，并继续按
+AGPL-3.0 提供与实际运行版本对应的完整源码；通过网络与修改版交互的用户也应能显著、
+免费地取得对应源码。
 
-| 入门 | 配置 | 使用 | 原理 |
-| :--- | :--- | :--- | :--- |
-| [快速开始](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/guide/getting-started)<br>[功能全览](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/features) | [完整配置](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/configuration) | [命令列表](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/commands)<br>[WebUI 管理](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/webui) | [技术架构](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/architecture) |
-
-从 v1.4.0-v1.4.2 升级？请先检查[备份、迁移与清理配置](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/configuration#备份迁移与清理)。
-
-## 项目
-
-[完整文档](https://lxfight-s-astrbot-plugins.github.io/astrbot_plugin_livingmemory/) · [版本发布](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues)
-
-社区支持：[QQ 群 953245617](https://qm.qq.com/cgi-bin/qm/qr?k=WdyqoP-AOEXqGAN08lOFfVSguF2EmBeO&jump_from=webapi&authKey=tPyfv90TVYSGVhbAhsAZCcSBotJuTTLf03wnn7/lQZPUkWfoQ/J8e9nkAipkOzwh) · 口令：`lxfight`
-
-LivingMemory 使用 [AGPL-3.0 许可证](LICENSE)发布。
+Dashboard 随附的 Lucide 材料采用其自有许可证，见
+[pages/dashboard/vendor/LUCIDE_LICENSE](pages/dashboard/vendor/LUCIDE_LICENSE)。
+ChatMemory 是未包含在本仓库中的独立 MIT 依赖；如将其一并分发，还需保留 ChatMemory
+自己的许可证和版权声明。

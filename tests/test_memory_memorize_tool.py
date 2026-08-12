@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from astrbot.api.platform import MessageType
 
-from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
-from astrbot_plugin_livingmemory.core.tools.memory_memorize_tool import (
+from livingmemory_cm.core.tools.memory_memorize_tool import (
     MemoryMemorizeTool,
 )
 
@@ -64,7 +63,7 @@ async def test_memory_memorize_tool_writes_current_session_and_persona(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -87,37 +86,6 @@ async def test_memory_memorize_tool_writes_current_session_and_persona(
 
 
 @pytest.mark.asyncio
-async def test_memory_memorize_tool_writes_resolved_user_scope(
-    memory_engine, memory_processor
-):
-    tool = MemoryMemorizeTool(
-        context=Mock(),
-        config_manager=ConfigManager(
-            {"filtering_settings": {"memory_scope_mode": "user"}}
-        ),
-        memory_engine=memory_engine,
-        memory_processor=memory_processor,
-    )
-    run_context = _make_run_context()
-    event = run_context.context.event
-    event.get_platform_name = Mock(return_value="test")
-    event.get_sender_id = Mock(return_value="user-1")
-
-    with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
-        new_callable=AsyncMock,
-        return_value="persona_a",
-    ):
-        await tool.call(run_context, memory="remember this")
-
-    call_kwargs = memory_engine.add_memory.await_args.kwargs
-    assert call_kwargs["session_id"] == "livingmemory:user:test:user-1"
-    assert call_kwargs["metadata"]["source_session_id"] == (
-        "test:private:session-1"
-    )
-
-
-@pytest.mark.asyncio
 async def test_memory_memorize_tool_uses_memory_processor_format(
     memory_engine, memory_processor
 ):
@@ -128,7 +96,7 @@ async def test_memory_memorize_tool_uses_memory_processor_format(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -174,7 +142,7 @@ async def test_memory_memorize_tool_detects_group_chat(memory_engine, memory_pro
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -199,7 +167,7 @@ async def test_memory_memorize_tool_normalizes_invalid_sentiment(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -226,7 +194,7 @@ async def test_memory_memorize_tool_handles_non_string_sentiment(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -290,7 +258,7 @@ async def test_memory_memorize_tool_hides_internal_exception_details(
     memory_engine.add_memory = AsyncMock(side_effect=RuntimeError("secret db path"))
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -313,7 +281,7 @@ async def test_memory_memorize_tool_propagates_cancellation(
     memory_engine.add_memory = AsyncMock(side_effect=asyncio.CancelledError())
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_memorize_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_memorize_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"

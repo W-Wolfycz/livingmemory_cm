@@ -100,12 +100,6 @@ class MemoryAtom:
         days_since = max(0.0, (reference_time - self.last_accessed_at) / 86400.0)
         return compute_decay_score(self.decay_type, self.ttl_days, days_since)
 
-    def is_expired(self, reference_time: float | None = None) -> bool:
-        """Check whether the atom has passed its expiry threshold."""
-        if reference_time is None:
-            reference_time = time.time()
-        return reference_time >= self.expires_at
-
 
 def compute_ttl(
     atom_type: AtomType,

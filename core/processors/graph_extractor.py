@@ -35,9 +35,10 @@ class GraphExtractor:
         return self._extract_legacy(source_memory_id, content, metadata)
 
     def _participant_nodes(
-        self, metadata: dict[str, Any]
+        self,
+        metadata: dict[str, Any],
     ) -> list[tuple[str, str, dict[str, Any]]]:
-        """Return display name, canonical identity, and metadata for people."""
+        """Return display name, stable canonical identity, and alias metadata."""
         resolved: list[tuple[str, str, dict[str, Any]]] = []
         identities = metadata.get("participant_identities")
         if isinstance(identities, list):
@@ -126,7 +127,7 @@ class GraphExtractor:
             return node.node_key
 
         topic_keys = [_add_node("topic", topic) for topic in topics]
-        participant_keys = []
+        participant_keys: list[str] = []
         for participant, canonical_value, identity_metadata in participants:
             node = GraphNode(
                 node_type="person",
@@ -342,13 +343,13 @@ class GraphExtractor:
             persona_id = getattr(atom, "persona_id", None)
             entities = getattr(atom, "entities", []) or []
 
-            # Atom entities mix topics and LLM participant labels. Stable sender
-            # identities replace the participant labels when they are available.
+            # Stable participant nodes replace nickname-like atom entities.
             entity_keys: list[str] = []
             for entity in entities:
                 if (
                     participant_nodes
-                    and EntityResolver.canonicalize(str(entity)) in participant_values
+                    and EntityResolver.canonicalize(str(entity))
+                    in participant_values
                 ):
                     continue
                 entity_key = _add_node("topic", entity)
@@ -412,7 +413,10 @@ class GraphExtractor:
                         metadata={"atom_content": atom.content},
                     )
                 )
-                edge_payload = f"edge|{source_memory_id}|{relation_type}|{entity_key}|{fact_key}|{atom.content}"
+                edge_payload = (
+                    f"edge|{source_memory_id}|{relation_type}|{entity_key}|"
+                    f"{fact_key}|{atom.content}"
+                )
                 edge_entry_key = hashlib.sha1(edge_payload.encode("utf-8")).hexdigest()
                 graph.entries.append(
                     GraphEntry(
@@ -422,8 +426,9 @@ class GraphExtractor:
                         persona_id=persona_id,
                         entry_type="edge",
                         content=(
-                            f"{'Participant' if is_person else 'Topic'} {node_map[entity_key].value} "
-                            f"relates to fact: {atom.content}"
+                            f"{'Participant' if is_person else 'Topic'} "
+                            f"{node_map[entity_key].value} relates to fact: "
+                            f"{atom.content}"
                         ),
                         metadata={
                             **entry_metadata,

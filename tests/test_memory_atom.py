@@ -7,18 +7,18 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from astrbot_plugin_livingmemory.core.models.memory_atom import (
+from livingmemory_cm.core.models.memory_atom import (
     AtomStatus,
     AtomType,
     DecayType,
     MemoryAtom,
     compute_ttl,
 )
-from astrbot_plugin_livingmemory.core.processors.atom_classifier import (
+from livingmemory_cm.core.processors.atom_classifier import (
     _classify_single,
     classify_atoms,
 )
-from astrbot_plugin_livingmemory.storage.atom_store import AtomStore
+from livingmemory_cm.storage.atom_store import AtomStore
 
 # ---------- TTL computation ----------
 
@@ -96,22 +96,6 @@ def test_memory_atom_step_decay() -> None:
     assert before >= 0.99
     after = atom.compute_temporal_score(time.time() + 12 * 86400.0)
     assert after <= 0.06
-
-
-def test_memory_atom_expiry_check() -> None:
-    atom = MemoryAtom(
-        parent_memory_id=4,
-        content="expired test",
-        expires_at=time.time() - 1.0,
-    )
-    assert atom.is_expired()
-
-    atom_still_alive = MemoryAtom(
-        parent_memory_id=5,
-        content="alive",
-        expires_at=time.time() + 3600.0,
-    )
-    assert not atom_still_alive.is_expired()
 
 
 # ---------- Atom classifier ----------
@@ -323,7 +307,7 @@ async def test_atom_store_delete_by_parent(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_atom_retriever_search(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.retrieval.atom_retriever import AtomRetriever
+    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
 
     db_path = str(tmp_path / "test_atoms_retriever.db")
     store = AtomStore(db_path)
@@ -362,7 +346,7 @@ async def test_atom_retriever_search(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_atom_retriever_session_filter(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.retrieval.atom_retriever import AtomRetriever
+    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
 
     db_path = str(tmp_path / "test_atoms_filter.db")
     store = AtomStore(db_path)
@@ -492,7 +476,7 @@ async def test_atom_store_touch_updates_access_time(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_lifecycle_manager_run_maintenance(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.managers.atom_lifecycle_manager import (
+    from livingmemory_cm.core.managers.atom_lifecycle_manager import (
         AtomLifecycleManager,
     )
 
@@ -510,7 +494,7 @@ async def test_lifecycle_manager_run_maintenance(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_lifecycle_manager_reinforcement_no_match(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.managers.atom_lifecycle_manager import (
+    from livingmemory_cm.core.managers.atom_lifecycle_manager import (
         AtomLifecycleManager,
     )
 
@@ -526,7 +510,7 @@ async def test_lifecycle_manager_reinforcement_no_match(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_lifecycle_manager_reinforcement_jaccard_match(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.managers.atom_lifecycle_manager import (
+    from livingmemory_cm.core.managers.atom_lifecycle_manager import (
         AtomLifecycleManager,
     )
 
@@ -555,8 +539,8 @@ async def test_lifecycle_manager_reinforcement_jaccard_match(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_lifecycle_manager_logs_and_backs_off_on_error(monkeypatch):
-    import astrbot_plugin_livingmemory.core.managers.atom_lifecycle_manager as lifecycle_module
-    from astrbot_plugin_livingmemory.core.managers.atom_lifecycle_manager import (
+    import livingmemory_cm.core.managers.atom_lifecycle_manager as lifecycle_module
+    from livingmemory_cm.core.managers.atom_lifecycle_manager import (
         AtomLifecycleManager,
     )
 
@@ -579,7 +563,7 @@ async def test_lifecycle_manager_logs_and_backs_off_on_error(monkeypatch):
     await mgr._maintenance_loop()
 
     error_mock.assert_called_once()
-    assert error_mock.call_args.args[0] == "[AtomLifecycle] 维护任务异常"
+    assert error_mock.call_args.args[0] == "[livingmemory_cm:atom] 维护任务异常"
     assert error_mock.call_args.kwargs["exc_info"] is True
     assert sleep_calls == [60.0]
 
@@ -589,7 +573,7 @@ async def test_lifecycle_manager_logs_and_backs_off_on_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_atom_retriever_get_atoms_for_memory(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.retrieval.atom_retriever import AtomRetriever
+    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
 
     db_path = str(tmp_path / "test_atoms_by_parent.db")
     store = AtomStore(db_path)
@@ -608,7 +592,7 @@ async def test_atom_retriever_get_atoms_for_memory(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_atom_retriever_touch(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.retrieval.atom_retriever import AtomRetriever
+    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
 
     db_path = str(tmp_path / "test_atoms_retriever_touch.db")
     store = AtomStore(db_path)
@@ -630,11 +614,11 @@ async def test_atom_retriever_touch(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_graph_store_semantic_edge_merge(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.models.graph_models import (
+    from livingmemory_cm.core.models.graph_models import (
         GraphEdge,
         GraphNode,
     )
-    from astrbot_plugin_livingmemory.storage.graph_store import GraphStore
+    from livingmemory_cm.storage.graph_store import GraphStore
 
     db_path = str(tmp_path / "test_semantic_edge.db")
     store = GraphStore(db_path)
@@ -689,11 +673,11 @@ async def test_graph_store_semantic_edge_merge(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_graph_store_first_edge_no_merge(tmp_path: Path) -> None:
-    from astrbot_plugin_livingmemory.core.models.graph_models import (
+    from livingmemory_cm.core.models.graph_models import (
         GraphEdge,
         GraphNode,
     )
-    from astrbot_plugin_livingmemory.storage.graph_store import GraphStore
+    from livingmemory_cm.storage.graph_store import GraphStore
 
     db_path = str(tmp_path / "test_edge_no_merge.db")
     store = GraphStore(db_path)
@@ -731,7 +715,7 @@ async def test_graph_store_first_edge_no_merge(tmp_path: Path) -> None:
 
 def test_graph_extractor_empty_atoms_falls_back_to_legacy() -> None:
     """Empty atoms list is falsy → extract() falls back to legacy path."""
-    from astrbot_plugin_livingmemory.core.processors.graph_extractor import (
+    from livingmemory_cm.core.processors.graph_extractor import (
         GraphExtractor,
     )
 
@@ -748,8 +732,8 @@ def test_graph_extractor_empty_atoms_falls_back_to_legacy() -> None:
 
 
 def test_graph_extractor_atoms_with_entities() -> None:
-    from astrbot_plugin_livingmemory.core.models.memory_atom import AtomType, MemoryAtom
-    from astrbot_plugin_livingmemory.core.processors.graph_extractor import (
+    from livingmemory_cm.core.models.memory_atom import AtomType, MemoryAtom
+    from livingmemory_cm.core.processors.graph_extractor import (
         GraphExtractor,
     )
 
@@ -773,8 +757,8 @@ def test_graph_extractor_atoms_with_entities() -> None:
 
 
 def test_graph_extractor_atoms_no_entities_fallback() -> None:
-    from astrbot_plugin_livingmemory.core.models.memory_atom import AtomType, MemoryAtom
-    from astrbot_plugin_livingmemory.core.processors.graph_extractor import (
+    from livingmemory_cm.core.models.memory_atom import AtomType, MemoryAtom
+    from livingmemory_cm.core.processors.graph_extractor import (
         GraphExtractor,
     )
 
@@ -809,7 +793,7 @@ def test_graph_extractor_atoms_no_entities_fallback() -> None:
 
 def test_classify_atoms_from_metadata_default_config() -> None:
     """MemoryProcessor initializes atom config for direct construction."""
-    from astrbot_plugin_livingmemory.core.processors.memory_processor import MemoryProcessor
+    from livingmemory_cm.core.processors.memory_processor import MemoryProcessor
 
     processor = MemoryProcessor()
     atoms = processor.classify_atoms_from_metadata(metadata={"key_facts": []})
@@ -818,7 +802,7 @@ def test_classify_atoms_from_metadata_default_config() -> None:
 
 def test_classify_atoms_from_metadata_atom_disabled() -> None:
     """When atom_enabled is False, classify_atoms_from_metadata returns empty list."""
-    from astrbot_plugin_livingmemory.core.processors.memory_processor import (
+    from livingmemory_cm.core.processors.memory_processor import (
         MemoryProcessor,
     )
 
@@ -830,7 +814,7 @@ def test_classify_atoms_from_metadata_atom_disabled() -> None:
 
 
 def test_classify_atoms_from_metadata_atom_enabled_returns_atoms() -> None:
-    from astrbot_plugin_livingmemory.core.processors.memory_processor import MemoryProcessor
+    from livingmemory_cm.core.processors.memory_processor import MemoryProcessor
 
     processor = MemoryProcessor(config={"atom_enabled": True})
     atoms = processor.classify_atoms_from_metadata(
@@ -852,7 +836,7 @@ def test_classify_atoms_from_metadata_atom_enabled_returns_atoms() -> None:
 
 def test_classify_atoms_from_metadata_no_key_facts() -> None:
     """When key_facts is empty, classify_atoms_from_metadata returns empty list."""
-    from astrbot_plugin_livingmemory.core.processors.memory_processor import (
+    from livingmemory_cm.core.processors.memory_processor import (
         MemoryProcessor,
     )
 
@@ -865,7 +849,7 @@ def test_classify_atoms_from_metadata_no_key_facts() -> None:
 
 def test_legacy_extract_path_unchanged() -> None:
     """When no atoms provided, extract() uses legacy path (backward compatible)."""
-    from astrbot_plugin_livingmemory.core.processors.graph_extractor import (
+    from livingmemory_cm.core.processors.graph_extractor import (
         GraphExtractor,
     )
 
@@ -892,7 +876,7 @@ def test_legacy_extract_path_unchanged() -> None:
 
 
 def test_event_time_parsing_tomorrow() -> None:
-    from astrbot_plugin_livingmemory.core.processors.atom_classifier import (
+    from livingmemory_cm.core.processors.atom_classifier import (
         _parse_event_time,
     )
 
@@ -903,7 +887,7 @@ def test_event_time_parsing_tomorrow() -> None:
 
 
 def test_event_time_parsing_bare_weekday_uses_next_occurrence(monkeypatch) -> None:
-    from astrbot_plugin_livingmemory.core.processors import atom_classifier
+    from livingmemory_cm.core.processors import atom_classifier
 
     # 2024-06-05 is Wednesday; bare "周二" should point to the next Tuesday.
     now = 1717588800.0
@@ -916,7 +900,7 @@ def test_event_time_parsing_bare_weekday_uses_next_occurrence(monkeypatch) -> No
 
 
 def test_event_time_parsing_explicit_next_week(monkeypatch) -> None:
-    from astrbot_plugin_livingmemory.core.processors import atom_classifier
+    from livingmemory_cm.core.processors import atom_classifier
 
     # 2024-06-05 is Wednesday; "下周二" is six days after this Wednesday.
     now = 1717588800.0
@@ -929,7 +913,7 @@ def test_event_time_parsing_explicit_next_week(monkeypatch) -> None:
 
 
 def test_event_time_parsing_month_day() -> None:
-    from astrbot_plugin_livingmemory.core.processors.atom_classifier import (
+    from livingmemory_cm.core.processors.atom_classifier import (
         _parse_event_time,
     )
 
@@ -938,7 +922,7 @@ def test_event_time_parsing_month_day() -> None:
 
 
 def test_event_time_parsing_no_time() -> None:
-    from astrbot_plugin_livingmemory.core.processors.atom_classifier import (
+    from livingmemory_cm.core.processors.atom_classifier import (
         _parse_event_time,
     )
 

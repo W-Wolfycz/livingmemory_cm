@@ -6,7 +6,10 @@ import json
 import os
 from pathlib import Path
 
-from astrbot_plugin_livingmemory.core.managers.backup_manager import (
+import pytest
+
+from livingmemory_cm.core.managers.backup_manager import (
+    BackupError,
     PLUGIN_VERSION,
     BackupManager,
     _BACKUP_INFO_FILE,
@@ -201,6 +204,33 @@ def test_backup_continues_on_copy_failure(tmp_path: Path) -> None:
     assert (backup_path / "conversations.db").exists()
 
 
+def test_backup_failure_does_not_mark_version_complete(monkeypatch, tmp_path: Path) -> None:
+    """真实复制失败时保留旧版本标记，下一次启动必须可以重试。"""
+    (tmp_path / "livingmemory.db").write_text("ok")
+    mgr = BackupManager(str(tmp_path))
+    mgr.version_file.write_text("1.0.0", encoding="utf-8")
+
+    def _fail_copy(*_args, **_kwargs):
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(
+        "livingmemory_cm.core.managers.backup_manager.shutil.copy2",
+        _fail_copy,
+    )
+
+    with pytest.raises(BackupError, match="备份文件失败"):
+        mgr.backup_if_needed()
+
+    assert mgr.get_stored_version() == "1.0.0"
+    assert mgr.needs_backup() is True
+    published = [
+        path
+        for path in (tmp_path / "backups").iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+    assert published == []
+
+
 def test_list_backups_multiple_sorted_desc(tmp_path: Path) -> None:
     """多个备份应按版本号逆序排列。"""
     for ver in ("v1.0.0", "v2.0.0", "v2.5.0"):
@@ -263,8 +293,7 @@ def test_backup_info_json_contains_all_fields(tmp_path: Path) -> None:
     (tmp_path / "livingmemory.db").write_text("test")
 
     mgr = BackupManager(str(tmp_path))
-    previous_version = "0.0.0"
-    mgr.version_file.write_text(previous_version, encoding="utf-8")
+    mgr.version_file.write_text("2.5.0", encoding="utf-8")
     backup_dir = mgr.backup_if_needed()
 
     info = json.loads(
@@ -272,13 +301,15 @@ def test_backup_info_json_contains_all_fields(tmp_path: Path) -> None:
     )
     required_fields = [
         "plugin_version", "previous_version", "backup_timestamp",
-        "backup_unix_time", "files_copied", "data_dir",
+        "backup_unix_time", "files_copied", "complete",
     ]
     for field in required_fields:
         assert field in info, f"Missing field: {field}"
-    assert info["previous_version"] == previous_version
+    assert info["previous_version"] == "2.5.0"
     assert info["plugin_version"] == PLUGIN_VERSION
     assert isinstance(info["backup_unix_time"], float)
+    assert info["complete"] is True
+    assert "data_dir" not in info
 
 
 def test_pluigin_version_constant_matches_metadata() -> None:
@@ -289,7 +320,7 @@ def test_pluigin_version_constant_matches_metadata() -> None:
     if not metadata_path.exists():
         return  # skip if metadata.yaml not found (CI, etc.)
 
-    with open(metadata_path) as f:
+    with open(metadata_path, encoding="utf-8") as f:
         metadata = yaml.safe_load(f)
     assert PLUGIN_VERSION == metadata["version"], (
         f"PLUGIN_VERSION ({PLUGIN_VERSION}) must match metadata.yaml "

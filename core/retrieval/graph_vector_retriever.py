@@ -43,11 +43,13 @@ class GraphVectorRetriever:
         """Insert one graph entry into the vector database."""
         return await self.faiss_db.insert(content=content, metadata=metadata)
 
-    async def add_entries(self, entries: list[tuple[str, dict[str, Any]]]) -> list[int]:
+    async def add_entries(
+        self,
+        entries: list[tuple[str, dict[str, Any]]],
+    ) -> list[int]:
         """Insert one source memory as one aggregated graph vector."""
         if not entries:
             return []
-
         return [await self.add_memory_entries(entries)]
 
     @classmethod
@@ -102,25 +104,37 @@ class GraphVectorRetriever:
 
         insert_batch = getattr(self.faiss_db, "insert_batch", None)
         if callable(insert_batch):
-            return await insert_batch(
-                contents=contents,
-                metadatas=metadatas,
-            )
+            return await insert_batch(contents=contents, metadatas=metadatas)
 
-        # Compatibility with older AstrBot versions without insert_batch.
         return [
             await self.add_entry(content, metadata)
             for content, metadata in zip(contents, metadatas, strict=True)
         ]
 
-    async def clear_all(self, known_vector_doc_ids: list[int]) -> None:
-        """Clear the dedicated graph-vector store with one save when supported."""
-        delete_documents = getattr(self.faiss_db, "delete_documents", None)
-        if callable(delete_documents):
-            await delete_documents(metadata_filters={})
-            return
+    async def list_document_ids(self) -> list[int]:
+        """List every graph-vector document ID without exposing document text."""
+        document_storage = self.faiss_db.document_storage
+        get_session = getattr(document_storage, "get_session", None)
+        if callable(get_session):
+            from sqlalchemy import text
 
-        await self.delete_entries_batch({0: known_vector_doc_ids})
+            async with get_session() as session:
+                result = await session.execute(
+                    text("SELECT id FROM documents ORDER BY id")
+                )
+                return [int(row[0]) for row in result.fetchall()]
+
+        total = int(
+            await document_storage.count_documents(metadata_filters={})
+        )
+        if total <= 0:
+            return []
+        documents = await document_storage.get_documents(
+            metadata_filters={},
+            offset=0,
+            limit=total,
+        )
+        return [int(document["id"]) for document in documents]
 
     async def search(
         self,
@@ -139,31 +153,41 @@ class GraphVectorRetriever:
         if persona_id is not None:
             metadata_filters["persona_id"] = persona_id
 
-        fetch_k = k * 2 if metadata_filters else k
+        # During a shadow rebuild the old and candidate vector generations coexist
+        # briefly. Fetch extra candidates so duplicate generations do not crowd out
+        # distinct source memories before the generation switch completes.
+        retrieve_k = k * 2
+        fetch_k = retrieve_k * 2 if metadata_filters else retrieve_k
         raw_results = await self.faiss_db.retrieve(
             query=query,
-            k=k,
+            k=retrieve_k,
             fetch_k=fetch_k,
             rerank=False,
             metadata_filters=metadata_filters if metadata_filters else None,
         )
 
-        results: list[GraphVectorResult] = []
+        best_by_source: dict[int, GraphVectorResult] = {}
         for result in raw_results:
             data = result.data
             metadata = self._coerce_metadata(data.get("metadata"))
             source_memory_id = metadata.get("source_memory_id")
             if source_memory_id is None:
                 continue
-            results.append(
-                GraphVectorResult(
-                    doc_id=int(source_memory_id),
-                    score=float(result.similarity),
-                    content=str(data.get("text") or ""),
-                    metadata=metadata,
-                )
+            candidate = GraphVectorResult(
+                doc_id=int(source_memory_id),
+                score=float(result.similarity),
+                content=str(data.get("text") or ""),
+                metadata=metadata,
             )
-        return results
+            previous = best_by_source.get(candidate.doc_id)
+            if previous is None or candidate.score > previous.score:
+                best_by_source[candidate.doc_id] = candidate
+
+        return sorted(
+            best_by_source.values(),
+            key=lambda item: item.score,
+            reverse=True,
+        )[:k]
 
     async def _get_uuid_from_id(self, vector_doc_id: int) -> str | None:
         """Resolve the internal UUID used by the underlying vector store."""
@@ -200,7 +224,6 @@ class GraphVectorRetriever:
             )
             return
 
-        # Compatibility with older AstrBot versions without bulk deletion.
         for vector_doc_id in vector_doc_ids:
             await self.delete_entry(vector_doc_id)
 
@@ -218,7 +241,8 @@ class GraphVectorRetriever:
             return
 
         deleted_ids = await delete_faiss_documents_by_ids(
-            self.faiss_db, vector_doc_ids
+            self.faiss_db,
+            vector_doc_ids,
         )
         if deleted_ids is not None:
             if len(deleted_ids) != len(set(vector_doc_ids)):

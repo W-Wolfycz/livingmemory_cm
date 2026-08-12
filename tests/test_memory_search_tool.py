@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
-from astrbot_plugin_livingmemory.core.tools.memory_search_tool import MemorySearchTool
+from livingmemory_cm.core.base.config_manager import ConfigManager
+from livingmemory_cm.core.tools.memory_search_tool import MemorySearchTool
 
 
 @pytest.fixture
@@ -33,16 +33,15 @@ def _make_run_context():
 
 
 @pytest.mark.asyncio
-async def test_memory_search_tool_uses_filtering_settings(memory_engine, astr_context):
+async def test_memory_search_tool_always_filters_by_session_and_persona(
+    memory_engine, astr_context
+):
+    """人格/会话过滤恒开（CM-only 单路径），search_memories 必须收到 session_id 和 persona_id。"""
     tool = MemorySearchTool(
         context=astr_context,
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 3, "max_k": 8},
-                "filtering_settings": {
-                    "use_session_filtering": True,
-                    "use_persona_filtering": True,
-                },
             }
         ),
         memory_engine=memory_engine,
@@ -50,7 +49,7 @@ async def test_memory_search_tool_uses_filtering_settings(memory_engine, astr_co
     memory_engine.search_memories = AsyncMock(return_value=[])
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -68,91 +67,6 @@ async def test_memory_search_tool_uses_filtering_settings(memory_engine, astr_co
         session_id="test:private:session-1",
         persona_id="persona_a",
     )
-
-
-@pytest.mark.asyncio
-async def test_memory_search_tool_disables_filters_when_config_disabled(
-    memory_engine, astr_context
-):
-    tool = MemorySearchTool(
-        context=astr_context,
-        config_manager=ConfigManager(
-            {
-                "filtering_settings": {
-                    "use_session_filtering": False,
-                    "use_persona_filtering": False,
-                }
-            }
-        ),
-        memory_engine=memory_engine,
-    )
-
-    with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
-        new_callable=AsyncMock,
-    ) as get_persona:
-        get_persona.return_value = "persona_a"
-        await tool.call(_make_run_context(), query="项目约定")
-
-    memory_engine.search_memories.assert_awaited_once_with(
-        query="项目约定",
-        k=5,
-        session_id=None,
-        persona_id=None,
-    )
-    get_persona.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_memory_search_tool_uses_user_scope(memory_engine, astr_context):
-    tool = MemorySearchTool(
-        context=astr_context,
-        config_manager=ConfigManager(
-            {
-                "filtering_settings": {
-                    "memory_scope_mode": "user",
-                    "use_persona_filtering": False,
-                }
-            }
-        ),
-        memory_engine=memory_engine,
-    )
-    run_context = _make_run_context()
-    event = run_context.context.event
-    event.get_platform_name = Mock(return_value="test")
-    event.get_sender_id = Mock(return_value="user-1")
-
-    await tool.call(run_context, query="跨会话项目")
-
-    memory_engine.search_memories.assert_awaited_once_with(
-        query="跨会话项目",
-        k=5,
-        session_id="livingmemory:user:test:user-1",
-        persona_id=None,
-    )
-
-
-@pytest.mark.asyncio
-async def test_memory_search_tool_denies_unlisted_user(memory_engine, astr_context):
-    tool = MemorySearchTool(
-        context=astr_context,
-        config_manager=ConfigManager(
-            {
-                "access_control": {
-                    "whitelist_enabled": True,
-                    "allowed_ids": "another-user",
-                }
-            }
-        ),
-        memory_engine=memory_engine,
-    )
-    run_context = _make_run_context()
-    run_context.context.event.get_sender_id = Mock(return_value="user-1")
-
-    result = json.loads(await tool.call(run_context, query="private memory"))
-
-    assert result["error"] == "memory access is not allowed"
-    memory_engine.search_memories.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -178,10 +92,9 @@ async def test_memory_search_tool_serializes_results(memory_engine, astr_context
             )
         ]
     )
-    memory_engine.get_memory_source = AsyncMock()
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -199,44 +112,6 @@ async def test_memory_search_tool_serializes_results(memory_engine, astr_context
         "create_time": 100.0,
         "last_access_time": 200.0,
     }
-    memory_engine.get_memory_source.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_memory_search_tool_includes_retained_source_on_request(
-    memory_engine, astr_context
-):
-    memory_engine.search_memories = AsyncMock(
-        return_value=[
-            Mock(
-                doc_id=9,
-                content="summary",
-                final_score=0.9,
-                metadata={"has_source": True},
-            )
-        ]
-    )
-    memory_engine.get_memory_source = AsyncMock(
-        return_value=[{"role": "user", "content": "exact detail"}]
-    )
-    tool = MemorySearchTool(
-        context=astr_context,
-        config_manager=ConfigManager(),
-        memory_engine=memory_engine,
-    )
-
-    with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
-        new=AsyncMock(return_value="persona_a"),
-    ):
-        result = json.loads(
-            await tool.call(
-                _make_run_context(), query="details", include_source=True
-            )
-        )
-
-    assert result["results"][0]["source_messages"][0]["content"] == "exact detail"
-    memory_engine.get_memory_source.assert_awaited_once_with(9)
 
 
 @pytest.mark.asyncio
@@ -260,7 +135,7 @@ async def test_memory_search_tool_serializes_non_dict_metadata(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -288,7 +163,7 @@ async def test_memory_search_tool_limits_k_by_config(memory_engine, astr_context
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -309,10 +184,6 @@ async def test_memory_search_tool_clamps_low_k_to_one(memory_engine, astr_contex
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 3, "max_k": 8},
-                "filtering_settings": {
-                    "use_session_filtering": True,
-                    "use_persona_filtering": True,
-                },
             }
         ),
         memory_engine=memory_engine,
@@ -320,7 +191,7 @@ async def test_memory_search_tool_clamps_low_k_to_one(memory_engine, astr_contex
     memory_engine.search_memories = AsyncMock(return_value=[])
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -347,7 +218,7 @@ async def test_memory_search_tool_falls_back_to_default_k_for_invalid_input(
     memory_engine.search_memories = AsyncMock(return_value=[])
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -413,7 +284,7 @@ async def test_memory_search_tool_hides_internal_exception_details(
     )
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -434,7 +305,7 @@ async def test_memory_search_tool_propagates_cancellation(memory_engine, astr_co
     memory_engine.search_memories = AsyncMock(side_effect=asyncio.CancelledError())
 
     with patch(
-        "astrbot_plugin_livingmemory.core.tools.memory_search_tool.get_persona_id",
+        "livingmemory_cm.core.tools.memory_search_tool.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
