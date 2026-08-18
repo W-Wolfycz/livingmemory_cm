@@ -433,7 +433,7 @@ async def test_memory_engine_dual_route_promotes_graph_hits(tmp_path: Path):
         config={
             "fallback_enabled": True,
             "graph_memory_enabled": True,
-            "document_route_weight": 0.6,
+            # 合并后的单一图路权重；文档路权重由引擎自动推导为 1 - 0.4 = 0.6
             "graph_route_weight": 0.4,
         },
     )

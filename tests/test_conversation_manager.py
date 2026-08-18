@@ -213,7 +213,9 @@ def test_message_roundtrip_and_llm_format() -> None:
 
     assert restored.content == "hello"
     assert formatted["role"] == "assistant"
-    assert "[Bot:" in formatted["content"]
+    # 前缀对齐 CM 最新结构，不输出账号 ID
+    assert '<cm_speaker bot="1"/> <cm_nickname>Bot</cm_nickname>' in formatted["content"]
+    assert "| ID:" not in formatted["content"]
 
 
 def test_message_multimodal_content_is_normalized_for_llm() -> None:

@@ -5,16 +5,23 @@
 import asyncio
 import json
 import random
-import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ...log import logger, tag
 
 from ..models.conversation_models import Message
 from ..models.memory_atom import MemoryAtom
 from .atom_classifier import classify_atoms
+
+
+class LLMExtractionSkip(Exception):
+    """模型按 JSON 协议明确表示本批内容无法处理。"""
+
+    def __init__(self, reason: str = "") -> None:
+        self.reason = str(reason or "").strip()[:120]
+        super().__init__(self.reason or "LLM requested structured skip")
 
 
 class MemoryProcessor:
@@ -111,13 +118,13 @@ class MemoryProcessor:
 {conversation}
 
 输出格式:
-{"memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
+{"status": "success", "memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
 """
             self.group_chat_prompt = """分析以下群聊对话并生成JSON格式的长期记忆:
 {conversation}
 
 输出格式:
-{"memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "participants": ["参与者"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
+{"status": "success", "memories": [{"summary": "中性摘要", "topics": ["主题"], "key_facts": ["事实"], "participants": ["参与者"], "event_time": "", "sentiment": "neutral", "importance": 0.5}]}
 """
 
     async def _build_system_prompt_with_persona(self, persona_id: str | None) -> str:
@@ -132,18 +139,96 @@ class MemoryProcessor:
                 f"{tag('processor')} persona_id 仅用于分区，不注入萃取提示词"
             )
         return (
-            "你是长期记忆事实萃取器。请严格按照 JSON 格式输出。\n"
+            "你是长期记忆事实萃取器。只能输出一个标准 JSON 对象，禁止输出 Markdown、"
+            "解释、道歉或其他自然语言。\n"
             f"当前日期时间: {current_date}\n"
             "只提取对未来有用、能够由对话支持的事实。使用中性、简洁、第三人称或"
             "直接事实表述；不得模仿任何角色人格、语气或文风，不得文学化补写。\n"
             "必须区分消息前缀中的具体发言者和 Bot，不得把不同人的行为合并。\n"
             "将今天、明天、昨天、下周等相对时间转换为可长期理解的绝对日期。\n"
-            "一次输入可按主题或连续事件拆成 0 至 5 条记忆；没有持久价值时输出"
-            " {\"memories\": []}。"
+            "一次输入可按主题或连续事件拆成 0 至 5 条记忆。正常完成时输出"
+            " {\"status\": \"success\", \"memories\": [...]}；没有持久价值时输出"
+            " {\"status\": \"success\", \"memories\": []}；如果内容安全或政策原因"
+            "导致无法处理，也必须输出"
+            " {\"status\": \"skip\", \"reason\": \"简短原因\", \"memories\": []}。"
         )
 
+    @staticmethod
+    def _exception_chain(error: BaseException) -> list[BaseException]:
+        """有限展开异常链，兼容 Provider 对底层 HTTP 错误的包装。"""
+        chain: list[BaseException] = []
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen and len(chain) < 5:
+            seen.add(id(current))
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        return chain
+
+    @classmethod
+    def _is_content_policy_rejection(cls, error: BaseException) -> bool:
+        """只识别高置信度的 Provider 内容安全拒绝，不匹配普通 4xx。"""
+        statuses: set[int] = set()
+        text_parts: list[str] = []
+
+        for current in cls._exception_chain(error):
+            try:
+                text_parts.append(str(current))
+            except Exception:
+                pass
+
+            for attribute in ("message", "code", "type", "body"):
+                try:
+                    value = getattr(current, attribute, None)
+                except Exception:
+                    value = None
+                if value is not None:
+                    try:
+                        text_parts.append(
+                            json.dumps(value, ensure_ascii=False, default=str)
+                            if isinstance(value, (dict, list, tuple))
+                            else str(value)
+                        )
+                    except Exception:
+                        pass
+
+            try:
+                status_code = getattr(current, "status_code", None)
+                response = getattr(current, "response", None)
+                if status_code is None and response is not None:
+                    status_code = getattr(response, "status_code", None)
+                if status_code is not None:
+                    statuses.add(int(status_code))
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        # 已知是其他状态码时不因偶然包含敏感词而误判；部分 Provider 包装会丢失状态码，
+        # 此时仍允许下方高置信度错误签名命中。
+        if statuses and not statuses.intersection({400, 403, 422}):
+            return False
+
+        normalized = " ".join(text_parts).casefold()
+        signatures = (
+            "input data may contain inappropriate content",
+            "content_policy_violation",
+            "content policy violation",
+            "responsibleaipolicyviolation",
+            "request was rejected as a result of the content filter",
+            "blocked due to safety",
+            "prompt was blocked for safety",
+            "输入数据可能包含不当内容",
+            "输入内容可能包含不适当内容",
+            "api 返回的 completion 由于内容安全过滤被拒绝",
+            "内容安全过滤被拒绝",
+        )
+        return any(signature in normalized for signature in signatures)
+
     async def _call_llm_with_retry(
-        self, prompt: str, system_prompt: str, max_retries: int = 3
+        self,
+        prompt: str,
+        system_prompt: str,
+        max_retries: int = 3,
+        response_validator: Callable[[str], Any] | None = None,
     ) -> str:
         """
         带指数退避的 LLM 调用
@@ -165,64 +250,27 @@ class MemoryProcessor:
                 response = await provider.text_chat(
                     prompt=prompt, system_prompt=system_prompt
                 )
-                return response.completion_text
+                completion_text = str(response.completion_text or "")
+                if response_validator is not None:
+                    response_validator(completion_text)
+                return completion_text
+            except LLMExtractionSkip:
+                raise
             except Exception as e:
+                if self._is_content_policy_rejection(e):
+                    raise LLMExtractionSkip("provider_content_policy") from e
                 last_error = e
                 if attempt == max_retries - 1:
                     raise
                 wait_time = (2**attempt) + random.uniform(0, 1)
                 logger.warning(
-                    f"{tag('processor')} LLM 调用失败，{wait_time:.1f}s 后重试 "
+                    f"{tag('processor')} LLM 调用或 JSON 校验失败，{wait_time:.1f}s 后重试 "
                     f"({attempt + 1}/{max_retries}): {e}"
                 )
                 await asyncio.sleep(wait_time)
         if last_error:
             raise last_error
         raise RuntimeError("LLM 调用失败，未捕获到具体异常")
-
-    def _try_fix_json(self, text: str) -> str:
-        """
-        尝试修复损坏的 JSON 字符串
-
-        Args:
-            text: 可能损坏的 JSON 字符串
-
-        Returns:
-            修复后的 JSON 字符串
-        """
-        fixed = text.strip()
-
-        # 移除 markdown 代码块标记
-        if fixed.startswith("```json"):
-            fixed = fixed[7:]
-        elif fixed.startswith("```"):
-            fixed = fixed[3:]
-        if fixed.endswith("```"):
-            fixed = fixed[:-3]
-        fixed = fixed.strip()
-
-        # 修复未闭合的字符串（截断的 JSON）
-        open_quotes = fixed.count('"') - fixed.count('\\"')
-        if open_quotes % 2 != 0:
-            fixed += '"'
-
-        # 修复未闭合的数组
-        open_brackets = fixed.count("[") - fixed.count("]")
-        if open_brackets > 0:
-            fixed += "]" * open_brackets
-
-        # 修复未闭合的对象
-        open_braces = fixed.count("{") - fixed.count("}")
-        if open_braces > 0:
-            fixed += "}" * open_braces
-
-        # 移除尾部逗号（JSON 不允许）
-        fixed = re.sub(r",(\s*[}\]])", r"\1", fixed)
-
-        # 修复常见的转义问题
-        fixed = fixed.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-
-        return fixed
 
     async def process_conversation(
         self,
@@ -291,6 +339,9 @@ class MemoryProcessor:
             llm_response_text = await self._call_llm_with_retry(
                 prompt=prompt,
                 system_prompt=system_prompt,
+                response_validator=lambda text: self._parse_llm_response_batch(
+                    text, is_group_chat
+                ),
             )
             logger.debug(
                 f"{tag('processor')} LLM 响应成功，响应长度={len(llm_response_text)}"
@@ -321,6 +372,8 @@ class MemoryProcessor:
                 f"{tag('processor')} {conversation_type}批次生成 {len(results)} 条长期记忆"
             )
             return results
+        except LLMExtractionSkip:
+            raise
         except Exception as e:
             logger.error(f"{tag('processor')} 处理对话历史失败: {e}", exc_info=True)
             raise
@@ -388,17 +441,35 @@ class MemoryProcessor:
 
     @staticmethod
     def _format_sender_info(msg: Message) -> str:
+        """按 CM 最新上下文结构生成消息前缀（``<cm_time>/<cm_speaker>/<cm_nickname>``）。
+
+        与 chat_memory 注入格式对齐：昵称缺失时输出 ``?``，不回退账号 ID（CM 隐私
+        承诺：ID 不进入 LLM 上下文）。Bot 发言额外用 ``<cm_speaker bot="1"/>`` 标记，
+        因为萃取文本没有 role 维度，需要显式区分 Bot 与用户。
+        """
+        from xml.sax.saxutils import escape
+
         time_str = datetime.fromtimestamp(msg.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-        display_name = msg.sender_name if msg.sender_name else msg.sender_id or "未知"
+        display_name = escape(
+            (msg.sender_name if msg.sender_name else "?").strip() or "?"
+        )
         is_bot = msg.metadata.get("is_bot_message", False) or msg.role == "assistant"
         if is_bot:
-            return f"[Bot: {display_name} | ID: {msg.sender_id} | {time_str}]"
-        relation = msg.metadata.get("speaker_relation")
-        if msg.group_id and relation == "current_user":
-            return f"[当前发言者: {display_name} | ID: {msg.sender_id} | {time_str}]"
-        if msg.group_id and relation == "other_user":
-            return f"[其他发言者: {display_name} | ID: {msg.sender_id} | {time_str}]"
-        return f"[{display_name} | ID: {msg.sender_id} | {time_str}]"
+            speaker_tag = '<cm_speaker bot="1"/>'
+        else:
+            relation = msg.metadata.get("speaker_relation")
+            if msg.group_id and relation == "current_user":
+                speaker_tag = '<cm_speaker current="1"/>'
+            elif msg.group_id and relation == "other_user":
+                speaker_tag = "<cm_speaker/>"
+            else:
+                # 私聊：与 CM 一致，不加 speaker 标签
+                speaker_tag = ""
+        parts = [f"<cm_time>{time_str}</cm_time>"]
+        if speaker_tag:
+            parts.append(speaker_tag)
+        parts.append(f"<cm_nickname>{display_name}</cm_nickname>")
+        return " ".join(parts)
 
     @classmethod
     def _message_content_to_text(cls, content: Any) -> str:
@@ -407,7 +478,7 @@ class MemoryProcessor:
     def _parse_llm_response_batch(
         self, response_text: str, is_group_chat: bool
     ) -> list[dict[str, Any]]:
-        """解析新版 ``{"memories": [...]}``，并兼容旧版单记忆 JSON。"""
+        """严格解析萃取 JSON；非 JSON 响应不得降级为长期记忆。"""
         cleaned_text = response_text.strip()
         if cleaned_text.startswith("```json"):
             cleaned_text = cleaned_text[7:]
@@ -417,263 +488,93 @@ class MemoryProcessor:
             cleaned_text = cleaned_text[:-3]
         cleaned_text = cleaned_text.strip()
 
+        if not cleaned_text:
+            raise ValueError("LLM 萃取响应为空")
         try:
             payload = json.loads(cleaned_text)
-            return self._normalize_batch_payload(payload, is_group_chat)
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            logger.warning(f"{tag('processor')} 批量 JSON 解析失败: {exc}")
-
-        try:
-            payload = json.loads(self._try_fix_json(response_text))
-            return self._normalize_batch_payload(payload, is_group_chat)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            legacy = self._extract_by_regex(response_text, is_group_chat)
-            return [self._normalize_parsed_data(legacy, is_group_chat)]
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM 萃取响应不是合法 JSON") from exc
+        return self._normalize_batch_payload(payload, is_group_chat)
 
     def _normalize_batch_payload(
         self, payload: Any, is_group_chat: bool
     ) -> list[dict[str, Any]]:
-        if isinstance(payload, dict) and "memories" in payload:
+        if not isinstance(payload, dict):
+            raise ValueError("LLM 萃取响应根节点必须是 JSON 对象")
+
+        if "memories" in payload:
+            status = payload.get("status", "success")
+            if status not in {"success", "skip"}:
+                raise ValueError("status 必须是 success 或 skip")
             raw_memories = payload.get("memories")
             if not isinstance(raw_memories, list):
                 raise ValueError("memories 必须是数组")
-        elif isinstance(payload, dict):
+            if status == "skip":
+                if raw_memories:
+                    raise ValueError("status=skip 时 memories 必须为空")
+                reason = str(payload.get("reason", "") or "").strip()
+                raise LLMExtractionSkip(reason)
+        elif {"summary", "topics", "key_facts"}.issubset(payload):
             # 兼容 cm.2 及更早 Prompt 的单记忆 JSON。
             raw_memories = [payload]
-        elif isinstance(payload, list):
-            raw_memories = payload
         else:
-            raise ValueError("LLM 响应必须是 JSON 对象或数组")
+            raise ValueError("LLM 萃取响应缺少 memories 数组")
+
+        if len(raw_memories) > 5:
+            raise ValueError("memories 最多允许 5 条")
 
         normalized: list[dict[str, Any]] = []
-        for item in raw_memories[:5]:
+        for item in raw_memories:
             if not isinstance(item, dict):
-                logger.warning(f"{tag('processor')} 跳过非对象记忆项")
-                continue
+                raise ValueError("memories 中的每一项都必须是 JSON 对象")
+            self._validate_memory_payload(item, is_group_chat)
             normalized.append(self._normalize_parsed_data(dict(item), is_group_chat))
         return normalized
 
-    def _parse_llm_response(
-        self, response_text: str, is_group_chat: bool
-    ) -> dict[str, Any]:
-        """
-        解析LLM响应,提取JSON数据
+    @staticmethod
+    def _validate_memory_payload(item: dict[str, Any], is_group_chat: bool) -> None:
+        """校验决定是否允许持久化的核心字段，拒绝拒答伪装成记忆。"""
+        summary = item.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("memory.summary 必须是非空字符串")
 
-        Args:
-            response_text: LLM响应文本
-            is_group_chat: 是否为群聊
-
-        Returns:
-            解析后的字典数据
-        """
-        logger.debug(f"{tag('processor')} 开始解析 LLM 响应，长度={len(response_text)}")
-
-        try:
-            # 尝试直接解析JSON
-            # 先清理可能的markdown代码块标记
-            cleaned_text = response_text.strip()
-            logger.debug(
-                f"{tag('processor')} 清理前响应长度={len(response_text)}"
-            )
-
-            if cleaned_text.startswith("```json"):
-                cleaned_text = cleaned_text[7:]
-                logger.debug(f"{tag('processor')} 移除了 ```json 标记")
-            if cleaned_text.startswith("```"):
-                cleaned_text = cleaned_text[3:]
-                logger.debug(f"{tag('processor')} 移除了 ``` 标记")
-            if cleaned_text.endswith("```"):
-                cleaned_text = cleaned_text[:-3]
-                logger.debug(f"{tag('processor')} 移除了结尾 ``` 标记")
-            cleaned_text = cleaned_text.strip()
-
-            logger.debug(
-                f"{tag('processor')} 清理后 JSON 长度={len(cleaned_text)}"
-            )
-
-            # 解析JSON
-            data = json.loads(cleaned_text)
-
-            # 类型检查：确保解析结果是 dict
-            if not isinstance(data, dict):
-                logger.warning(
-                    f"{tag('processor')} JSON 解析结果不是 dict，类型为 {type(data).__name__}"
-                )
-                raise ValueError(f"期望 dict 类型，实际为 {type(data).__name__}")
-
-            logger.debug(f"{tag('processor')} JSON 解析成功")
-            logger.debug(f"{tag('processor')} 解析得到的字段: {list(data.keys())}")
-
-            # 验证必需字段 - 简化后的字段列表
-            required_fields = [
-                "summary",
-                "topics",
-                "key_facts",
-                "sentiment",
-                "importance",
-            ]
-            if is_group_chat:
-                required_fields.append("participants")
-
-            for field in required_fields:
-                if field not in data:
-                    logger.warning(
-                        f"{tag('processor')} LLM 响应缺少字段: {field}, 使用默认值"
-                    )
-                    data[field] = self._get_default_value(field)
-
-            # 数据类型校验和规范化
-            data["summary"] = str(data.get("summary", ""))
-            logger.debug(f"{tag('processor')} 提取 summary: {data['summary']}")
-
-            data["topics"] = self._ensure_list(data.get("topics", []))[:5]
-            logger.debug(
-                f"{tag('processor')} 提取 topics ({len(data['topics'])} 个): {data['topics']}"
-            )
-
-            data["key_facts"] = self._ensure_list(data.get("key_facts", []))[:5]
-            logger.debug(
-                f"{tag('processor')} 提取 key_facts ({len(data['key_facts'])} 个): {data['key_facts']}"
-            )
-
-            data["sentiment"] = self._validate_sentiment(
-                data.get("sentiment", "neutral")
-            )
-            logger.debug(f"{tag('processor')} 提取 sentiment: {data['sentiment']}")
-
-            data["importance"] = self._validate_importance(data.get("importance", 0.5))
-            logger.debug(f"{tag('processor')} 提取 importance: {data['importance']}")
-
-            if is_group_chat:
-                data["participants"] = self._ensure_list(data.get("participants", []))
-                logger.debug(
-                    f"{tag('processor')} 提取 participants ({len(data['participants'])} 个): {data['participants']}"
+        for field, maximum in (("topics", 4), ("key_facts", 5)):
+            value = item.get(field)
+            if (
+                not isinstance(value, list)
+                or not value
+                or len(value) > maximum
+                or any(not isinstance(entry, str) or not entry.strip() for entry in value)
+            ):
+                raise ValueError(
+                    f"memory.{field} 必须是包含 1 至 {maximum} 个非空字符串的数组"
                 )
 
-            return data
+        event_time = item.get("event_time", "")
+        if not isinstance(event_time, str):
+            raise ValueError("memory.event_time 必须是字符串")
 
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"{tag('processor')} JSON 解析失败: {e}")
-            logger.debug(
-                f"{tag('processor')} 解析失败的内容:\n{response_text}"
+        sentiment = item.get("sentiment")
+        if sentiment not in {"positive", "neutral", "negative"}:
+            raise ValueError(
+                "memory.sentiment 必须是 positive、neutral 或 negative"
             )
 
-            # 尝试修复 JSON 后再解析
-            logger.debug(f"{tag('processor')} 尝试修复 JSON 后重新解析")
-            try:
-                fixed_text = self._try_fix_json(response_text)
-                data = json.loads(fixed_text)
-                if isinstance(data, dict):
-                    logger.debug(f"{tag('processor')} JSON 修复后解析成功")
-                    return self._normalize_parsed_data(data, is_group_chat)
-            except (json.JSONDecodeError, ValueError) as fix_err:
-                logger.debug(f"{tag('processor')} JSON 修复后仍无法解析: {fix_err}")
+        importance = item.get("importance")
+        if (
+            isinstance(importance, bool)
+            or not isinstance(importance, (int, float))
+            or not 0.0 <= float(importance) <= 1.0
+        ):
+            raise ValueError("memory.importance 必须是 0.0 至 1.0 的数字")
 
-            logger.debug(f"{tag('processor')} 尝试使用正则表达式提取 JSON")
-            # 尝试正则提取
-            return self._extract_by_regex(response_text, is_group_chat)
-        except Exception as e:
-            logger.error(
-                f"{tag('processor')} 解析 LLM 响应时发生异常: {e}", exc_info=True
-            )
-            logger.debug(
-                f"{tag('processor')} 异常发生时的响应内容:\n{response_text}"
-            )
-            return self._get_default_structured_data(is_group_chat)
-
-    def _extract_by_regex(self, text: str, is_group_chat: bool) -> dict[str, Any]:
-        """
-        使用正则表达式从文本中提取结构化数据(备用方案)
-
-        Args:
-            text: 响应文本
-            is_group_chat: 是否为群聊
-
-        Returns:
-            提取的结构化数据
-        """
-        logger.debug(f"{tag('processor')} 开始使用正则表达式提取结构化数据")
-        data = self._get_default_structured_data(is_group_chat)
-
-        try:
-            # 先尝试找到完整的 JSON 块
-            json_matches = re.findall(
-                r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL
-            )
-            logger.debug(
-                f"{tag('processor')} 正则匹配到 {len(json_matches)} 个可能的 JSON 块"
-            )
-
-            for i, match in enumerate(json_matches):
-                logger.debug(
-                    f"{tag('processor')} JSON 块 #{i + 1}:\n{match}"
-                )
-                try:
-                    # 尝试解析每个匹配的块
-                    parsed = json.loads(match)
-                    if "summary" in parsed:
-                        logger.debug(
-                            f"{tag('processor')} 成功从第 {i + 1} 个 JSON 块中解析数据"
-                        )
-                        data = parsed
-                        break
-                except json.JSONDecodeError:
-                    continue
-
-            # 如果没有找到完整的 JSON，尝试单独提取字段
-            if data == self._get_default_structured_data(is_group_chat):
-                logger.debug(f"{tag('processor')} 未找到完整 JSON，尝试提取单独字段")
-
-                # 提取summary
-                summary_match = re.search(r'"summary"\s*:\s*"([^"]+)"', text)
-                if summary_match:
-                    data["summary"] = summary_match.group(1)
-                    logger.debug(
-                        f"{tag('processor')} 正则提取 summary: {data['summary']}"
-                    )
-
-                # 提取importance
-                importance_match = re.search(r'"importance"\s*:\s*([0-9.]+)', text)
-                if importance_match:
-                    data["importance"] = float(importance_match.group(1))
-                    logger.debug(
-                        f"{tag('processor')} 正则提取 importance: {data['importance']}"
-                    )
-
-                # 提取sentiment
-                sentiment_match = re.search(r'"sentiment"\s*:\s*"(\w+)"', text)
-                if sentiment_match:
-                    data["sentiment"] = sentiment_match.group(1)
-                    logger.debug(
-                        f"{tag('processor')} 正则提取 sentiment: {data['sentiment']}"
-                    )
-
-                # 提取 topics 数组
-                topics_match = re.search(r'"topics"\s*:\s*\[(.*?)\]', text, re.DOTALL)
-                if topics_match:
-                    topics_str = topics_match.group(1)
-                    topics = re.findall(r'"([^"]+)"', topics_str)
-                    data["topics"] = topics[:5]
-                    logger.debug(f"{tag('processor')} 正则提取 topics: {data['topics']}")
-
-                # 提取 key_facts 数组
-                facts_match = re.search(r'"key_facts"\s*:\s*\[(.*?)\]', text, re.DOTALL)
-                if facts_match:
-                    facts_str = facts_match.group(1)
-                    facts = re.findall(r'"([^"]+)"', facts_str)
-                    data["key_facts"] = facts[:5]
-                    logger.debug(
-                        f"{tag('processor')} 正则提取 key_facts: {data['key_facts']}"
-                    )
-
-            logger.debug(
-                f"{tag('processor')} 正则提取完成，提取到的字段: {list(data.keys())}"
-            )
-
-        except Exception as e:
-            logger.error(f"{tag('processor')} 正则提取失败: {e}", exc_info=True)
-
-        return data
+        if is_group_chat and "participants" in item:
+            participants = item["participants"]
+            if not isinstance(participants, list) or any(
+                not isinstance(entry, str) or not entry.strip()
+                for entry in participants
+            ):
+                raise ValueError("memory.participants 必须是字符串数组")
 
     def _build_storage_format(
         self,
@@ -841,20 +742,6 @@ class MemoryProcessor:
             "importance": 0.5,
         }
         return defaults.get(field, "")
-
-    def _get_default_structured_data(self, is_group_chat: bool) -> dict[str, Any]:
-        """获取默认的结构化数据"""
-        data = {
-            "summary": "对话记录",
-            "topics": [],
-            "key_facts": [],
-            "event_time": "",
-            "sentiment": "neutral",
-            "importance": 0.5,
-        }
-        if is_group_chat:
-            data["participants"] = []
-        return data
 
     def _validate_summary_quality(self, structured_data: dict[str, Any]) -> str:
         """

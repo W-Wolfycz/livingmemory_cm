@@ -302,74 +302,6 @@ async def test_atom_store_delete_by_parent(tmp_path: Path) -> None:
     assert len(remaining) == 1
 
 
-# ---------- AtomRetriever integration ----------
-
-
-@pytest.mark.asyncio
-async def test_atom_retriever_search(tmp_path: Path) -> None:
-    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
-
-    db_path = str(tmp_path / "test_atoms_retriever.db")
-    store = AtomStore(db_path)
-    await store.initialize()
-
-    await store.insert(
-        MemoryAtom(
-            parent_memory_id=1,
-            atom_type=AtomType.FACTUAL,
-            content="张三喜欢滑雪",
-            importance=0.9,
-        )
-    )
-    await store.insert(
-        MemoryAtom(
-            parent_memory_id=2,
-            atom_type=AtomType.EPISODIC,
-            content="李四昨天去爬山了",
-            importance=0.5,
-        )
-    )
-    await store.insert(
-        MemoryAtom(
-            parent_memory_id=3,
-            atom_type=AtomType.PREFERENCE,
-            content="张三喜欢咖啡",
-            importance=0.7,
-        )
-    )
-
-    retriever = AtomRetriever(store)
-    results = await retriever.search("滑雪", k=5)
-    assert len(results) >= 1
-    assert results[0].content == "张三喜欢滑雪"
-
-
-@pytest.mark.asyncio
-async def test_atom_retriever_session_filter(tmp_path: Path) -> None:
-    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
-
-    db_path = str(tmp_path / "test_atoms_filter.db")
-    store = AtomStore(db_path)
-    await store.initialize()
-
-    await store.insert(
-        MemoryAtom(parent_memory_id=1, content="公共记忆", session_id="session_a")
-    )
-    await store.insert(
-        MemoryAtom(parent_memory_id=2, content="私有记忆", session_id="session_b")
-    )
-
-    retriever = AtomRetriever(store)
-    results = await retriever.search("记忆", k=5, session_id="session_a")
-    assert all(
-        r.metadata.get("session_id") == "session_a" or "公共" in r.content
-        for r in results
-    )
-
-
-# ---------- Classifier edge cases ----------
-
-
 def test_classify_empty_facts() -> None:
     atoms = classify_atoms(key_facts=[], topics=["会议"])
     assert atoms == []
@@ -566,50 +498,6 @@ async def test_lifecycle_manager_logs_and_backs_off_on_error(monkeypatch):
     assert error_mock.call_args.args[0] == "[livingmemory_cm:atom] 维护任务异常"
     assert error_mock.call_args.kwargs["exc_info"] is True
     assert sleep_calls == [60.0]
-
-
-# ---------- AtomRetriever get_atoms_for_memory ----------
-
-
-@pytest.mark.asyncio
-async def test_atom_retriever_get_atoms_for_memory(tmp_path: Path) -> None:
-    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
-
-    db_path = str(tmp_path / "test_atoms_by_parent.db")
-    store = AtomStore(db_path)
-    await store.initialize()
-
-    await store.insert(MemoryAtom(parent_memory_id=42, content="fact a"))
-    await store.insert(MemoryAtom(parent_memory_id=42, content="fact b"))
-    await store.insert(MemoryAtom(parent_memory_id=99, content="fact c"))
-
-    retriever = AtomRetriever(store)
-    atoms = await retriever.get_atoms_for_memory(42)
-    assert len(atoms) == 2
-    contents = {a.content for a in atoms}
-    assert contents == {"fact a", "fact b"}
-
-
-@pytest.mark.asyncio
-async def test_atom_retriever_touch(tmp_path: Path) -> None:
-    from livingmemory_cm.core.retrieval.atom_retriever import AtomRetriever
-
-    db_path = str(tmp_path / "test_atoms_retriever_touch.db")
-    store = AtomStore(db_path)
-    await store.initialize()
-
-    atom = MemoryAtom(parent_memory_id=1, content="test touch", last_accessed_at=1000.0)
-    atom_id = await store.insert(atom)
-
-    retriever = AtomRetriever(store)
-    await retriever.touch(atom_id)
-
-    updated = await store.get(atom_id)
-    assert updated is not None
-    assert updated.last_accessed_at > 1000.0
-
-
-# ---------- Graph store semantic edge merge ----------
 
 
 @pytest.mark.asyncio

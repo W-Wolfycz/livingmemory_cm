@@ -108,6 +108,9 @@ async def test_faiss_bootstrap_rejects_empty_index_without_deleting(tmp_path) ->
 
 @pytest.mark.asyncio
 async def test_faiss_bootstrap_keeps_matching_dimension(monkeypatch, tmp_path) -> None:
+    # 该分支会执行 faiss_bootstrap 里的 ``import faiss``；本地不装 faiss，
+    # 用命名空间占位即可通过（实际读取已被 mock 掉）。
+    monkeypatch.setitem(sys.modules, "faiss", SimpleNamespace())
     index_path = tmp_path / "matching.index"
     index_path.write_bytes(b"valid")
     service = FaissBootstrapService()
@@ -129,6 +132,8 @@ async def test_faiss_bootstrap_rejects_mismatched_dimension_without_deleting(
     monkeypatch,
     tmp_path,
 ) -> None:
+    # 该分支同样会执行 ``import faiss``，用命名空间占位避免真实依赖。
+    monkeypatch.setitem(sys.modules, "faiss", SimpleNamespace())
     index_path = tmp_path / "mismatched.index"
     index_path.write_bytes(b"valid")
     service = FaissBootstrapService()

@@ -1,4 +1,9 @@
-"""LivingMemoryCM 代码级测试入口，不启动 AstrBot。"""
+"""LivingMemoryCM 代码级测试入口，不启动 AstrBot，也不导入真实 AstrBot core。
+
+本地测试只验证领域逻辑与存储协议；`astrbot.api` / `astrbot.core` 由
+`tests/conftest.py` 提供最小 fake 类型树。AstrBot core 兼容性由 Windows 测试端
+reload/部署验收，不由本入口读取真实 backend 源码保证。
+"""
 
 from __future__ import annotations
 
@@ -9,34 +14,22 @@ import tempfile
 from pathlib import Path
 
 
-def _default_astrbot_backend() -> Path | None:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        candidate = Path(local_app_data) / "AstrBot" / "backend"
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="运行 LivingMemoryCM 函数、模块、存储与数据协议测试。"
-    )
-    parser.add_argument(
-        "--astrbot-backend",
-        type=Path,
-        default=_default_astrbot_backend(),
-        help="AstrBot backend 目录；Windows 默认从 LOCALAPPDATA/AstrBot/backend 解析。",
+        description=(
+            "运行 LivingMemoryCM 函数、模块、存储与数据协议测试。"
+            "默认不读取任何 AstrBot 源码/backend，兼容性由部署端验收。"
+        )
     )
     parser.add_argument(
         "--astrbot-source",
         type=Path,
-        default=(
-            Path(os.environ["ASTRBOT_SOURCE"])
-            if os.environ.get("ASTRBOT_SOURCE")
-            else None
+        default=None,
+        help=(
+            "【仅调试用】可选：额外把包含 astrbot/ 包的源码根目录加入 sys.path。"
+            "默认不添加；本地测试使用 conftest.py 的 fake astrbot 类型树，"
+            "不再依赖真实 AstrBot core。"
         ),
-        help="包含 astrbot/ 包的源码根目录；优先于桌面版 backend/app。",
     )
     return parser.parse_args()
 
@@ -44,21 +37,6 @@ def _parse_args() -> argparse.Namespace:
 def _append_if_directory(path: Path) -> None:
     if path.is_dir():
         sys.path.append(str(path))
-
-
-def _normalize_backend_path(value: Path | None) -> Path | None:
-    """兼容 Windows 原生路径和 WSL 的 /mnt/<drive>/ 路径。"""
-    if value is None:
-        return None
-    raw = str(value)
-    # Windows Python may normalize a WSL argument into ``\\mnt\\c\\...``
-    # before this function sees it. Handle both spellings.
-    normalized = raw.replace("\\", "/")
-    if normalized.startswith("/mnt/") and len(normalized) > 6:
-        drive = normalized[5]
-        remainder = normalized[6:].replace("/", "\\")
-        return Path(f"{drive.upper()}:\\{remainder}")
-    return value
 
 
 def main() -> int:
@@ -69,24 +47,9 @@ def main() -> int:
     workspace = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(workspace))
 
-    source = _normalize_backend_path(args.astrbot_source)
-    backend = _normalize_backend_path(args.astrbot_backend)
-    if source is not None and (source / "astrbot").is_dir():
-        _append_if_directory(source)
-    elif backend is not None and (backend / "app" / "astrbot").is_dir():
-        _append_if_directory(backend / "app")
-    else:
-        raise SystemExit(
-            "未找到 AstrBot core 源码。请传入 --astrbot-source <源码根目录> "
-            "或 --astrbot-backend <桌面版 backend>；测试只读取类型与接口，"
-            "不会启动 AstrBot。"
-        )
-
-    if backend is not None:
-        _append_if_directory(backend / "python" / "Lib" / "site-packages")
-
-    # AstrBot 桌面版会把部分插件依赖安装到用户数据目录。
-    _append_if_directory(Path.home() / ".astrbot" / "data" / "site-packages")
+    # 仅当显式传入时把 AstrBot 源码加入 sys.path（调试/对比用）；默认不注入。
+    if args.astrbot_source is not None and (args.astrbot_source / "astrbot").is_dir():
+        _append_if_directory(args.astrbot_source)
 
     # 避免 AstrBot 数据目录中的第三方 pytest 插件被自动加载，
     # 例如与本项目无关的 langsmith 插件及其可选依赖。
@@ -102,8 +65,7 @@ def main() -> int:
 
     tests_dir = Path(__file__).resolve().parent
     original_cwd = Path.cwd()
-    # AstrBot import may initialize host defaults relative to the current
-    # directory. Isolate those side effects from the plugin source tree.
+    # 在临时目录中运行，隔离任何测试对当前目录的副作用（例如缓存目录）。
     with tempfile.TemporaryDirectory(prefix="livingmemory_cm_tests_") as temp_dir:
         try:
             os.chdir(temp_dir)

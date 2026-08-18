@@ -43,12 +43,29 @@ class ReflectionService:
         statuses = set(getattr(cm_plugin, "ct_llm_status_filter", []) or [])
         return "rounds" if statuses == {"llm_success"} else "messages"
 
+    @staticmethod
+    def select_refusal_records(
+        selected_units: list[Any], extraction_mode: str, advance_count: int
+    ) -> tuple[list[dict], int]:
+        """截取模型主动拒绝后允许推进的最旧 CM 单位。"""
+        effective_count = min(
+            max(1, int(advance_count or 1)), len(selected_units)
+        )
+        refusal_units = selected_units[:effective_count]
+        records = (
+            [message for round_messages in refusal_units for message in round_messages]
+            if extraction_mode == "rounds"
+            else list(refusal_units)
+        )
+        return records, effective_count
+
     async def dispatch(
         self,
         *,
         event: Any,
         session_id: str,
         trigger_count: int,
+        refusal_advance_count: int,
         cm_limit: int,
         extraction_mode: str,
     ) -> None:
@@ -233,7 +250,13 @@ class ReflectionService:
             else selected_units
         )
         end_cursor = self.cursor_service.latest_from_records(messages)
-        if end_cursor is None or self.shutting_down:
+        refusal_records, refusal_units = self.select_refusal_records(
+            selected_units,
+            extraction_mode,
+            refusal_advance_count,
+        )
+        skip_cursor = self.cursor_service.latest_from_records(refusal_records)
+        if end_cursor is None or skip_cursor is None or self.shutting_down:
             return
 
         async with self.storage_state_lock:
@@ -253,6 +276,8 @@ class ReflectionService:
                     persona_id=persona_id,
                     start_cursor=last_cursor,
                     end_cursor=end_cursor,
+                    skip_cursor=skip_cursor,
+                    skip_units=refusal_units,
                     cursor_key=cursor_key,
                     current_user_id=current_user_id,
                 )
@@ -276,6 +301,8 @@ class ReflectionService:
         persona_id: str,
         start_cursor: ReflectionCursor,
         end_cursor: ReflectionCursor,
+        skip_cursor: ReflectionCursor,
+        skip_units: int,
         cursor_key: str,
         current_user_id: str,
     ) -> None:
@@ -285,6 +312,8 @@ class ReflectionService:
             persona_id=persona_id,
             start_cursor=start_cursor,
             end_cursor=end_cursor,
+            skip_cursor=skip_cursor,
+            skip_units=skip_units,
             cursor_key=cursor_key,
             current_user_id=current_user_id,
         )

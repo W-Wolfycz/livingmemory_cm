@@ -1,12 +1,16 @@
 """包内日志 wrapper：
 
-- ``debug_to_info``：把 debug 日志提级为 info 输出，让用户无需改 AstrBot 后台
-  日志级别即可看到详细运行信息（与 time_awareness / chat_memory 等插件一致）。
 - ``log_with_bot_id``：在日志前缀中附加机器人实例标识
-  （如 ``[livingmemory_cm:bot-7f3a1c2d]``），区分多 bot 共存场景；原始
-  platform ID 不写入日志。
+  （如 ``[livingmemory_cm:bot-10000]``），区分多 bot 共存场景；前缀直接使用
+  AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出便于按 Bot ID
+  定位日志。会话/用户引用仍通过 ``log_ref`` 保持脱敏（如 ``[session:<hash>]``）。
   前缀通过 ``tag(module, event)`` 在调用点拼装——只有能拿到 event 的调用点
-  （hook/命令）才会带 platform_id，后台调度等无 event 的日志保持模块名或默认。
+  （hook/命令）才会带 bot 前缀，后台调度等无 event 的日志保持模块名或默认。
+  需要真实体现 Bot ID 的关键事件入口（recall/reflection/session reset）
+  应使用 ``tag_event(module, event)`` 传入事件对象。
+
+日志级别完全跟随 AstrBot 原生配置，插件不再自行提级（debug→info）；需要查看
+详细运行信息时，请在 AstrBot 全局日志级别中开启 debug。
 
 各模块统一通过 ``logger.debug/info/...`` 调用，前缀用 ``tag('module_name')``
 函数获取。建议每个文件用一个固定 module 名（如 recall / reflection / store）。
@@ -18,16 +22,10 @@ from astrbot.api import logger as _astrbot_logger
 
 
 class _LoggerProxy:
-    """转发到 astrbot logger，但 ``debug`` 受 ``debug_to_info`` 控制。"""
-
-    def __init__(self):
-        self.debug_to_info = False
+    """转发到 astrbot logger，保持 AstrBot 原生日志级别。"""
 
     def debug(self, msg, *args, **kwargs):
-        if self.debug_to_info:
-            _astrbot_logger.info(msg, *args, **kwargs)
-        else:
-            _astrbot_logger.debug(msg, *args, **kwargs)
+        _astrbot_logger.debug(msg, *args, **kwargs)
 
     def info(self, msg, *args, **kwargs):
         _astrbot_logger.info(msg, *args, **kwargs)
@@ -65,9 +63,8 @@ def log_ref(value, label: str = "id") -> str:
     return f"{label}:{digest}"
 
 
-def configure(debug_to_info: bool = False, log_with_bot_id: bool = False) -> None:
-    """启动时由 main.py 调用，根据配置开关提级 / 区分实例。"""
-    logger.debug_to_info = bool(debug_to_info)
+def configure(log_with_bot_id: bool = False) -> None:
+    """启动时由 main.py 调用，根据配置开关区分实例。"""
     global _with_bot_id
     _with_bot_id = bool(log_with_bot_id)
 
@@ -82,22 +79,39 @@ def tag(module: str | None = None, event=None) -> str:
     """日志前缀。
 
     优先级：
-    1. ``log_with_bot_id=True`` 且传入 event 且能取到 platform_id → ``[livingmemory_cm:bot-hash]``
+    1. ``log_with_bot_id=True`` 且传入 event 且能取到 self_id → ``[livingmemory_cm:bot-<self_id>]``
     2. 传入 module → ``[livingmemory_cm:module]``
     3. 默认 → ``[livingmemory_cm]``
+
+    Bot 标识使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文
+    输出（如 ``[livingmemory_cm:bot-10000]``）便于定位；会话/用户引用请继续使用
+    ``log_ref`` 保持脱敏。
 
     建议调用点固定一个 module 名，例如::
 
         from ..log import logger, tag
         logger.info(f"{tag('recall')} 召回 5 条")
+
+    关键事件入口（recall/reflection/session reset）如需真实体现 Bot ID，请使用
+    ``tag_event(module, event)``。
     """
     if _with_bot_id and event is not None:
         try:
-            pid = event.get_platform_id()
-            if pid:
-                return f"[livingmemory_cm:bot-{log_ref(pid, 'ref').split(':', 1)[1]}]"
+            self_id = event.get_self_id()
+            if self_id:
+                return f"[livingmemory_cm:bot-{self_id}]"
         except Exception:
+            # 取不到 self_id（事件/平台未实现）时不加 bot 前缀，保持模块名。
             pass
     if module:
         return f"[livingmemory_cm:{module}]"
     return "[livingmemory_cm]"
+
+
+def tag_event(module: str | None = None, event=None) -> str:
+    """与 ``tag(module, event)`` 等价，语义上明确“这是事件入口”。
+
+    供 recall/reflection/session reset 等有 event 的关键入口使用，以便
+    ``log_with_bot_id=True`` 时按原始 self_id 附加 Bot 前缀。
+    """
+    return tag(module, event)

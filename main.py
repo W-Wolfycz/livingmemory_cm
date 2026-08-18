@@ -107,12 +107,10 @@ class LivingMemoryCMPlugin(Star):
         # 初始化后端 i18n（zh-only）
         i18n_init()
 
-        # 日志提级 / 多 bot 区分配置（与其他 lxfight 系插件一致）
-        log_cfg = config.get("log", {}) or {}
-        configure_log(
-            debug_to_info=log_cfg.get("debug_to_info", False),
-            log_with_bot_id=log_cfg.get("log_with_bot_id", False),
-        )
+        # 多 bot 实例日志区分配置；日志级别跟随 AstrBot 原生配置，不做插件内提级。
+        # ConfigManager 会先完成隐藏兼容键迁移，这里必须读迁移后的顶层值，
+        # 避免 AstrBot 完整性注入的顶层默认 False 覆盖旧 log.log_with_bot_id=true。
+        configure_log(log_with_bot_id=bool(self.config_manager.get("log_with_bot_id", False)))
 
         # 初始化插件初始化器
         self.initializer = PluginInitializer(context, self.config_manager, data_dir)
@@ -135,6 +133,7 @@ class LivingMemoryCMPlugin(Star):
         CM 前置条件不满足时向 StarManager 抛出异常，避免插件以
         “已加载但永远未就绪”的半失败状态留在运行时。
         """
+        await self.config_manager.persist_legacy_cleanup()
         await self._initialize_plugin()
         self._register_official_page_api_if_available()
 

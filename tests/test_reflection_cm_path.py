@@ -15,16 +15,21 @@ from livingmemory_cm.core.event_handler_modules import (
     memory_reflection as reflection_hook_module,
 )
 from livingmemory_cm.log import log_ref
-from livingmemory_cm.core.processors.memory_processor import MemoryProcessor
+from livingmemory_cm.core.processors.memory_processor import (
+    LLMExtractionSkip,
+    MemoryProcessor,
+)
 from livingmemory_cm.core.reflection import (
     CMHistoryReader,
     ReflectionBatchWriter,
     ReflectionCursor,
     ReflectionCursorService,
     ReflectionExtractionService,
+    ReflectionExtractionSkip,
     ReflectionService,
 )
 from livingmemory_cm.core.reflection import reflection_service as reflection_module
+from livingmemory_cm.core.models.memory_atom import AtomType, MemoryAtom
 
 
 def _record(turn: int, role: str, second: int, user_id: str = "10001") -> dict:
@@ -258,6 +263,7 @@ async def test_new_partition_bypasses_backlog_pagination(monkeypatch) -> None:
         event=event,
         session_id="demo:GroupMessage:group_demo",
         trigger_count=120,
+        refusal_advance_count=7,
         cm_limit=120,
         extraction_mode="messages",
     )
@@ -293,7 +299,10 @@ async def test_memory_reflection_hook_delegates_to_service(monkeypatch) -> None:
     reflection = MemoryReflection.__new__(MemoryReflection)
     reflection.context = SimpleNamespace()
     reflection.config_manager = SimpleNamespace(
-        get=lambda _key, _default=0: 5
+        get=lambda key, default=0: {
+            "reflection_engine.trigger_count": 5,
+            "reflection_engine.refusal_advance_count": 7,
+        }.get(key, default)
     )
     reflection._reflection_service = SimpleNamespace(dispatch=AsyncMock())
     cm = SimpleNamespace(ct_llm_status_filter={"llm_success"})
@@ -315,6 +324,7 @@ async def test_memory_reflection_hook_delegates_to_service(monkeypatch) -> None:
         event=event,
         session_id="demo:FriendMessage:10001",
         trigger_count=5,
+        refusal_advance_count=7,
         cm_limit=120,
         extraction_mode="rounds",
     )
@@ -370,6 +380,8 @@ async def test_batch_writer_writes_all_generated_topic_memories() -> None:
         persona_id="persona_demo",
         start_cursor=ReflectionCursor("2026-07-19T00:00:00.000000Z", 0),
         end_cursor=ReflectionCursor("2026-07-19T00:00:11.000000Z", 11),
+        skip_cursor=ReflectionCursor("2026-07-19T00:00:05.000000Z", 5),
+        skip_units=1,
         cursor_key="cursor_demo",
         current_user_id="10001",
     )
@@ -421,6 +433,8 @@ async def test_empty_extraction_advances_cursor_without_writing_memory() -> None
         persona_id="persona_demo",
         start_cursor=ReflectionCursor("2026-07-19T00:00:00.000000Z", 0),
         end_cursor=ReflectionCursor("2026-07-19T00:00:11.000000Z", 11),
+        skip_cursor=ReflectionCursor("2026-07-19T00:00:05.000000Z", 5),
+        skip_units=1,
         cursor_key="cursor_demo",
         current_user_id="10001",
     )
@@ -453,6 +467,8 @@ async def test_failed_extraction_does_not_advance_cursor() -> None:
         persona_id="persona_demo",
         start_cursor=ReflectionCursor("2026-07-19T00:00:00.000000Z", 0),
         end_cursor=ReflectionCursor("2026-07-19T00:00:11.000000Z", 11),
+        skip_cursor=ReflectionCursor("2026-07-19T00:00:05.000000Z", 5),
+        skip_units=1,
         cursor_key="cursor_demo",
         current_user_id="10001",
     )
@@ -478,12 +494,15 @@ async def test_reflection_service_delegates_to_batch_writer() -> None:
     end_cursor = ReflectionCursor("2026-07-19T00:00:11.000000Z", 11)
     messages = _round(1, 10)
 
+    skip_cursor = ReflectionCursor("2026-07-19T00:00:05.000000Z", 5)
     await service._write_batch(
         session_id="demo:GroupMessage:group_demo",
         cm_messages=messages,
         persona_id="persona_demo",
         start_cursor=start_cursor,
         end_cursor=end_cursor,
+        skip_cursor=skip_cursor,
+        skip_units=2,
         cursor_key="cursor_demo",
         current_user_id="10001",
     )
@@ -494,6 +513,8 @@ async def test_reflection_service_delegates_to_batch_writer() -> None:
         persona_id="persona_demo",
         start_cursor=start_cursor,
         end_cursor=end_cursor,
+        skip_cursor=skip_cursor,
+        skip_units=2,
         cursor_key="cursor_demo",
         current_user_id="10001",
     )
@@ -592,8 +613,10 @@ def test_cm_message_conversion_preserves_real_speaker_identity() -> None:
 
     processor = MemoryProcessor.__new__(MemoryProcessor)
     formatted = processor._format_conversation([user, bot])
-    assert "[当前发言者: Alice | ID: 10001" in formatted
-    assert "[Bot: Bot | ID: 10000" in formatted
+    # 前缀对齐 CM 最新结构：昵称标签 + speaker 标记，不输出账号 ID。
+    assert '<cm_speaker current="1"/> <cm_nickname>Alice</cm_nickname>' in formatted
+    assert '<cm_speaker bot="1"/> <cm_nickname>Bot</cm_nickname>' in formatted
+    assert "| ID:" not in formatted
 
 
 def _make_recall(
@@ -642,6 +665,7 @@ async def test_recall_query_only_reads_current_user_paired_rounds() -> None:
     cm = SimpleNamespace(
         ct_full_group=True,
         ct_cross_session=True,
+        ct_llm_status_filter=["llm_success"],
         query_rounds=AsyncMock(
             return_value=[
                 [
@@ -676,7 +700,7 @@ async def test_recall_query_only_reads_current_user_paired_rounds() -> None:
     assert call["umo"] == "demo:GroupMessage:group_demo"
     assert call["conversation_id"] == "conversation_demo"
     assert call["user_id"] == "10001"
-    assert call["llm_status"] == "llm_success"
+    assert call["llm_status"] == ["llm_success"]
     assert call["limit_rounds"] == 2
     assert call["since"] is None
 
@@ -684,7 +708,10 @@ async def test_recall_query_only_reads_current_user_paired_rounds() -> None:
 @pytest.mark.asyncio
 async def test_recall_query_pushes_age_window_into_chat_memory() -> None:
     recall = _make_recall(max_age_seconds=7200)
-    cm = SimpleNamespace(query_rounds=AsyncMock(return_value=[]))
+    cm = SimpleNamespace(
+        ct_llm_status_filter=["llm_success"],
+        query_rounds=AsyncMock(return_value=[]),
+    )
     recall.context = SimpleNamespace(
         get_registered_star=lambda _name: cm,
         conversation_manager=SimpleNamespace(
@@ -708,6 +735,7 @@ async def test_recall_query_pushes_age_window_into_chat_memory() -> None:
 async def test_recall_query_respects_history_character_budget() -> None:
     recall = _make_recall(rounds=3, max_chars=90)
     cm = SimpleNamespace(
+        ct_llm_status_filter=["llm_success"],
         query_rounds=AsyncMock(
             return_value=[
                 [
@@ -719,7 +747,7 @@ async def test_recall_query_respects_history_character_budget() -> None:
                     {"role": "assistant", "content": "最近回复"},
                 ],
             ]
-        )
+        ),
     )
     recall.context = SimpleNamespace(
         get_registered_star=lambda _name: cm,
@@ -740,3 +768,334 @@ async def test_recall_query_respects_history_character_budget() -> None:
     assert len(history) <= 90
     assert "最近主题" in history
     assert "最近回复" in history
+
+
+# ── 召回历史单位跟随 CM llm_status_filter ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recall_query_messages_mode_reads_query_history_with_cm_filter() -> None:
+    recall = _make_recall(rounds=2)
+    cm = SimpleNamespace(
+        ct_full_group=True,
+        ct_cross_session=True,
+        ct_llm_status_filter=["llm_success", "no_llm"],
+        query_history=AsyncMock(
+            return_value=[
+                {"role": "user", "content": "张三讨论项目 A"},
+                {"role": "assistant", "content": "Bot 回复项目 A"},
+                {"role": "user", "content": "张三又问了截止日期"},
+                {"role": "assistant", "content": "Bot 回答周五截止"},
+            ]
+        ),
+    )
+    recall.context = SimpleNamespace(
+        get_registered_star=lambda _name: cm,
+        conversation_manager=SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="conversation_demo")
+        ),
+    )
+
+    query = await recall._build_recall_query(
+        event=_recall_event(),
+        actual_query="那个什么时候截止？",
+        persona_id="persona_demo",
+    )
+
+    assert query.startswith("当前用户发言：那个什么时候截止？")
+    assert query.endswith("需要检索的当前发言：那个什么时候截止？")
+    assert "张三讨论项目 A" in query
+    assert "Bot 回答周五截止" in query
+    cm.query_history.assert_awaited_once()
+    call = cm.query_history.await_args.kwargs
+    assert call["umo"] == "demo:GroupMessage:group_demo"
+    assert call["conversation_id"] == "conversation_demo"
+    assert call["user_id"] == "10001"
+    assert call["llm_status"] == ["llm_success", "no_llm"]
+    assert call["limit"] == 2
+    assert call["persona_id"] == "persona_demo"
+    assert call["since"] is None
+    assert not hasattr(cm, "query_rounds") or not cm.query_rounds.await_args
+
+
+@pytest.mark.asyncio
+async def test_recall_query_messages_mode_pushes_age_window_into_chat_memory() -> None:
+    recall = _make_recall(max_age_seconds=7200)
+    cm = SimpleNamespace(
+        ct_llm_status_filter=["llm_success", "no_llm", "orphan"],
+        query_history=AsyncMock(return_value=[]),
+    )
+    recall.context = SimpleNamespace(
+        get_registered_star=lambda _name: cm,
+        conversation_manager=SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="conversation_demo")
+        ),
+    )
+
+    await recall._build_recall_query(
+        event=_recall_event(),
+        actual_query="继续",
+        persona_id="persona_demo",
+    )
+
+    since = cm.query_history.await_args.kwargs["since"]
+    assert since.tzinfo is not None
+    age_seconds = (datetime.now(timezone.utc) - since).total_seconds()
+    assert 7190 <= age_seconds <= 7210
+
+
+@pytest.mark.asyncio
+async def test_recall_query_max_chars_zero_disables_history() -> None:
+    recall = _make_recall(rounds=2, max_chars=0)
+    recall.context = Mock()
+
+    query = await recall._build_recall_query(
+        event=_recall_event(),
+        actual_query="继续说那个计划",
+        persona_id="persona_demo",
+    )
+
+    assert query == "继续说那个计划"
+    recall.context.get_registered_star.assert_not_called()
+
+
+# ── 日志 bot 前缀（self_id 原文）与关键入口使用 event tag ─────────────────────
+
+
+class _FakeRecallEvent:
+    """fake 事件：支持 get_self_id / get_sender_id，Bot 与用户均为虚构 ID。"""
+
+    def __init__(self, self_id: str = "10000") -> None:
+        self._self_id = self_id
+        self.unified_msg_origin = "demo:GroupMessage:group_demo"
+
+    def get_self_id(self) -> str:
+        return self._self_id
+
+    def get_sender_id(self) -> str:
+        return "10001"
+
+
+def test_log_tag_event_uses_raw_self_id_bot_prefix() -> None:
+    """log_with_bot_id=True 时前缀用原始 self_id，不再输出 blake2s hash。"""
+    from livingmemory_cm import log as log_module
+
+    log_module.configure(log_with_bot_id=True)
+    event = _FakeRecallEvent(self_id="10000")
+    try:
+        prefix = log_module.tag_event("recall", event)
+        # 原文输出：包含完整 self_id，且不是 blake2s 脱敏短 hash
+        assert "bot-10000" in prefix
+        assert prefix == "[livingmemory_cm:bot-10000]"
+        assert log_module.tag_event("recall", event) == prefix
+        assert log_module.tag("recall", event) == prefix
+    finally:
+        log_module.configure(log_with_bot_id=False)
+
+
+def test_log_tag_without_bot_id_has_no_bot_prefix() -> None:
+    from livingmemory_cm import log as log_module
+
+    log_module.configure(log_with_bot_id=False)
+    event = _FakeRecallEvent(self_id="10000")
+    try:
+        assert log_module.tag_event("recall", event) == "[livingmemory_cm:recall]"
+        assert log_module.tag("recall", event) == "[livingmemory_cm:recall]"
+    finally:
+        log_module.configure(log_with_bot_id=False)
+
+
+def test_log_tag_falls_back_to_module_when_self_id_unavailable() -> None:
+    from livingmemory_cm import log as log_module
+
+    log_module.configure(log_with_bot_id=True)
+    event = _FakeRecallEvent(self_id="")
+    try:
+        assert log_module.tag_event("recall", event) == "[livingmemory_cm:recall]"
+    finally:
+        log_module.configure(log_with_bot_id=False)
+
+
+@pytest.mark.asyncio
+async def test_session_reset_entry_uses_event_tag() -> None:
+    """关键入口（session reset）通过 tag_event 使用 event，能真实体现 Bot ID。"""
+    from unittest.mock import patch
+
+    from livingmemory_cm.core.event_handler import EventHandler
+
+    handler = EventHandler.__new__(EventHandler)
+    handler.conversation_manager = SimpleNamespace(
+        clear_session=AsyncMock(return_value=None)
+    )
+    event = _FakeRecallEvent(self_id="10000")
+    with patch(
+        "livingmemory_cm.core.event_handler.tag_event",
+        return_value="[livingmemory_cm:bot-tag]",
+    ) as mocked:
+        await handler.handle_session_reset(event)
+    mocked.assert_called_once_with("handler", event)
+
+
+# ── select_refusal_records 语义 ──────────────────────────────────────────────
+
+
+def test_select_refusal_records_rounds_mode_expands_first_n_rounds() -> None:
+    units = [_round(1, 10), _round(2, 20), _round(3, 30)]
+
+    records, count = ReflectionService.select_refusal_records(units, "rounds", 2)
+
+    assert count == 2
+    assert [record["record_id"] for record in records] == [
+        10,
+        11,
+        20,
+        21,
+    ]
+
+
+def test_select_refusal_records_messages_mode_takes_first_n_records() -> None:
+    units = [_record(1, "user", 10), _record(2, "assistant", 20), _record(3, "user", 30)]
+
+    records, count = ReflectionService.select_refusal_records(units, "messages", 2)
+
+    assert count == 2
+    assert [record["record_id"] for record in records] == [10, 21]
+
+
+def test_select_refusal_records_clamps_to_window_size() -> None:
+    units = [_round(1, 10)]
+
+    records, count = ReflectionService.select_refusal_records(units, "rounds", 9)
+
+    assert count == 1
+    assert len(records) == 2
+
+
+def test_select_refusal_records_zero_or_negative_advances_at_least_one() -> None:
+    units = [_round(1, 10), _round(2, 20)]
+
+    records, count = ReflectionService.select_refusal_records(units, "rounds", 0)
+
+    assert count == 1
+    assert len(records) == 2
+
+
+# ── 结构化跳过与 atom_types 元数据 ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_batch_writer_skip_advances_cursor_to_skip_cursor() -> None:
+    """模型 status=skip 时不写记忆，只把游标推进到 skip_cursor。"""
+    conversation_manager = SimpleNamespace(
+        get_session_metadata=AsyncMock(return_value={}),
+        update_session_metadata=AsyncMock(),
+    )
+    memory_processor = SimpleNamespace(
+        process_conversation_batch=AsyncMock(
+            side_effect=LLMExtractionSkip("content_policy")
+        ),
+    )
+    memory_engine = SimpleNamespace(add_memory=AsyncMock())
+    cursor_service = ReflectionCursorService(conversation_manager)
+    writer = ReflectionBatchWriter(
+        memory_engine,
+        conversation_manager,
+        cursor_service,
+        ReflectionExtractionService(memory_processor),
+    )
+    skip_cursor = ReflectionCursor("2026-07-19T00:00:05.000000Z", 5)
+
+    await writer.write(
+        session_id="demo:FriendMessage:10001",
+        cm_messages=_round(1, 10),
+        persona_id="persona_demo",
+        start_cursor=ReflectionCursor("2026-07-19T00:00:00.000000Z", 0),
+        end_cursor=ReflectionCursor("2026-07-19T00:00:11.000000Z", 11),
+        skip_cursor=skip_cursor,
+        skip_units=1,
+        cursor_key="cursor_demo",
+        current_user_id="10001",
+    )
+
+    memory_engine.add_memory.assert_not_awaited()
+    stored = conversation_manager.update_session_metadata.await_args_list[0].args[2]
+    assert stored["cursor_demo"] == {
+        "created_at": "2026-07-19T00:00:05.000000Z",
+        "record_id": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_converts_llm_skip_to_skip_marker() -> None:
+    memory_processor = SimpleNamespace(
+        process_conversation_batch=AsyncMock(
+            side_effect=LLMExtractionSkip("content_policy")
+        )
+    )
+    service = ReflectionExtractionService(memory_processor)
+
+    result = await service.extract(
+        session_id="demo:FriendMessage:10001",
+        cm_messages=_round(1, 10),
+        persona_id="persona_demo",
+        current_user_id="10001",
+    )
+
+    assert isinstance(result, ReflectionExtractionSkip)
+    assert result.reason == "content_policy"
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_writes_atom_types_into_metadata() -> None:
+    atoms = [
+        MemoryAtom(parent_memory_id=1, atom_type=AtomType.EPISODIC, content="事实"),
+        MemoryAtom(parent_memory_id=1, atom_type=AtomType.PLANNED, content="计划"),
+    ]
+    memory_processor = SimpleNamespace(
+        process_conversation_batch=AsyncMock(
+            return_value=[
+                (
+                    "事实：会议",
+                    {"topics": ["会议"], "key_facts": ["Alice 安排会议"]},
+                    0.8,
+                )
+            ]
+        ),
+        classify_atoms_from_metadata=lambda **_kwargs: atoms,
+    )
+    service = ReflectionExtractionService(memory_processor)
+
+    candidates = await service.extract(
+        session_id="demo:GroupMessage:group_demo",
+        cm_messages=_round(1, 10),
+        persona_id="persona_demo",
+        current_user_id="10001",
+    )
+
+    assert candidates[0].metadata["atom_types"] == ["episodic", "planned"]
+
+
+@pytest.mark.asyncio
+async def test_extraction_service_omits_atom_types_when_no_atoms() -> None:
+    memory_processor = SimpleNamespace(
+        process_conversation_batch=AsyncMock(
+            return_value=[
+                (
+                    "事实：会议",
+                    {"topics": ["会议"], "key_facts": ["Alice 安排会议"]},
+                    0.8,
+                )
+            ]
+        ),
+        classify_atoms_from_metadata=lambda **_kwargs: [],
+    )
+    service = ReflectionExtractionService(memory_processor)
+
+    candidates = await service.extract(
+        session_id="demo:GroupMessage:group_demo",
+        cm_messages=_round(1, 10),
+        persona_id="persona_demo",
+        current_user_id="10001",
+    )
+
+    assert "atom_types" not in candidates[0].metadata

@@ -5,6 +5,7 @@ from .cm_history_reader import CMHistoryReader
 from .cursor_service import ReflectionCursor, ReflectionCursorService
 from .extraction_service import (
     ReflectionExtractionService,
+    ReflectionExtractionSkip,
     ReflectionMemoryCandidate,
 )
 from .reflection_service import ReflectionService
@@ -15,6 +16,7 @@ __all__ = [
     "ReflectionCursor",
     "ReflectionCursorService",
     "ReflectionExtractionService",
+    "ReflectionExtractionSkip",
     "ReflectionMemoryCandidate",
     "ReflectionService",
 ]

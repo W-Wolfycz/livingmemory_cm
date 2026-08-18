@@ -1,5 +1,5 @@
 name: livingmemory_cm
 author: Wolfycz
-version: 2.5.7-cm
+version: 2.5.7-cm.1
 description: 基于 astrbot_plugin_livingmemory 的 CM-only 单路径维护版（需配合 chat_memory context_takeover）
 repo: https://github.com/W-Wolfycz/livingmemory_cm

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...log import log_ref, logger, tag
 from ..models.conversation_models import Message
+from ..processors.memory_processor import LLMExtractionSkip
 
 if TYPE_CHECKING:
     from ..processors.memory_processor import MemoryProcessor
@@ -24,6 +25,13 @@ class ReflectionMemoryCandidate:
     atoms: list[Any]
 
 
+@dataclass(frozen=True)
+class ReflectionExtractionSkip:
+    """模型明确拒绝当前窗口；调用方按配置跳过有限 CM 单位。"""
+
+    reason: str = ""
+
+
 class ReflectionExtractionService:
     """负责 CM 消息身份转换、LLM 萃取和原子分类。"""
 
@@ -37,8 +45,8 @@ class ReflectionExtractionService:
         cm_messages: list[dict],
         persona_id: str,
         current_user_id: str,
-    ) -> list[ReflectionMemoryCandidate] | None:
-        """返回候选列表；LLM/处理器失败返回 None，合法空结果返回空列表。"""
+    ) -> list[ReflectionMemoryCandidate] | ReflectionExtractionSkip | None:
+        """区分成功、合法空结果、结构化跳过和可重试失败。"""
         session_ref = log_ref(session_id, "session")
         if not self.memory_processor:
             logger.error(
@@ -64,6 +72,12 @@ class ReflectionExtractionService:
                     persona_id=persona_id,
                 )
             )
+        except LLMExtractionSkip as exc:
+            logger.warning(
+                f"{tag('reflection')} [{session_ref}] CM 模式收到结构化跳过结果"
+                + (f"，原因={exc.reason}" if exc.reason else "")
+            )
+            return ReflectionExtractionSkip(exc.reason)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -82,6 +96,14 @@ class ReflectionExtractionService:
                 session_id=session_id,
                 persona_id=persona_id,
             )
+            if atoms:
+                # 把本批原子的类型集合写入主记忆 metadata，让
+                # recall_engine.memory_type_filter=event_only 对新反思记忆生效。
+                # atoms 为空/None 时不写，不编造类型；旧记忆与 Agent 主动
+                # memorize 工具（无 atoms）仍走 event_only 的保守兼容分支。
+                normalized_metadata["atom_types"] = sorted(
+                    {atom.atom_type.value for atom in atoms}
+                )
             candidates.append(
                 ReflectionMemoryCandidate(
                     content=content,
@@ -111,7 +133,13 @@ class ReflectionExtractionService:
         is_bot = cm_dict.get("role") == "assistant"
         if is_bot:
             sender_id = str(cm_dict.get("self_id") or "bot")
-            sender_name = cm_dict.get("bot_nickname") or "Bot"
+            # CM 最新结构把 Bot 昵称存在 assistant 行的 sender_nickname；
+            # bot_nickname 仅作为旧版 CM 兼容回退。
+            sender_name = (
+                cm_dict.get("sender_nickname")
+                or cm_dict.get("bot_nickname")
+                or "Bot"
+            )
             speaker_relation = "bot"
         else:
             sender_id = str(
@@ -147,4 +175,8 @@ class ReflectionExtractionService:
         )
 
 
-__all__ = ["ReflectionExtractionService", "ReflectionMemoryCandidate"]
+__all__ = [
+    "ReflectionExtractionService",
+    "ReflectionExtractionSkip",
+    "ReflectionMemoryCandidate",
+]

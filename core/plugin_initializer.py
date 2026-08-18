@@ -360,6 +360,9 @@ class PluginInitializer:
             graph_doc_path = data_dir_path / "livingmemory_graph_documents.db"
             graph_index_path = data_dir_path / "livingmemory_graph.index"
             graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
+            graph_route_weight = float(
+                self.config_manager.get("graph_memory.graph_route_weight", 0.35)
+            )
 
             # 新安装时 preflight 不创建空数据库；在正式初始化阶段准备迁移管理器。
             if self.db_migration is None:
@@ -457,12 +460,9 @@ class PluginInitializer:
                 ),
                 "stopwords_path": str(stopwords_dir),
                 "graph_memory_enabled": graph_memory_enabled,
-                "document_route_weight": self.config_manager.get(
-                    "graph_memory.document_route_weight", 0.65
-                ),
-                "graph_route_weight": self.config_manager.get(
-                    "graph_memory.graph_route_weight", 0.35
-                ),
+                # 单一 graph_route_weight 配置；文档路权重自动 = 1 - 图路权重
+                "graph_route_weight": graph_route_weight,
+                "document_route_weight": 1.0 - graph_route_weight,
                 "cross_route_bonus": self.config_manager.get(
                     "graph_memory.cross_route_bonus", 0.08
                 ),

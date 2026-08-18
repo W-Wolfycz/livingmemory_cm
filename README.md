@@ -6,7 +6,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 [chat_memory](https://github.com/W-Wolfycz/chat_memory) 的上下文接管模式维护。
 本项目是独立的 CM-only fork，不是上游官方发行版。
 
-- 当前版本：`2.5.7-cm`
+- 当前版本：`2.5.7-cm.1`
 - 源码仓库：<https://github.com/W-Wolfycz/livingmemory_cm>
 - 许可证：GNU Affero General Public License v3.0（AGPL-3.0）
 
@@ -26,9 +26,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 - 可选提供 `recall_long_term_memory` 与 `memorize_long_term_memory` 两个 Agent 工具。
 
 相较上游，本 fork 不提供 PromptManager、JSON/CSV 导入导出、原始来源编辑和上游自管
-conversation history。详细 CM 接口和取舍见
-[docs/CM_INTEGRATION.md](docs/CM_INTEGRATION.md)，完整运行流程和数据结构见
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+conversation history。
 
 ## 安装与升级
 
@@ -51,13 +49,14 @@ Release 包不包含 `data/`、数据库、FAISS 索引或用户配置。升级�
 - `provider_settings.embedding_provider_id`：Embedding Provider，留空使用 AstrBot 默认值。
 - `provider_settings.llm_provider_id`：LLM Provider，留空使用 AstrBot 默认值。
 - `recall_engine.injection_method`：长期记忆注入方式，默认 `extra_user_content`。
-- `recall_engine.query_context_rounds`：用于指代消歧的最近完整问答轮数，默认 `2`。
+- `recall_engine.query_context_rounds`：用于指代消歧的最近 CM 历史，单位跟随 CM `llm_status_filter`（仅 `llm_success` 按轮、含其他状态按条），默认 `2`。
 - `reflection_engine.trigger_count`：反思触发数量；`0` 跟随 ChatMemory 配置。
-- `graph_memory.enabled`：启用知识图谱和图检索。
+- `graph_memory.graph_route_weight`：图路融合权重，默认 `0.35`；文档路权重自动为 `1 - graph_route_weight`。
+- `log_with_bot_id`（全局配置项，不属于配置段）：多 Bot 共存时在关键事件日志前缀附加 self_id 原文（如 `[livingmemory_cm:bot-10000]`），便于定位；会话/用户引用仍脱敏。
 - `maintenance.cleanup_days_threshold`、`backup_keep_days`：`0` 表示关闭对应维护任务。
 
-全部 8 个配置段、45 个配置项的作用和建议见
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+全部 7 个配置段 + 1 个全局配置项（`log_with_bot_id`）、共 44 个配置项的作用和建议见
+AstrBot 配置面板中各配置项的说明文案。
 
 ## 命令
 
@@ -76,13 +75,14 @@ Release 包不包含 `data/`、数据库、FAISS 索引或用户配置。升级�
 
 ```powershell
 python -m pip install -r requirements.txt -r requirements-test.txt
-python tests\run_tests.py --astrbot-source "D:\path\to\AstrBot-source-root"
+python tests\run_tests.py
 ```
 
-本地测试只验证领域算法、状态机、存储协议和边界条件，不模拟完整 AstrBot。当前代码级
-回归为 `435 passed`；AstrBot reload、真实 Provider、平台发送、ChatMemory Hook 顺序和
-Dashboard 浏览器交互必须在部署端验收。完整说明见
-[docs/TESTING.md](docs/TESTING.md)。
+本地测试只验证领域算法、状态机、存储协议和边界条件；`astrbot.api` 与 `astrbot.core`
+由 `tests/conftest.py` 提供最小 fake 类型树，不导入、也不安装真实 AstrBot
+core/backend，因此不再需要 `--astrbot-source` / `--astrbot-backend`。当前代码级
+回归为 `508 passed`；AstrBot reload、真实 core 兼容性、Provider、平台发送、
+ChatMemory Hook 顺序和 Dashboard 浏览器交互必须在部署端验收。
 
 ## 更新记录
 

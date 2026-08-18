@@ -32,7 +32,6 @@ from ..managers.atom_lifecycle_manager import AtomLifecycleManager
 from ..managers.graph_memory_manager import GraphMemoryManager
 from ..processors.graph_extractor import GraphExtractor
 from ..processors.text_processor import TextProcessor
-from ..retrieval.atom_retriever import AtomRetriever
 from ..retrieval.dual_route_retriever import DualRouteRetriever
 from ..retrieval.graph_keyword_retriever import GraphKeywordRetriever
 from ..retrieval.graph_retriever import GraphRetriever
@@ -126,7 +125,6 @@ class MemoryEngine:
         self.dual_route_retriever = None
         self.atom_store = None
         self.atom_lifecycle_manager = None
-        self.atom_retriever = None
         self.db_connection = None
         self._document_repository = DocumentRepository(self.faiss_db)
         self._search_service = MemorySearchService(self.config)
@@ -181,7 +179,6 @@ class MemoryEngine:
                 self.atom_lifecycle_manager = AtomLifecycleManager(
                     self.atom_store, self.config
                 )
-                self.atom_retriever = AtomRetriever(self.atom_store, self.config)
                 await self.atom_lifecycle_manager.start()
 
             self.graph_extractor = GraphExtractor(self.config)

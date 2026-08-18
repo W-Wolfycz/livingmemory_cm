@@ -24,10 +24,11 @@ class DualRouteRetriever:
         self.graph_retriever = graph_retriever
         self.memory_loader = memory_loader
         self.config = config or {}
-        self.document_route_weight = float(
-            self.config.get("document_route_weight", 0.65)
-        )
         self.graph_route_weight = float(self.config.get("graph_route_weight", 0.35))
+        # 文档路权重：优先使用显式旧键，否则自动 = 1 - 图路权重
+        self.document_route_weight = float(
+            self.config.get("document_route_weight", 1.0 - self.graph_route_weight)
+        )
         self.cross_route_bonus = float(self.config.get("cross_route_bonus", 0.08))
         self.dynamic_route_weighting = bool(
             self.config.get("dynamic_route_weighting", True)

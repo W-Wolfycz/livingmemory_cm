@@ -291,6 +291,45 @@ def test_memory_search_service_applies_optional_retrieval_policies() -> None:
     assert [result.doc_id for result in filtered] == [1]
 
 
+def test_memory_search_service_event_only_excludes_preference_keeps_events() -> None:
+    service = MemorySearchService({"memory_type_filter": "event_only"})
+    results = [
+        HybridResult(
+            1,
+            0.9,
+            0.8,
+            "纯偏好",
+            {"importance": 0.8, "atom_types": ["preference"]},
+        ),
+        HybridResult(
+            2,
+            0.9,
+            0.8,
+            "计划与事实",
+            {"importance": 0.8, "atom_types": ["planned", "factual"]},
+        ),
+        HybridResult(
+            3,
+            0.9,
+            0.8,
+            "混合含事件",
+            {"importance": 0.8, "atom_types": ["preference", "planned"]},
+        ),
+        HybridResult(
+            4,
+            0.9,
+            0.8,
+            "空类型列表兼容",
+            {"importance": 0.8, "atom_types": []},
+        ),
+        HybridResult(5, 0.9, 0.8, "无类型元数据兼容", {"importance": 0.8}),
+    ]
+
+    filtered = service._filter_by_retrieval_policy(results)
+
+    assert [result.doc_id for result in filtered] == [2, 3, 4, 5]
+
+
 @pytest.mark.asyncio
 async def test_memory_search_recent_slot_keeps_session_and_persona_scope() -> None:
     connection = await aiosqlite.connect(":memory:")

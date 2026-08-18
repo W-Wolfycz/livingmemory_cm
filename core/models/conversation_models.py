@@ -148,8 +148,12 @@ class Message:
 
         content = self.content_to_text(self.content)
 
-        # 群聊场景: 在消息前加上发送者详细信息
+        # 群聊场景: 在消息前加上发送者详细信息。
+        # 前缀对齐 CM 最新注入结构（<cm_time>/<cm_speaker>/<cm_nickname>），
+        # 昵称缺失输出 "?"，不回退账号 ID（ID 不进入 LLM 上下文）。
         if include_sender_name and self.group_id:
+            from xml.sax.saxutils import escape
+
             # 判断是否为Bot消息：优先检查 metadata 标记，其次 role
             is_bot = (
                 self.metadata.get("is_bot_message", False) or self.role == "assistant"
@@ -160,9 +164,9 @@ class Message:
                 "%Y-%m-%d %H:%M:%S"
             )
 
-            # 确定显示的发送者名称：优先使用昵称，否则使用ID
-            display_name = (
-                self.sender_name if self.sender_name else self.sender_id or "未知"
+            # 确定显示的发送者名称：优先使用昵称，缺失用 "?"
+            display_name = escape(
+                (self.sender_name if self.sender_name else "?").strip() or "?"
             )
 
             # Debug: 记录发送者信息获取情况
@@ -172,15 +176,17 @@ class Message:
                 f"is_bot={is_bot}, role={self.role}"
             )
 
-            # 构建发送者信息前缀
-            # Bot消息使用 [Bot: 昵称] 格式
-            # 其他群成员直接使用 [昵称] 格式，让LLM能清晰识别每个发送者
+            # 构建发送者信息前缀：Bot 用 bot 标记，普通群成员用空 speaker 标记
             if is_bot:
                 sender_info = (
-                    f"[Bot: {display_name} | ID: {self.sender_id} | {time_str}]"
+                    f"<cm_time>{time_str}</cm_time> <cm_speaker bot=\"1\"/> "
+                    f"<cm_nickname>{display_name}</cm_nickname>"
                 )
             else:
-                sender_info = f"[{display_name} | ID: {self.sender_id} | {time_str}]"
+                sender_info = (
+                    f"<cm_time>{time_str}</cm_time> <cm_speaker/> "
+                    f"<cm_nickname>{display_name}</cm_nickname>"
+                )
             content = f"{sender_info} {content}"
 
         return {"role": self.role, "content": content}

@@ -7,7 +7,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from ...log import log_ref, logger, tag
+from ...log import log_ref, logger, tag, tag_event
+from ..reflection import ReflectionService
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
@@ -65,14 +66,14 @@ class MemoryRecall:
         try:
             session_id = event.unified_msg_origin
             session_ref = log_ref(session_id, "session")
-            logger.debug(f"{tag('recall')} 获取到会话引用: {session_ref}")
+            logger.debug(f"{tag_event('recall', event)} 获取到会话引用: {session_ref}")
 
             # 检测异常session_id
             if session_id and (
                 "Error:" in session_id or "error:" in session_id.lower()
             ):
                 logger.warning(
-                    f"{tag('recall')} [{session_ref}] 检测到异常会话引用，"
+                    f"{tag_event('recall', event)} [{session_ref}] 检测到异常会话引用，"
                     "这可能导致记忆功能异常。"
                 )
 
@@ -281,7 +282,12 @@ class MemoryRecall:
             return actual_query
 
         cm_plugin = get_cm_plugin(self.context)
-        if cm_plugin is None or not hasattr(cm_plugin, "query_rounds"):
+        if cm_plugin is None:
+            return actual_query
+        extraction_mode = ReflectionService.get_extraction_mode(cm_plugin)
+        if extraction_mode == "rounds" and not hasattr(cm_plugin, "query_rounds"):
+            return actual_query
+        if extraction_mode == "messages" and not hasattr(cm_plugin, "query_history"):
             return actual_query
 
         umo = event.unified_msg_origin
@@ -308,23 +314,40 @@ class MemoryRecall:
             else None
         )
 
-        rounds = await cm_plugin.query_rounds(
-            umo=umo,
-            conversation_id=cid,
-            user_id=user_id,
-            limit_rounds=rounds_limit,
-            # 召回消歧只需要“该用户发言 + Bot 对该发言的完整回复”，
-            # 不跟随 full_group/cross_session 的混合消息窗口。
-            llm_status="llm_success",
-            persona_id=persona_id,
-            since=since,
-        )
-        if not rounds:
+        # 召回历史单位跟随 CM llm_status_filter（与反思萃取语义一致）：
+        # 仅 llm_success → 前 N 轮配对问答（query_rounds）；
+        # 包含其他状态 → 前 N 条消息（query_history）。
+        # 召回消歧只需要“该用户发言 + Bot 对该发言的完整回复”，
+        # 不跟随 full_group/cross_session 的混合消息窗口。
+        llm_status = getattr(cm_plugin, "ct_llm_status_filter", None)
+        if extraction_mode == "rounds":
+            rounds = await cm_plugin.query_rounds(
+                umo=umo,
+                conversation_id=cid,
+                user_id=user_id,
+                limit_rounds=rounds_limit,
+                llm_status=llm_status,
+                persona_id=persona_id,
+                since=since,
+            )
+            units = rounds or []
+        else:
+            messages = await cm_plugin.query_history(
+                umo=umo,
+                conversation_id=cid,
+                user_id=user_id,
+                limit=rounds_limit,
+                llm_status=llm_status,
+                persona_id=persona_id,
+                since=since,
+            )
+            units = [[message] for message in (messages or [])]
+        if not units:
             return actual_query
 
         history_lines: list[str] = []
         used = 0
-        for round_messages in reversed(rounds):
+        for round_messages in reversed(units):
             round_lines: list[str] = []
             for message in round_messages:
                 role = message.get("role")
@@ -352,9 +375,11 @@ class MemoryRecall:
             return actual_query
         history_lines.reverse()
         history = "\n".join(history_lines)
+        unit_label = "轮" if extraction_mode == "rounds" else "条消息"
         logger.debug(
             f"{tag('recall')} [{log_ref(umo, 'umo')}] 召回查询包含当前发言 + "
-            f"{min(len(rounds), rounds_limit)} 轮当前用户 CM 问答（{len(history)}字符）"
+            f"{min(len(units), rounds_limit)}{unit_label} 当前用户 CM 历史"
+            f"（{len(history)}字符，模式={extraction_mode}）"
         )
         # 当前发言置于首尾各一次，明确其为 embedding 查询主体。
         return (

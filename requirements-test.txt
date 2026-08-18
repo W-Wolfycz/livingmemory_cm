@@ -1,22 +1,21 @@
+# LivingMemoryCM 本地测试依赖。
+#
+# 本地测试不再导入真实 AstrBot core/backend，因此不再需要以下仅为让真实 core
+# 可导入的依赖：audioop-lts、deprecated、sqlalchemy、sqlmodel、apscheduler、
+# loguru、aiohttp、anthropic、google-genai、jsonschema、mcp、openai、pillow、
+# psutil、pypdf、quart、certifi 等。AstrBot core 兼容性由 Windows 测试端
+# reload/部署验收。
+#
+# 本文件同时包含测试运行真实需要的插件运行依赖（pytz/aiofiles/jieba 等），
+# 使测试 venv 只安装本文件即可独立跑完整测试；与 requirements.txt 一起安装
+# 也不冲突。
+
 pytest>=9.0,<10
 pytest-asyncio>=1.0,<2
 pydantic>=2.12,<3
-deprecated>=1.2,<2
-sqlalchemy[asyncio]>=2.0.41
-sqlmodel>=0.0.24
-apscheduler>=3.11.0
-loguru>=0.7.2
-aiohttp>=3.11.18
-audioop-lts; python_full_version >= "3.13"
-anthropic>=0.51.0
-certifi>=2025.4.26
-google-genai>=1.56.0
-jsonschema>=4.23,<5
-mcp>=1.8.0,<2
-openai>=1.78.0
-pillow>=11.2.1
-psutil>=5.8.0,<7.2.0
-pypdf>=6.1.1
+aiosqlite>=0.20.0
 pyyaml>=6.0.2
-quart>=0.20.0
-rank-bm25>=0.2.2
+pytz>=2021.3
+aiofiles>=23.0.0
+jieba>=0.42.1
+numpy>=1.26,<3

@@ -116,7 +116,15 @@ class MemorySearchService:
             session_id or "",
             persona_id or "",
             dual_route_enabled,
-            round(float(self.config.get("document_route_weight", 0.65)), 4),
+            round(
+                float(
+                    self.config.get(
+                        "document_route_weight",
+                        1.0 - float(self.config.get("graph_route_weight", 0.35)),
+                    )
+                ),
+                4,
+            ),
             round(float(self.config.get("graph_route_weight", 0.35)), 4),
             int(self.config.get("graph_expansion_hops", 1)),
             round(

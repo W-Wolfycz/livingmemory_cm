@@ -5,7 +5,35 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [2.5.7-cm.1]
+
+### 修复
+
+- 配置迁移适配 AstrBot 4.27.3 完整性注入：旧 `log.log_with_bot_id` / `document_route_weight`
+  由隐藏兼容键保留并在加载时迁移；迁移后清除配置中的 legacy 键并落盘，避免旧值反复
+  覆盖用户在 UI 的新设置。
+- 反思记忆写入 `atom_types` 元数据，使 `memory_type_filter=event_only` 对新记忆生效。
+- 日志 Bot 前缀改用 `get_self_id()` 原文，便于多 Bot 定位。
+
+### 修改
+
+- 萃取改为严格 JSON 协议（`status=success/skip`）：非法响应重试 3 次后失败，不再宽松
+  降级；`status=skip` 或 Provider 内容安全拒绝按 `refusal_advance_count`（默认 5）推进
+  有限反思单位。
+- 萃取消息前缀对齐 CM 最新注入结构（`<cm_time>` / `<cm_speaker>` / `<cm_nickname>`），
+  不再把账号 ID 交给 LLM；Bot 昵称改从 assistant 行 `sender_nickname` 读取。
+- 召回历史单位跟随 CM `llm_status_filter`（仅 `llm_success` 按轮，否则按条）。
+- `graph_memory` 合并为单一 `graph_route_weight`，文档路自动取 `1 - graph_route_weight`；
+  旧配置自动迁移。
+- `log_with_bot_id` 提升为顶层全局配置项；删除 `debug_to_info` 提级，日志级别跟随
+  AstrBot 原生配置。配置结构为 7 个配置段 + 1 个全局配置项（共 44 项），schema 文案
+  同步更新。
+- 删除死组件 `AtomRetriever` 与 `memory_processor` 遗留宽松解析代码。
+
+### 测试
+
+- 本地测试改用 fake `astrbot.core` 类型树，不再依赖真实 backend；`requirements-test.txt`
+  相应精简。本地回归 `508 passed`；AstrBot reload 与部署端验收仍需另行完成。
 
 ## [2.5.7-cm] - 2026-08-12
 

@@ -6,7 +6,7 @@
 import asyncio
 from typing import Any
 
-from ..log import log_ref, logger, tag
+from ..log import log_ref, logger, tag, tag_event
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
@@ -97,7 +97,7 @@ class EventHandler:
         try:
             await self.conversation_manager.clear_session(session_id)
             logger.info(
-                f"{tag('handler')} [{log_ref(session_id, 'session')}] "
+                f"{tag_event('handler', event)} [{log_ref(session_id, 'session')}] "
                 "已同步清空插件会话上下文（/reset 或 /new）"
             )
         except Exception as e:

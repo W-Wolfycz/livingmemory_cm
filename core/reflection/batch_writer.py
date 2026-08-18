@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from ...log import log_ref, logger, tag
 from .cursor_service import ReflectionCursor, ReflectionCursorService
-from .extraction_service import ReflectionExtractionService
+from .extraction_service import ReflectionExtractionService, ReflectionExtractionSkip
 
 if TYPE_CHECKING:
     from ..managers.conversation_manager import ConversationManager
@@ -37,6 +37,8 @@ class ReflectionBatchWriter:
         persona_id: str,
         start_cursor: ReflectionCursor,
         end_cursor: ReflectionCursor,
+        skip_cursor: ReflectionCursor,
+        skip_units: int,
         cursor_key: str,
         current_user_id: str,
     ) -> None:
@@ -71,14 +73,26 @@ class ReflectionBatchWriter:
                     )
                     return
 
-                candidates = await self.extraction_service.extract(
+                extraction_result = await self.extraction_service.extract(
                     session_id=session_id,
                     cm_messages=cm_messages,
                     persona_id=persona_id,
                     current_user_id=current_user_id,
                 )
-                if candidates is None:
+                if extraction_result is None:
                     return
+                if isinstance(extraction_result, ReflectionExtractionSkip):
+                    await self.cursor_service.store(
+                        session_id, cursor_key, skip_cursor
+                    )
+                    logger.warning(
+                        f"{tag('reflection')} [{session_ref}] CM 模式按配置跳过 "
+                        f"{skip_units} 个拒绝单位，"
+                        f"游标推进至 {skip_cursor.created_at}#{skip_cursor.record_id}"
+                    )
+                    return
+
+                candidates = extraction_result
 
                 batch_id = self.cursor_service.build_batch_id(
                     cursor_key, start_cursor, end_cursor

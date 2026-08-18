@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from ...log import logger, tag
+from ...log import logger, tag, tag_event
 from ..reflection import (
     CMHistoryReader,
     ReflectionBatchWriter,
@@ -66,7 +66,7 @@ class MemoryReflection:
     async def handle_memory_reflection(self, event: AstrMessageEvent) -> None:
         """在 CM 写入 prepared assistant 后检查并派发反思批次。"""
         logger.debug(
-            f"{tag('reflection')} 进入 handle_memory_reflection"
+            f"{tag_event('reflection', event)} 进入 handle_memory_reflection"
             "（on_decorating_result）"
         )
         try:
@@ -98,16 +98,24 @@ class MemoryReflection:
                 or 0
             )
             trigger_count = configured if configured > 0 else cm_limit
+            refusal_advance_count = int(
+                self.config_manager.get(
+                    "reflection_engine.refusal_advance_count", 1
+                )
+                or 1
+            )
             unit = "轮" if extraction_mode == "rounds" else "条消息"
             logger.debug(
                 f"{tag('reflection')} 反思模式={extraction_mode}, "
-                f"触发阈值={trigger_count}{unit}"
+                f"触发阈值={trigger_count}{unit}, "
+                f"主动拒绝推进={refusal_advance_count}{unit}"
             )
 
             await self._reflection_service.dispatch(
                 event=event,
                 session_id=session_id,
                 trigger_count=trigger_count,
+                refusal_advance_count=refusal_advance_count,
                 cm_limit=cm_limit,
                 extraction_mode=extraction_mode,
             )
