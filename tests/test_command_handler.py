@@ -8,6 +8,7 @@ import pytest
 from livingmemory_cm.core.base.config_manager import ConfigManager
 from livingmemory_cm.core.command_handler import CommandHandler
 from livingmemory_cm.core.i18n_backend import init as init_i18n
+from livingmemory_cm.storage.freeze_store import FreezeStore
 
 
 @pytest.fixture(autouse=True)
@@ -249,3 +250,106 @@ async def test_handle_rebuild_graph_reports_progress_and_summary(
     assert [
         part for part in messages[1].split() if any(ch.isdigit() for ch in part)
     ] == ["3", "1"]
+
+
+# ── /lmem freeze 与 /lmem unfreeze ──────────────────────────────────────────
+
+
+@pytest.fixture
+def freeze_handler(tmp_path, config_manager):
+    store = FreezeStore(tmp_path / "frozen_personas.json")
+    engine = Mock()
+    engine.freeze_store = store
+    engine.refresh_persona_access_time = AsyncMock(return_value=3)
+    return CommandHandler(
+        context=Mock(),
+        config_manager=config_manager,
+        memory_engine=engine,
+        conversation_manager=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_freeze_lists_and_freezes_persona(
+    freeze_handler, mock_event, tmp_path
+) -> None:
+    empty = [msg async for msg in freeze_handler.handle_freeze(mock_event, "list")]
+    assert len(empty) == 1
+    assert "没有冻结的 persona" in empty[0]
+
+    frozen = [msg async for msg in freeze_handler.handle_freeze(mock_event, "persona_demo")]
+    assert len(frozen) == 1
+    assert "已冻结" in frozen[0]
+
+    store = freeze_handler.memory_engine.freeze_store
+    assert await store.frozen_personas() == {"persona_demo"}
+
+    listed = [msg async for msg in freeze_handler.handle_freeze(mock_event, "")]
+    assert len(listed) == 1
+    assert "已冻结" in listed[0]
+    assert "persona_demo" in listed[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_freeze_without_store_reports_component_not_ready(
+    mock_event, config_manager
+) -> None:
+    engine = Mock(spec=["db_path"])
+    engine.db_path = "/tmp/livingmemory-test.db"
+    handler = CommandHandler(
+        context=Mock(),
+        config_manager=config_manager,
+        memory_engine=engine,
+        conversation_manager=None,
+    )
+
+    messages = [msg async for msg in handler.handle_freeze(mock_event, "persona_demo")]
+
+    assert len(messages) == 1
+    assert "未初始化" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_unfreeze_never_frozen_persona_writes_nothing(
+    freeze_handler, mock_event, tmp_path
+) -> None:
+    """从未冻结的 persona 不能凭空获得豁免记录，也不能被刷新访问时间。"""
+    messages = [
+        msg async for msg in freeze_handler.handle_unfreeze(mock_event, "persona_never")
+    ]
+
+    assert len(messages) == 1
+    assert "不在冻结列表中" in messages[0]
+    store = freeze_handler.memory_engine.freeze_store
+    assert await store.protected_personas() == set()
+    assert await store.entries() == []
+    assert not (tmp_path / "frozen_personas.json").exists()
+    freeze_handler.memory_engine.refresh_persona_access_time.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_unfreeze_frozen_persona_enters_grace(
+    freeze_handler, mock_event
+) -> None:
+    store = freeze_handler.memory_engine.freeze_store
+    await store.freeze("persona_demo")
+
+    messages = [msg async for msg in freeze_handler.handle_unfreeze(mock_event, "persona_demo")]
+
+    assert len(messages) == 1
+    assert "已解冻" in messages[0]
+    assert "3 条记忆的访问时间" in messages[0]
+    # 默认 freeze_grace_days=7：解冻后仍在保护名单内，但不再算"冻结"
+    assert await store.frozen_personas() == set()
+    assert await store.protected_personas() == {"persona_demo"}
+    freeze_handler.memory_engine.refresh_persona_access_time.assert_awaited_once_with(
+        "persona_demo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_unfreeze_requires_argument(freeze_handler, mock_event) -> None:
+    messages = [msg async for msg in freeze_handler.handle_unfreeze(mock_event, "")]
+
+    assert len(messages) == 1
+    assert "用法" in messages[0]

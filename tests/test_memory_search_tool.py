@@ -25,6 +25,7 @@ def astr_context():
 def _make_run_context():
     event = Mock()
     event.unified_msg_origin = "test:private:session-1"
+    event.get_self_id.return_value = "10000"
 
     run_context = Mock()
     run_context.context = Mock()
@@ -66,6 +67,8 @@ async def test_memory_search_tool_always_filters_by_session_and_persona(
         k=6,
         session_id="test:private:session-1",
         persona_id="persona_a",
+        self_id="10000",
+        isolate_persona_memory=True,
     )
 
 
@@ -174,6 +177,8 @@ async def test_memory_search_tool_limits_k_by_config(memory_engine, astr_context
         k=4,
         session_id="test:private:session-1",
         persona_id="persona_a",
+        self_id="10000",
+        isolate_persona_memory=True,
     )
 
 
@@ -229,6 +234,8 @@ async def test_memory_search_tool_falls_back_to_default_k_for_invalid_input(
         k=3,
         session_id="test:private:session-1",
         persona_id="persona_a",
+        self_id="10000",
+        isolate_persona_memory=True,
     )
 
 

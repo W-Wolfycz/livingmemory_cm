@@ -32,6 +32,9 @@ class MemorySearchService:
         k: int,
         session_id: str | None,
         persona_id: str | None,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
+        exclude_personas: set[str] | None = None,
         hybrid_retriever,
         dual_route_retriever,
         schedule_task: Callable[[Awaitable[Any]], None],
@@ -43,12 +46,16 @@ class MemorySearchService:
         if not query or not query.strip():
             return []
 
+        excluded = {str(item) for item in (exclude_personas or set()) if item}
         cache_key = self._cache_key(
             query,
             k,
             session_id,
             persona_id,
             dual_route_enabled=dual_route_retriever is not None,
+            self_id=self_id,
+            isolate_persona_memory=isolate_persona_memory,
+            excluded_personas=excluded,
         )
         cached_results = self._get_cached_results(cache_key)
         if cached_results is not None:
@@ -77,12 +84,26 @@ class MemorySearchService:
             )
 
         results = self._filter_by_retrieval_policy(results)
+        results = self._isolate_persona_memory(
+            results, self_id, isolate_persona_memory
+        )
+        results = self._filter_frozen_personas(results, excluded)
         results = await self._merge_recent_memories(
             results,
             k,
             session_id,
             persona_id,
             db_connection,
+            excluded_personas=excluded,
+            self_id=self_id,
+            isolate_persona_memory=isolate_persona_memory,
+        )
+        # 近期槽位直接查库、不经过向量过滤，而它的 SQL 只按 session/persona
+        # 过滤，因此这里必须把冻结与 persona 记忆隔离两道过滤都再兜一次，
+        # 确保两者都不会从该路径泄漏回注入结果。
+        results = self._filter_frozen_personas(results, excluded)
+        results = self._isolate_persona_memory(
+            results, self_id, isolate_persona_memory
         )
 
         for result in results:
@@ -90,6 +111,54 @@ class MemorySearchService:
 
         self._set_cached_results(cache_key, results)
         return results
+
+    @staticmethod
+    def _filter_frozen_personas(
+        results: list[Any],
+        excluded: set[str],
+    ) -> list[Any]:
+        """冷存储隔离：冻结中的 persona 不参与召回。"""
+        if not excluded:
+            return results
+        filtered: list[Any] = []
+        for result in results:
+            metadata = getattr(result, "metadata", None)
+            persona = (
+                str(metadata.get("persona_id") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if persona and persona in excluded:
+                continue
+            filtered.append(result)
+        return filtered
+
+    @staticmethod
+    def _isolate_persona_memory(
+        results: list[Any],
+        self_id: str | None,
+        enabled: bool,
+    ) -> list[Any]:
+        """persona 记忆隔离：排除 metadata.self_id 明确属于其他 Bot 的结果。
+
+        同群多 Bot 共用同一 session（umo），需要按写入时的 Bot 标识过滤，避免
+        A Bot 召回 B Bot 的记忆。兼容策略：没有 self_id 字段的旧记忆保留
+        （迁移前写入的数据无法回溯归属）；self_id 为空或开关关闭时不过滤。
+        """
+        if not enabled or not self_id:
+            return results
+        filtered: list[Any] = []
+        for result in results:
+            metadata = getattr(result, "metadata", None)
+            owner = (
+                str(metadata.get("self_id") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if owner and owner != str(self_id):
+                continue
+            filtered.append(result)
+        return filtered
 
     def invalidate(self) -> None:
         """写操作后使全部检索缓存失效。"""
@@ -108,6 +177,9 @@ class MemorySearchService:
         persona_id: str | None,
         *,
         dual_route_enabled: bool,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
+        excluded_personas: set[str] | None = None,
     ) -> tuple[Any, ...]:
         return (
             self._cache_generation,
@@ -116,6 +188,9 @@ class MemorySearchService:
             session_id or "",
             persona_id or "",
             dual_route_enabled,
+            self_id or "",
+            bool(isolate_persona_memory),
+            tuple(sorted(str(item) for item in (excluded_personas or set()))),
             round(
                 float(
                     self.config.get(
@@ -213,6 +288,9 @@ class MemorySearchService:
         session_id: str | None,
         persona_id: str | None,
         db_connection,
+        excluded_personas: set[str] | None = None,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         if count <= 0 or db_connection is None:
             return []
@@ -257,7 +335,14 @@ class MemorySearchService:
             )
             for row in rows
         ]
-        return self._filter_by_retrieval_policy(recent)[:count]
+        # 过滤必须发生在 [:count] 截断之前：截断后再过滤会让槽位空着，
+        # 最终返回条数少于 k（该路径直查数据库，不经过向量过滤）。
+        recent = self._filter_by_retrieval_policy(recent)
+        recent = self._filter_frozen_personas(recent, excluded_personas or set())
+        recent = self._isolate_persona_memory(
+            recent, self_id, isolate_persona_memory
+        )
+        return recent[:count]
 
     async def _merge_recent_memories(
         self,
@@ -266,6 +351,9 @@ class MemorySearchService:
         session_id: str | None,
         persona_id: str | None,
         db_connection,
+        excluded_personas: set[str] | None = None,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         recent_count = min(
             max(0, int(self.config.get("recent_memory_count", 0))),
@@ -279,6 +367,9 @@ class MemorySearchService:
             session_id,
             persona_id,
             db_connection,
+            excluded_personas=excluded_personas,
+            self_id=self_id,
+            isolate_persona_memory=isolate_persona_memory,
         )
         if not recent:
             return results[:k]

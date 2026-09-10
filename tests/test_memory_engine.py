@@ -14,6 +14,7 @@ import pytest
 from livingmemory_cm.core.managers.memory_engine import MemoryEngine
 from livingmemory_cm.core.models.memory_atom import MemoryAtom
 from livingmemory_cm.storage.atom_store import AtomStore
+from livingmemory_cm.storage.freeze_store import FreezeStore
 
 
 @dataclass
@@ -1422,4 +1423,67 @@ async def test_batch_delete_faiss_failure_continues(tmp_path: Path):
         row = await cursor.fetchone()
         assert row[0] == 0
 
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_engine_search_fails_closed_when_freeze_state_unreadable(
+    tmp_path: Path,
+):
+    """冻结名单读不到时放弃本轮召回，而不是按"未冻结"继续（也不能抛 NameError）。"""
+    store_path = tmp_path / "frozen_personas.json"
+    store_path.write_text("{ broken", encoding="utf-8")
+    engine = MemoryEngine(
+        db_path=str(tmp_path / "memory_freeze.db"),
+        faiss_db=_FakeFaissDB(),
+        config={},
+        freeze_store=FreezeStore(store_path),
+    )
+    await engine.initialize()
+    await engine.add_memory(
+        content="正常记忆",
+        session_id="s",
+        persona_id="p",
+        importance=0.9,
+    )
+
+    results = await engine.search_memories("正常记忆", k=5, session_id="s")
+
+    assert results == []
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_engine_search_excludes_frozen_persona(tmp_path: Path):
+    """冻结 persona 的记忆不进入召回结果。"""
+    store = FreezeStore(tmp_path / "frozen_personas.json")
+    await store.freeze("persona_frozen")
+    engine = MemoryEngine(
+        db_path=str(tmp_path / "memory_freeze_ok.db"),
+        faiss_db=_FakeFaissDB(),
+        config={},
+        freeze_store=store,
+    )
+    await engine.initialize()
+    await engine.add_memory(
+        content="冻结人格记忆",
+        session_id="s",
+        persona_id="persona_frozen",
+        importance=0.9,
+    )
+    await engine.add_memory(
+        content="正常人格记忆",
+        session_id="s",
+        persona_id="persona_live",
+        importance=0.9,
+    )
+
+    results = await engine.search_memories("记忆", k=5, session_id="s")
+    personas = {
+        item.metadata.get("persona_id")
+        for item in results
+        if isinstance(item.metadata, dict)
+    }
+
+    assert "persona_frozen" not in personas
     await engine.close()

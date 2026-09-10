@@ -13,6 +13,7 @@ from typing import Any
 
 import aiosqlite
 
+from ...log import logger, tag
 from ...storage.atom_store import AtomStore
 from ...storage.graph_store import GraphStore
 from ..memory import (
@@ -79,6 +80,7 @@ class MemoryEngine:
         graph_vector_db=None,
         llm_provider=None,
         config: dict[str, Any] | None = None,
+        freeze_store=None,
     ):
         """
         初始化记忆引擎
@@ -98,6 +100,8 @@ class MemoryEngine:
         self.graph_vector_db = graph_vector_db
         self.llm_provider = llm_provider
         self.config = config or {}
+        # 冻结（冷存储）状态：冻结中的 persona 不召回，且清理任务跳过
+        self.freeze_store = freeze_store
         self.graph_enabled = bool(self.config.get("graph_memory_enabled", False))
         self.atom_enabled = bool(
             self.config.get(
@@ -310,6 +314,7 @@ class MemoryEngine:
             config=self.config,
             batch_delete_memories=self.batch_delete_memories,
             invalidate_search_cache=self._invalidate_search_cache,
+            freeze_store=self.freeze_store,
         )
 
     def _build_repair_context(self) -> MemoryRepairContext:
@@ -476,6 +481,8 @@ class MemoryEngine:
         k: int = 5,
         session_id: str | None = None,
         persona_id: str | None = None,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         """
         检索相关记忆
@@ -485,21 +492,47 @@ class MemoryEngine:
             k: 返回数量
             session_id: 会话ID过滤(可选,应传入unified_msg_origin完整格式)
             persona_id: 人格ID过滤(可选)
+            self_id: 当前 Bot 的 self_id（persona 记忆隔离，可选）
+            isolate_persona_memory: 是否排除其他 Bot 写入的记忆（旧数据无 self_id 保留）
 
         Returns:
             List[HybridResult]: 检索结果列表
+
+        Raises:
+            FreezeStateUnreadable: 冻结状态文件存在但不可读时，本轮按 fail-closed
+                放弃召回（宁可不注入，也不把冻结 persona 的记忆送进上下文）。
         """
+        excluded_personas: set[str] = set()
+        if self.freeze_store is not None:
+            try:
+                excluded_personas = await self.freeze_store.frozen_personas()
+            except Exception as exc:
+                logger.error(
+                    f"{tag('engine')} 读取冻结 persona 列表失败，本轮放弃记忆召回"
+                    f"（fail-closed，先修复冻结状态文件）: {exc}"
+                )
+                return []
         return await self._search_service.search(
             query=query,
             k=k,
             session_id=session_id,
             persona_id=persona_id,
+            self_id=self_id,
+            isolate_persona_memory=isolate_persona_memory,
+            exclude_personas=excluded_personas,
             hybrid_retriever=self.hybrid_retriever,
             dual_route_retriever=self.dual_route_retriever,
             schedule_task=self._create_tracked_task,
             update_access_time=self._update_access_time_internal,
             migrate_session=self._migrate_session_data_if_needed,
             db_connection=self.db_connection,
+        )
+
+    async def refresh_persona_access_time(self, persona_id: str) -> int:
+        """解冻时刷新该 persona 记忆的访问时间（唤醒保护）。"""
+        return await self._lifecycle_service.refresh_persona_access_time(
+            self._build_lifecycle_context(),
+            persona_id,
         )
 
     async def get_memory(self, memory_id: int) -> dict[str, Any] | None:

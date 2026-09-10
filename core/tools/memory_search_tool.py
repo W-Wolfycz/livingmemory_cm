@@ -110,28 +110,51 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
 
             limited_k = max(1, min(requested_k_int, max_k))
 
+            try:
+                bot_self_id = event.get_self_id() or ""
+            except Exception:
+                bot_self_id = ""
+
             memories = await self.memory_engine.search_memories(
                 query=cleaned_query,
                 k=limited_k,
                 session_id=recall_session_id,
                 persona_id=recall_persona_id,
+                self_id=bot_self_id,
+                isolate_persona_memory=bool(
+                    self.config_manager.get(
+                        "recall_engine.isolate_persona_memory", True
+                    )
+                ),
             )
 
-            serialized_results = []
-            for memory in memories:
-                metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-                serialized_results.append(
-                    {
-                        "id": memory.doc_id,
-                        "content": memory.content,
-                        "score": memory.final_score,
-                        "importance": metadata.get("importance"),
-                        "session_id": metadata.get("session_id"),
-                        "persona_id": metadata.get("persona_id"),
-                        "create_time": metadata.get("create_time"),
-                        "last_access_time": metadata.get("last_access_time"),
-                    }
-                )
+            serialized_results = [
+                {
+                    "id": memory.doc_id,
+                    "content": memory.content,
+                    "score": memory.final_score,
+                    "importance": memory.metadata.get("importance")
+                    if isinstance(memory.metadata, dict)
+                    else None,
+                    "session_id": memory.metadata.get("session_id")
+                    if isinstance(memory.metadata, dict)
+                    else None,
+                    "persona_id": memory.metadata.get("persona_id")
+                    if isinstance(memory.metadata, dict)
+                    else None,
+                    "create_time": memory.metadata.get("create_time")
+                    if isinstance(memory.metadata, dict)
+                    else None,
+                    "last_access_time": memory.metadata.get("last_access_time")
+                    if isinstance(memory.metadata, dict)
+                    else None,
+                }
+                for memory in memories
+            ]
+            logger.debug(
+                f"{tag('tool')} 记忆工具检索成功: query_len={len(cleaned_query)}, "
+                f"count={len(serialized_results)}"
+            )
 
             return _json_result(
                 {

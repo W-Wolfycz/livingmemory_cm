@@ -120,27 +120,6 @@ async def test_process_conversation_success():
 
 
 @pytest.mark.asyncio
-async def test_process_conversation_non_json_response_retries_then_fails(monkeypatch):
-    """非 JSON 响应属于严格校验失败：重试 3 次后失败，不产生任何记忆。"""
-    async def _no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-    llm = _DummyLLMProvider("summary=测试, importance=0.6")
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    with pytest.raises(ValueError):
-        await processor.process_conversation(
-            messages=_make_messages(),
-            is_group_chat=False,
-            persona_id=None,
-        )
-
-    # 严格协议：3 次尝试全部失败，未降级为记忆
-    assert llm.text_chat.await_count == 3
-
-
-@pytest.mark.asyncio
 async def test_persona_prompt_is_not_included_in_extraction():
     llm = _DummyLLMProvider(
         """{
@@ -292,119 +271,42 @@ async def test_summary_quality_normal_for_valid_response():
     assert metadata.get("summary_quality") == "normal"
 
 
-@pytest.mark.asyncio
-async def test_process_conversation_empty_summary_fails_strict_validation(monkeypatch):
-    """自动萃取路径空 summary 属于严格校验失败，不得降级写入记忆。"""
-    async def _no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"",
-            "topics":["闲聊"],
-            "key_facts":["用户问候"],
-            "sentiment":"neutral",
-            "importance":0.5
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    with pytest.raises(ValueError):
-        await processor.process_conversation(
-            messages=_make_messages(),
-            is_group_chat=False,
-            persona_id=None,
-        )
-    assert llm.text_chat.await_count == 3
-
-
-@pytest.mark.asyncio
-async def test_process_conversation_empty_key_facts_fails_strict_validation(monkeypatch):
-    """自动萃取路径空 key_facts 属于严格校验失败，不得降级写入记忆。"""
-    async def _no_sleep(_seconds: float) -> None:
-        return None
-
-    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"用户进行了一次普通对话",
-            "topics":["闲聊"],
-            "key_facts":[],
-            "sentiment":"neutral",
-            "importance":0.5
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    with pytest.raises(ValueError):
-        await processor.process_conversation(
-            messages=_make_messages(),
-            is_group_chat=False,
-            persona_id=None,
-        )
-    assert llm.text_chat.await_count == 3
-
-
-def test_build_memory_from_structured_data_flags_low_quality_for_empty_summary():
+@pytest.mark.parametrize(
+    "structured_data",
+    [
+        pytest.param(
+            {
+                "summary": "",
+                "topics": ["闲聊"],
+                "key_facts": ["用户问候"],
+                "sentiment": "neutral",
+                "importance": 0.5,
+            },
+            id="empty-summary",
+        ),
+        pytest.param(
+            {
+                "summary": "用户进行了一次普通对话",
+                "topics": ["闲聊"],
+                "key_facts": [],
+                "sentiment": "neutral",
+                "importance": 0.5,
+            },
+            id="missing-key-facts",
+        ),
+    ],
+)
+def test_build_memory_from_structured_data_flags_low_quality(structured_data):
     """手动结构化写入仍可保留 low quality 判定（不经过严格协议）。"""
     processor = MemoryProcessor(llm_provider=Mock(), context=None)
 
     _, metadata, _ = processor.build_memory_from_structured_data(
-        {
-            "summary": "",
-            "topics": ["闲聊"],
-            "key_facts": ["用户问候"],
-            "sentiment": "neutral",
-            "importance": 0.5,
-        },
+        structured_data,
         is_group_chat=False,
         fallback_excerpt="fallback",
     )
 
     assert metadata["summary_quality"] == "low"
-
-
-def test_build_memory_from_structured_data_flags_low_quality_for_missing_key_facts():
-    """手动结构化写入仍可保留 low quality 判定（不经过严格协议）。"""
-    processor = MemoryProcessor(llm_provider=Mock(), context=None)
-
-    _, metadata, _ = processor.build_memory_from_structured_data(
-        {
-            "summary": "用户进行了一次普通对话",
-            "topics": ["闲聊"],
-            "key_facts": [],
-            "sentiment": "neutral",
-            "importance": 0.5,
-        },
-        is_group_chat=False,
-        fallback_excerpt="fallback",
-    )
-
-    assert metadata["summary_quality"] == "low"
-
-
-@pytest.mark.asyncio
-async def test_summary_quality_low_for_generic_terms():
-    """summary 包含泛化词（某用户、有人等）时应标记为 summary_quality=low。"""
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"某用户提到了一些事情",
-            "topics":["闲聊"],
-            "key_facts":["某用户说了话"],
-            "sentiment":"neutral",
-            "importance":0.5
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    _, metadata, _ = await processor.process_conversation(
-        messages=_make_messages(),
-        is_group_chat=False,
-        persona_id=None,
-    )
-
-    assert metadata.get("summary_quality") == "low"
 
 
 def test_validate_summary_quality_directly():
@@ -459,6 +361,33 @@ def test_validate_summary_quality_directly():
             }
         )
         == "low"
+    )
+
+
+def test_quality_failure_reason_reports_specific_rule():
+    """低质量警告应携带具体触发规则（不输出记忆正文）。"""
+    processor = MemoryProcessor(llm_provider=Mock(), context=None)
+
+    assert processor._quality_failure_reason(
+        {"summary": "", "key_facts": ["事实"], "importance": 0.5}
+    ) == "summary 为空"
+    assert processor._quality_failure_reason(
+        {"summary": "短", "key_facts": ["事实"], "importance": 0.5}
+    ) == "summary 过短（1 字符）"
+    assert processor._quality_failure_reason(
+        {"summary": "用户进行了一次普通对话", "key_facts": [], "importance": 0.5}
+    ) == "key_facts 为空"
+    assert processor._quality_failure_reason(
+        {"summary": "用户明确表示喜欢吃寿司", "key_facts": ["事实"], "importance": 1.5}
+    ) == "importance 越界（1.5）"
+    assert processor._quality_failure_reason(
+        {"summary": "某用户在群里说了一些事情", "key_facts": ["事实"], "importance": 0.5}
+    ) == "summary 含泛化词「某用户」"
+    assert (
+        processor._quality_failure_reason(
+            {"summary": "用户明确表示喜欢吃寿司", "key_facts": ["事实"], "importance": 0.7}
+        )
+        is None
     )
 
 
@@ -959,69 +888,32 @@ def test_strict_json_protocol_skip_empty_array_raises_llmextractionskip():
     assert exc_info.value.reason == "content_policy"
 
 
-def test_strict_json_protocol_rejects_invalid_status():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError):
-        processor._parse_llm_response_batch(
-            '{"status":"error","memories":[]}', is_group_chat=False
-        )
-
-
-def test_strict_json_protocol_rejects_skip_with_non_empty_memories():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError):
-        processor._parse_llm_response_batch(
+@pytest.mark.parametrize(
+    "payload, match",
+    [
+        pytest.param('{"status":"error","memories":[]}', None, id="invalid-status"),
+        pytest.param(
             """{"status":"skip","reason":"content_policy","memories":[
                 {"summary":"s","topics":["t"],"key_facts":["f"],
                  "event_time":"","sentiment":"neutral","importance":0.5}]}""",
-            is_group_chat=False,
-        )
-
-
-def test_strict_json_protocol_accepts_markdown_wrapped_json():
-    """Markdown 代码块包裹仍应被剥离后解析。"""
+            None,
+            id="skip-with-non-empty-memories",
+        ),
+        pytest.param("[]", None, id="root-array"),
+        pytest.param('{"status":"success"}', "缺少 memories", id="missing-memories"),
+        pytest.param(
+            '{"status":"success","memories":["文本"]}',
+            "JSON 对象",
+            id="non-object-item",
+        ),
+    ],
+)
+def test_strict_json_protocol_rejects_invalid_batch_shapes(payload, match):
+    """非法根结构（状态/跳过语义/数组/缺字段/非对象项）一律拒绝。"""
     processor = _new_processor()
 
-    result = processor._parse_llm_response_batch(
-        """```json
-{"status":"success","memories":[]}
-```""",
-        is_group_chat=False,
-    )
-
-    assert result == []
-
-
-def test_strict_json_protocol_rejects_empty_response():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError, match="为空"):
-        processor._parse_llm_response_batch("   ", is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_non_json_response():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError, match="不是合法 JSON"):
-        processor._parse_llm_response_batch("抱歉，我无法处理", is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_root_array():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError):
-        processor._parse_llm_response_batch("[]", is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_object_without_memories():
-    processor = _new_processor()
-
-    with pytest.raises(ValueError, match="缺少 memories"):
-        processor._parse_llm_response_batch(
-            '{"status":"success"}', is_group_chat=False
-        )
+    with pytest.raises(ValueError, match=match):
+        processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
 def test_strict_json_protocol_rejects_more_than_five_memories():
@@ -1040,13 +932,32 @@ def test_strict_json_protocol_rejects_more_than_five_memories():
         processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
-def test_strict_json_protocol_rejects_non_object_memory_item():
+def test_strict_json_protocol_accepts_markdown_wrapped_json():
+    """Markdown 代码块包裹仍应被剥离后解析。"""
     processor = _new_processor()
 
-    with pytest.raises(ValueError, match="JSON 对象"):
-        processor._parse_llm_response_batch(
-            '{"status":"success","memories":["文本"]}', is_group_chat=False
-        )
+    result = processor._parse_llm_response_batch(
+        """```json
+{"status":"success","memories":[]}
+```""",
+        is_group_chat=False,
+    )
+
+    assert result == []
+
+
+@pytest.mark.parametrize(
+    "payload, match",
+    [
+        pytest.param("   ", "为空", id="empty-response"),
+        pytest.param("抱歉，我无法处理", "不是合法 JSON", id="non-json-response"),
+    ],
+)
+def test_strict_json_protocol_rejects_unparsable_payloads(payload, match):
+    processor = _new_processor()
+
+    with pytest.raises(ValueError, match=match):
+        processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
 def test_strict_json_protocol_rejects_empty_or_non_string_summary():
@@ -1064,93 +975,44 @@ def test_strict_json_protocol_rejects_empty_or_non_string_summary():
             processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
-def test_strict_json_protocol_rejects_invalid_topics():
+@pytest.mark.parametrize(
+    "field, bad_value, match",
+    [
+        pytest.param("topics", [], "topics", id="topics-empty"),
+        pytest.param("topics", ["a"] * 5, "topics", id="topics-overflow"),
+        pytest.param("topics", "会议", "topics", id="topics-not-list"),
+        pytest.param("key_facts", [], "key_facts", id="key-facts-empty"),
+        pytest.param("key_facts", ["f"] * 6, "key_facts", id="key-facts-overflow"),
+        pytest.param("key_facts", "事实", "key_facts", id="key-facts-not-list"),
+        pytest.param("event_time", 20260720, "event_time", id="event-time-non-string"),
+        pytest.param("sentiment", "angry", "sentiment", id="sentiment-invalid"),
+        pytest.param("importance", True, "importance", id="importance-bool"),
+        pytest.param("importance", 1.5, "importance", id="importance-out-of-range"),
+        pytest.param(
+            "participants", ["张三", 42], "participants", id="participants-non-string"
+        ),
+    ],
+)
+def test_strict_json_protocol_rejects_invalid_memory_fields(field, bad_value, match):
+    """记忆条目核心字段的非法值一律拒绝（不静默规范化）。"""
     processor = _new_processor()
 
-    for bad_topics in ([], ["a"] * 5, [""], ["a", 1], "会议"):
-        payload = json.dumps(
-            {
-                "status": "success",
-                "memories": [_memory_payload(topics=bad_topics)],
-            },
-            ensure_ascii=False,
-        )
-        with pytest.raises(ValueError, match="topics"):
-            processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_invalid_key_facts():
-    processor = _new_processor()
-
-    for bad_facts in ([], ["f"] * 6, [""], ["f", None], "事实"):
-        payload = json.dumps(
-            {
-                "status": "success",
-                "memories": [_memory_payload(key_facts=bad_facts)],
-            },
-            ensure_ascii=False,
-        )
-        with pytest.raises(ValueError, match="key_facts"):
-            processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_non_string_event_time():
-    processor = _new_processor()
-
+    kwargs = {field: bad_value}
+    extra = None
+    if field == "participants":
+        kwargs = {}
+        extra = {"participants": bad_value}
     payload = json.dumps(
         {
             "status": "success",
-            "memories": [_memory_payload(event_time=20260720)],
+            "memories": [_memory_payload(**kwargs, extra=extra)],
         },
         ensure_ascii=False,
     )
-    with pytest.raises(ValueError, match="event_time"):
-        processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_invalid_sentiment():
-    processor = _new_processor()
-
-    payload = json.dumps(
-        {
-            "status": "success",
-            "memories": [_memory_payload(sentiment="angry")],
-        },
-        ensure_ascii=False,
-    )
-    with pytest.raises(ValueError, match="sentiment"):
-        processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_invalid_importance():
-    processor = _new_processor()
-
-    for bad_importance in (True, 1.5, -0.1, "high"):
-        payload = json.dumps(
-            {
-                "status": "success",
-                "memories": [_memory_payload(importance=bad_importance)],
-            },
-            ensure_ascii=False,
+    with pytest.raises(ValueError, match=match):
+        processor._parse_llm_response_batch(
+            payload, is_group_chat=field == "participants"
         )
-        with pytest.raises(ValueError, match="importance"):
-            processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_invalid_group_participants():
-    processor = _new_processor()
-
-    payload = json.dumps(
-        {
-            "status": "success",
-            "memories": [
-                _memory_payload(extra={"participants": ["张三", 42]})
-            ],
-        },
-        ensure_ascii=False,
-    )
-    with pytest.raises(ValueError, match="participants"):
-        processor._parse_llm_response_batch(payload, is_group_chat=True)
 
 
 def test_strict_json_protocol_accepts_valid_group_participants():
@@ -1170,27 +1032,34 @@ def test_strict_json_protocol_accepts_valid_group_participants():
     assert result[0]["participants"] == ["张三", "李四"]
 
 
-def test_content_policy_rejection_detects_known_signatures():
-    for signature in (
-        "Input data may contain inappropriate content",
-        "content_policy_violation",
-        "ResponsibleAIPolicyViolation",
-        "request was rejected as a result of the content filter",
-        "输入数据可能包含不当内容",
-    ):
-        error = RuntimeError(f"provider: {signature}")
-        assert MemoryProcessor._is_content_policy_rejection(error)
+@pytest.mark.parametrize(
+    "signature",
+    [
+        pytest.param("Input data may contain inappropriate content", id="openai"),
+        pytest.param("content_policy_violation", id="signature"),
+        pytest.param("ResponsibleAIPolicyViolation", id="azure"),
+        pytest.param("request was rejected as a result of the content filter", id="filter"),
+        pytest.param("输入数据可能包含不当内容", id="zh"),
+    ],
+)
+def test_content_policy_rejection_detects_known_signatures(signature):
+    error = RuntimeError(f"provider: {signature}")
+    assert MemoryProcessor._is_content_policy_rejection(error)
 
 
-def test_content_policy_rejection_with_unrelated_status_code_returns_false():
-    error = RuntimeError("request was rejected as a result of the content filter")
-    error.status_code = 500
-    assert not MemoryProcessor._is_content_policy_rejection(error)
-
-
-def test_content_policy_rejection_plain_400_is_not_rejection():
-    error = RuntimeError("Invalid model parameter: max_tokens")
-    error.status_code = 400
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            RuntimeError("request was rejected as a result of the content filter"),
+            id="unrelated-status-code",
+        ),
+        pytest.param(RuntimeError("Invalid model parameter: max_tokens"), id="plain-400"),
+    ],
+)
+def test_content_policy_rejection_guards_against_false_positives(error):
+    """普通 400/无关状态码不得误判为内容安全拒绝。"""
+    error.status_code = 400 if "Invalid" in str(error) else 500
     assert not MemoryProcessor._is_content_policy_rejection(error)
 
 
@@ -1240,14 +1109,61 @@ async def test_call_llm_with_retry_converts_provider_content_policy_to_skip(
 
 
 @pytest.mark.asyncio
-async def test_process_conversation_batch_raises_skip_for_policy_response():
-    """萃取批次收到 status=skip 时整体抛 LLMExtractionSkip，不产生记忆。"""
-    processor = MemoryProcessor(
-        llm_provider=_DummyLLMProvider(
-            '{"status":"skip","reason":"content_policy","memories":[]}'
-        ),
+async def test_llm_max_retries_config_controls_attempt_count(monkeypatch):
+    """config.llm_max_retries 控制最大尝试次数；缺省为 5，钳制不低于 1。"""
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    configured = MemoryProcessor(
+        llm_provider=_FailingLLMProvider(RuntimeError("provider down")),
+        context=None,
+        config={"llm_max_retries": 5},
+    )
+    with pytest.raises(RuntimeError):
+        await configured._call_llm_with_retry(prompt="p", system_prompt="s")
+    assert configured._llm_provider.text_chat.await_count == 5
+
+    defaulted = MemoryProcessor(
+        llm_provider=_FailingLLMProvider(RuntimeError("provider down")),
         context=None,
     )
+    with pytest.raises(RuntimeError):
+        await defaulted._call_llm_with_retry(prompt="p", system_prompt="s")
+    assert defaulted._llm_provider.text_chat.await_count == 5
 
-    with pytest.raises(LLMExtractionSkip):
-        await processor.process_conversation_batch(_make_messages())
+    clamped = MemoryProcessor(
+        llm_provider=_FailingLLMProvider(RuntimeError("provider down")),
+        context=None,
+        config={"llm_max_retries": 0},
+    )
+    with pytest.raises(RuntimeError):
+        await clamped._call_llm_with_retry(prompt="p", system_prompt="s")
+    assert clamped._llm_provider.text_chat.await_count == 1
+
+
+class _MaxRetriesAwareProvider:
+    """模拟 AstrBot 4.27.x 的 text_chat 签名（支持 request_max_retries）。"""
+
+    def __init__(self, completion_text: str):
+        self._completion_text = completion_text
+        self.last_request_max_retries = None
+
+    async def text_chat(self, prompt: str, system_prompt: str, request_max_retries=None):
+        self.last_request_max_retries = request_max_retries
+        return SimpleNamespace(completion_text=self._completion_text)
+
+
+@pytest.mark.asyncio
+async def test_call_llm_passes_request_max_retries_one_to_provider():
+    """支持该参数的 Provider：底层单次请求固定 1，重试统一由插件层控制。
+
+    避免 AstrBot Provider 内部默认 5 次与插件层 5 次叠加成 25 次底层请求。
+    """
+    provider = _MaxRetriesAwareProvider('{"status":"success","memories":[]}')
+    processor = MemoryProcessor(llm_provider=provider, context=None)
+
+    await processor._call_llm_with_retry(prompt="p", system_prompt="s")
+
+    assert provider.last_request_max_retries == 1

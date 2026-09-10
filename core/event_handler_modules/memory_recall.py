@@ -5,7 +5,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ...log import log_ref, logger, tag, tag_event
 from ..reflection import ReflectionService
@@ -27,6 +27,36 @@ if TYPE_CHECKING:
     from ..managers.memory_engine import MemoryEngine
     from ..utils.injection_adapter import InjectionAdapter
     from .message_utils import MessageUtils
+
+
+DEFAULT_SEARCH_TIMEOUT_SECONDS = 5.0
+
+
+def _resolve_search_timeout(config_manager) -> float:
+    """解析召回超时配置；缺键或脏值回落默认 5 秒（而不是关掉保护）。
+
+    只有显式的 0/负值才表示"不限时"。
+    """
+    raw = config_manager.get(
+        "recall_engine.search_timeout_seconds", DEFAULT_SEARCH_TIMEOUT_SECONDS
+    )
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SEARCH_TIMEOUT_SECONDS
+
+
+def _consume_detached_task(task: asyncio.Task) -> None:
+    """吞掉被取消/已放弃任务的最终结果，避免 "exception was never retrieved"。
+
+    超时路径不再等待检索协程真正结束，其取消后的异常只能在这里取走。
+    """
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        pass
 
 
 class MemoryRecall:
@@ -146,17 +176,30 @@ class MemoryRecall:
                         f"回退当前发言: {e}"
                     )
 
-                # 执行记忆召回
+                # 执行记忆召回（带超时降级：embedding 检索卡住时跳过注入，
+                # 不阻塞主链路 LLM 请求）
                 logger.debug(
                     f"{tag('recall')} [{session_ref}] 开始记忆召回，"
                     f"查询长度={len(query_for_search)}"
                 )
 
-                recalled_memories = await self.memory_engine.search_memories(
+                try:
+                    bot_self_id = event.get_self_id() or ""
+                except Exception:
+                    bot_self_id = ""
+
+                recalled_memories = await self._search_memories_guarded(
+                    session_ref=session_ref,
                     query=query_for_search,
                     k=self.config_manager.get("recall_engine.top_k", 5),
                     session_id=recall_session_id,
                     persona_id=recall_persona_id,
+                    self_id=bot_self_id,
+                    isolate_persona_memory=bool(
+                        self.config_manager.get(
+                            "recall_engine.isolate_persona_memory", True
+                        )
+                    ),
                 )
 
                 if recalled_memories:
@@ -262,6 +305,57 @@ class MemoryRecall:
             raise
         except Exception as e:
             logger.error(f"{tag('recall')} 处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+
+    async def _search_memories_guarded(
+        self,
+        *,
+        session_ref: str,
+        query: str,
+        k: int,
+        session_id: str,
+        persona_id: str | None,
+        self_id: str | None = None,
+        isolate_persona_memory: bool = True,
+    ) -> list[Any]:
+        """带超时的记忆召回：embedding 检索卡住时降级为空结果。
+
+        本方法运行在主链路 ``on_llm_request`` 内，embedding Provider 挂起时
+        AstrBot 底层会按自身重试策略等待（最坏 5×30s），足以拖住用户 @bot 的
+        回复。这里按 ``recall_engine.search_timeout_seconds`` 施加硬上限（0 或
+        非正值=不限时），超时取消检索并跳过注入。
+
+        超时判定用"本层等待是否到点"而不是捕获 ``TimeoutError``：Python 3.11+
+        ``asyncio.TimeoutError is TimeoutError``，检索链内部（socket/内层
+        wait_for）抛出的超时会和本层超时混为一谈，把真实故障伪装成"召回超时"。
+        把检索放进独立 task 后，只有"task 没在时限内完成"才算本层超时，检索
+        自身的异常一律原样上抛。
+        """
+        timeout = _resolve_search_timeout(self.config_manager)
+
+        search_coro = self.memory_engine.search_memories(
+            query=query,
+            k=k,
+            session_id=session_id,
+            persona_id=persona_id,
+            self_id=self_id,
+            isolate_persona_memory=isolate_persona_memory,
+        )
+        if timeout <= 0:
+            return await search_coro
+
+        task = asyncio.ensure_future(search_coro)
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            return task.result()
+
+        # 到点即取消并返回，不等待对方配合取消（避免被不响应取消的实现拖住）
+        task.cancel()
+        task.add_done_callback(_consume_detached_task)
+        logger.warning(
+            f"{tag('recall')} [{session_ref}] 记忆召回超时（>{timeout:.1f}s），"
+            "跳过本轮注入，不阻塞主请求"
+        )
+        return []
 
     async def _build_recall_query(
         self,

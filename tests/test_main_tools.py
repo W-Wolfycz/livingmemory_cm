@@ -1,10 +1,13 @@
 """Tests for plugin LLM tool registration."""
 
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from livingmemory_cm.core.base.config_manager import ConfigManager
-from livingmemory_cm.core.tools import MemoryMemorizeTool, MemorySearchTool
+from livingmemory_cm.core.tools import MemorySearchTool
 from livingmemory_cm.main import (
     LivingMemoryCMPlugin,
     _parse_version,
@@ -75,32 +78,7 @@ def test_distribution_metadata_and_required_notices_are_consistent():
 
 
 def test_register_llm_tools_is_idempotent():
-    plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
-    plugin.context = Mock()
-    plugin.config_manager = ConfigManager(
-        {"agent_tools": {"enable_recall_tool": True, "enable_memorize_tool": True}}
-    )
-    plugin.initializer = Mock()
-    plugin.initializer.memory_engine = Mock()
-    plugin.initializer.memory_processor = Mock()
-    plugin._llm_tools_registered = False
-
-    plugin._register_agent_tools_if_needed()
-    plugin._register_agent_tools_if_needed()
-
-    plugin.context.add_llm_tools.assert_called_once()
-    tools = plugin.context.add_llm_tools.call_args.args
-    tools_by_name = {tool.name: tool for tool in tools}
-    assert set(tools_by_name) == {
-        "recall_long_term_memory",
-        "memorize_long_term_memory",
-    }
-    assert isinstance(tools_by_name["recall_long_term_memory"], MemorySearchTool)
-    assert isinstance(tools_by_name["memorize_long_term_memory"], MemoryMemorizeTool)
-    assert plugin._llm_tools_registered is True
-
-
-def test_register_llm_tools_defaults_only_recall():
+    """Agent 检索工具恒开；重复调用只注册一次。"""
     plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
     plugin.context = Mock()
     plugin.config_manager = ConfigManager()
@@ -109,6 +87,7 @@ def test_register_llm_tools_defaults_only_recall():
     plugin.initializer.memory_processor = Mock()
     plugin._llm_tools_registered = False
 
+    plugin._register_agent_tools_if_needed()
     plugin._register_agent_tools_if_needed()
 
     plugin.context.add_llm_tools.assert_called_once()
@@ -118,88 +97,46 @@ def test_register_llm_tools_defaults_only_recall():
     assert plugin._llm_tools_registered is True
 
 
-def test_register_llm_tools_no_memory_engine():
+@pytest.mark.parametrize(
+    "engine_ready, processor_ready, expected_registered",
+    [
+        pytest.param(False, True, False, id="no-memory-engine"),
+        pytest.param(True, False, False, id="no-memory-processor"),
+    ],
+)
+def test_register_llm_tools_requires_core_components(
+    engine_ready, processor_ready, expected_registered
+):
     plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
     plugin.context = Mock()
     plugin.config_manager = ConfigManager()
     plugin.initializer = Mock()
-    plugin.initializer.memory_engine = None
-    plugin.initializer.memory_processor = Mock()
+    plugin.initializer.memory_engine = Mock() if engine_ready else None
+    plugin.initializer.memory_processor = Mock() if processor_ready else None
     plugin._llm_tools_registered = False
 
     plugin._register_agent_tools_if_needed()
 
     plugin.context.add_llm_tools.assert_not_called()
-    assert plugin._llm_tools_registered is False
+    assert plugin._llm_tools_registered is expected_registered
 
 
-def test_register_llm_tools_no_memory_processor():
+@pytest.mark.asyncio
+async def test_handle_session_reset_accepts_new_and_legacy_signals():
+    """/reset、/new：接受 AstrBot 4.27.x 新信号与旧信号，无信号时跳过。"""
     plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
-    plugin.context = Mock()
-    plugin.config_manager = ConfigManager()
-    plugin.initializer = Mock()
-    plugin.initializer.memory_engine = Mock()
-    plugin.initializer.memory_processor = None
-    plugin._llm_tools_registered = False
+    plugin._ensure_plugin_ready = AsyncMock(return_value=(True, None))
+    handler = SimpleNamespace(handle_session_reset=AsyncMock())
+    plugin.event_handler = handler
 
-    plugin._register_agent_tools_if_needed()
+    def _event(extra: str | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            get_extra=lambda key, default=False: key == extra
+        )
 
-    plugin.context.add_llm_tools.assert_not_called()
-    assert plugin._llm_tools_registered is False
+    await plugin.handle_session_reset(_event("_clean_group_context_session"))
+    await plugin.handle_session_reset(_event("_clean_ltm_session"))
+    assert handler.handle_session_reset.await_count == 2
 
-
-def test_register_llm_tools_respects_recall_tool_disabled():
-    plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
-    plugin.context = Mock()
-    plugin.config_manager = ConfigManager(
-        {"agent_tools": {"enable_recall_tool": False, "enable_memorize_tool": True}}
-    )
-    plugin.initializer = Mock()
-    plugin.initializer.memory_engine = Mock()
-    plugin.initializer.memory_processor = Mock()
-    plugin._llm_tools_registered = False
-
-    plugin._register_agent_tools_if_needed()
-
-    plugin.context.add_llm_tools.assert_called_once()
-    tools = plugin.context.add_llm_tools.call_args.args
-    assert [tool.name for tool in tools] == ["memorize_long_term_memory"]
-    assert isinstance(tools[0], MemoryMemorizeTool)
-    assert plugin._llm_tools_registered is True
-
-
-def test_register_llm_tools_respects_memorize_tool_disabled():
-    plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
-    plugin.context = Mock()
-    plugin.config_manager = ConfigManager(
-        {"agent_tools": {"enable_recall_tool": True, "enable_memorize_tool": False}}
-    )
-    plugin.initializer = Mock()
-    plugin.initializer.memory_engine = Mock()
-    plugin.initializer.memory_processor = Mock()
-    plugin._llm_tools_registered = False
-
-    plugin._register_agent_tools_if_needed()
-
-    plugin.context.add_llm_tools.assert_called_once()
-    tools = plugin.context.add_llm_tools.call_args.args
-    assert [tool.name for tool in tools] == ["recall_long_term_memory"]
-    assert isinstance(tools[0], MemorySearchTool)
-    assert plugin._llm_tools_registered is True
-
-
-def test_register_llm_tools_respects_all_tools_disabled():
-    plugin = LivingMemoryCMPlugin.__new__(LivingMemoryCMPlugin)
-    plugin.context = Mock()
-    plugin.config_manager = ConfigManager(
-        {"agent_tools": {"enable_recall_tool": False, "enable_memorize_tool": False}}
-    )
-    plugin.initializer = Mock()
-    plugin.initializer.memory_engine = Mock()
-    plugin.initializer.memory_processor = Mock()
-    plugin._llm_tools_registered = False
-
-    plugin._register_agent_tools_if_needed()
-
-    plugin.context.add_llm_tools.assert_not_called()
-    assert plugin._llm_tools_registered is True
+    await plugin.handle_session_reset(_event(None))
+    assert handler.handle_session_reset.await_count == 2

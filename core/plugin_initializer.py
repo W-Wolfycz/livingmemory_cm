@@ -14,6 +14,7 @@ from astrbot.core.provider.provider import EmbeddingProvider, Provider
 
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
+from ..storage.freeze_store import FreezeStore
 from .base.config_manager import ConfigManager
 from .base.exceptions import InitializationError, ProviderNotReadyError
 from .bootstrap import (
@@ -501,12 +502,14 @@ class PluginInitializer:
                 ),
             }
 
+            freeze_store = FreezeStore(data_dir_path / "frozen_personas.json")
             self.memory_engine = MemoryEngine(
                 db_path=str(db_path),
                 faiss_db=self.db,
                 graph_vector_db=self.graph_db,
                 llm_provider=self.llm_provider,
                 config=memory_engine_config,
+                freeze_store=freeze_store,
             )
             await self.memory_engine.initialize()
             logger.info(f"{tag('init')} MemoryEngine 已初始化")
@@ -530,6 +533,9 @@ class PluginInitializer:
                 llm_provider=llm_id if llm_id else None,
                 config={
                     "atom_enabled": memory_engine_config["atom_enabled"],
+                    "llm_max_retries": self.config_manager.get(
+                        "provider_settings.llm_max_retries", 5
+                    ),
                 },
             )
             logger.info(f"{tag('init')} MemoryProcessor 已初始化")
@@ -672,6 +678,10 @@ class PluginInitializer:
             service = EmbeddingIndexBootstrapService(
                 Path(self.data_dir) / "embedding_index_state.json",
                 faiss_bootstrap=self._get_faiss_bootstrap(),
+                batch_size=self.config_manager.get(
+                    "provider_settings.embedding_batch_size",
+                    EmbeddingIndexBootstrapService.DEFAULT_BATCH_SIZE,
+                ),
             )
             self._embedding_index_bootstrap = service
         await service.prepare(specs, self.embedding_provider)

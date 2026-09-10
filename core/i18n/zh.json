@@ -103,7 +103,7 @@
     "notice_exec": "AstrBot 对话历史已更新，记忆注入片段已清理。"
   },
   "help": {
-    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem reset               重置当前会话记忆上下文\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n源代码（AGPL-3.0）: https://github.com/W-Wolfycz/livingmemory_cm"
+    "text": "LivingMemory 使用指南\n\n核心指令:\n/lmem status              查看系统状态\n/lmem search <关键词> [数量]  搜索记忆(默认5条)\n/lmem forget <ID>          删除指定记忆\n/lmem rebuild-graph       重建图记忆索引（回填旧记忆）\n/lmem webui               查看 WebUI 管理界面入口\n/lmem reset               重置当前会话记忆上下文\n/lmem freeze <persona|current|list> 冻结 persona（冷存储：不召回、不清理）\n/lmem unfreeze <persona|current> 解冻 persona（进入清理豁免期）\n/lmem cleanup [preview|exec] 清理历史消息中的记忆片段(默认preview预演)\n/lmem help                显示此帮助\n\n使用建议:\n• 日常查询使用 search 指令\n• 复杂管理请在 AstrBot 仪表盘中进入 插件 -> LivingMemory -> Pages -> dashboard\n• 记忆会自动保存对话内容\n• 使用 forget 删除敏感信息\n• 启用图记忆后建议执行 rebuild-graph 回填旧数据\n• 更新插件后建议执行 cleanup 清理旧数据\n\ncleanup 命令示例:\n  /lmem cleanup          # 预演模式,仅显示统计\n  /lmem cleanup preview  # 同上\n  /lmem cleanup exec     # 执行实际清理\n\n源代码（AGPL-3.0）: https://github.com/W-Wolfycz/livingmemory_cm"
   },
   "init": {
     "ready": "插件已就绪。可使用 /lmem help 查看可用命令。",
@@ -113,5 +113,22 @@
   "command": {
     "not_ready": "命令处理器尚未就绪，当前命令无法执行。\n请先执行 /lmem status 查看插件状态；若持续失败，请检查初始化日志。",
     "core_not_ready": "插件核心组件未初始化。\n请先执行 /lmem status 查看初始化状态；如仍失败，请检查启动日志中的异常堆栈。"
+  },
+  "freeze": {
+    "action_name": "冻结 persona",
+    "unfreeze_action_name": "解冻 persona",
+    "success": "已冻结 persona「{persona}」：其记忆不再参与召回，也不会被自动清理；冻结期间重要性照常衰减。\n\n解冻：/lmem unfreeze {persona}",
+    "unfreeze_success": "已解冻 persona「{persona}」：{grace_note}\n\n该 persona 的记忆恢复正常生命周期。",
+    "grace_note": "进入 {days} 天清理豁免期，之后按正常规则衰减与清理。",
+    "grace_note_none": "豁免期已关闭（freeze_grace_days=0），立即恢复常规清理规则。",
+    "not_frozen": "persona「{persona}」当前不在冻结列表中。",
+    "list_header": "冻结的 persona：",
+    "list_item": "• {persona}（已冻结，冻结于 {frozen_at}）",
+    "list_item_grace": "• {persona}（清理豁免中，至 {grace_until}）",
+    "list_item_expired": "• {persona}（豁免期已过，已恢复常规生命周期）",
+    "list_empty": "当前没有冻结的 persona。\n\n用法：/lmem freeze <persona|current>",
+    "no_current_persona": "当前会话没有解析到 persona，请直接指定 persona ID。",
+    "usage": "用法：\n/lmem freeze <persona|current|list>   冻结（current=当前会话人格，list=查看列表）\n/lmem unfreeze <persona|current>     解冻并进入清理豁免期",
+    "refreshed": "已刷新 {count} 条记忆的访问时间。"
   }
 }

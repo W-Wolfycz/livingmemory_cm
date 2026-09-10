@@ -5,6 +5,42 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 2.5.7-cm.2 — 2026-09-11
+
+### 新增
+
+- **`/lmem freeze` 冷存储**：`freeze <persona|current|list>` / `unfreeze <persona|current>` 冻结 persona——其记忆（主记忆）不参与召回，冻结期间照常衰减但绝不被自动清理，派生原子仍按自身 TTL 回收；解冻进入 `maintenance.freeze_grace_days` 豁免期并刷新访问时间。状态存于 `frozen_personas.json`。
+- **`provider_settings.embedding_batch_size`**（默认 16，1-2048）：索引重建时单次请求嵌入条数；Provider 拒绝批大小时自动减半降级重试，修复 DashScope（`text-embedding-v4` 单请求上限 10 条）导致向量重建失败、插件无法加载的问题。
+- **`provider_settings.llm_max_retries`**（默认 5，1-10）：萃取 LLM 最大尝试次数（含首次）。底层 Provider 请求固定单次尝试、由本项统一重试，只重试调用失败与非法 JSON；`status=skip` 与内容安全拒绝不重试。
+- **`recall_engine.search_timeout_seconds`**（默认 5 秒，0=不限时）：主链路召回超时降级，embedding 挂起不再拖住 @bot 回复；检索链自身的异常（含内部 TimeoutError）仍原样上抛，不被误报成"召回超时"。
+- **`recall_engine.isolate_persona_memory`**（默认开启）：persona 记忆隔离。写入记忆时记录 Bot self_id，召回（含 Agent 检索工具与近期记忆槽位）排除其他 Bot 写入的记忆；无标识旧记忆保留。
+- **`maintenance.freeze_grace_days`**（默认 7，0=关闭）：解冻 persona 后的自动清理豁免天数。
+
+### 修复
+
+- **冻结状态 fail-closed**：`frozen_personas.json` 存在但损坏/不可读时不再当成"没有冻结"——读取抛 `FreezeStateUnreadable`，写路径拒绝覆盖（否则空视图会抹掉全部冻结记录）、自动清理整轮跳过、召回放弃本轮注入。修复前该文件一旦损坏，冻结记忆会被重新召回并被自动清理删除。
+- **冻结保护快照复查**：清理删除前按最新保护名单复查，扫描期间刚被冻结的 persona 不再被同一轮删除。
+- **`/lmem unfreeze` 不再凭空写入豁免**：存在性检查移到解冻动作之前，对从未冻结的 persona 只报错、不落状态（修复前会写进 7 天豁免，第二次执行还会改写其记忆访问时间）。
+- **解冻唤醒对中文 persona 生效**：`refresh_persona_access_time` 改用 `json_extract(metadata,'$.persona_id')` 精确匹配；AstrBot 用 `json.dumps` 落库（`ensure_ascii` 默认 True），中文 persona 在库里是 `\uXXXX` 转义，原先的 `metadata LIKE` 永远命中不了（静默刷新 0 条）。
+- **persona 记忆隔离覆盖近期槽位**：过滤前置到近期候选 `[:count]` 截断之前，修复该路径泄漏其他 Bot 的记忆、且槽位空转导致返回条数少于 k 的问题。
+- **冻结状态坏值保护**：`grace_until` 无法解析时按"仍冻结/仍受保护"处理，不再同时失去召回隔离与清理保护。
+- **graph 权重迁移落盘**：`document_route_weight` → `graph_route_weight` 的迁移结果写回原始配置对象并随 legacy 键清除一次性落盘，reload 后旧用户设置不再丢失；落盘失败只记日志，下次加载重做迁移。
+- **会话清理信号**：`/reset`、`/new` 兼容 AstrBot 4.27.x 的 `_clean_group_context_session`（保留旧 `_clean_ltm_session`），修复新版核心上清理失效（上游 #244）。
+- **`MemoryEngine` 日志导入**：补上缺失的 `logger` / `tag` 导入，冻结名单读取失败的降级分支不再抛 `NameError`。
+- **Embedding 降批判定收紧**：只有 batch 语义的错误才触发降批，token 超长这类 `larger than` 不再误判，避免无谓的降批请求。
+
+### 变更
+
+- **配置项总数 44 → 47**：可见项新增 5 项、删除 2 项（`agent_tools.*`）；配置结构 7 个配置段 → 6 个配置段 + 1 个全局配置项，隐藏兼容键只剩 `graph_memory.document_route_weight`。
+- **Agent 工具收敛**：删除 `memorize_long_term_memory` 工具与 `agent_tools` 配置段；`recall_long_term_memory` 恒开（不再需要开关）。
+- **移除旧 `log` 组一次性迁移**：删除 `_migrate_log_with_bot_id()` 与 `_conf_schema.json` 里的隐藏 `log` 兼容组，顶层 `log_with_bot_id` 成为唯一入口。旧版本在 `log` 组里设置过的用户升级后需在配置面板重新勾选顶层开关。
+- **schema hint 全量简化**：压缩长句，去掉与默认值列重复的表述，行为说明与当前实现对齐。
+- **日志调整**：`log_with_bot_id` 开启后前缀保留模块名（`[livingmemory_cm:bot-<self_id>][module]` 双段）；检索单路失败从 ERROR 降为 WARNING 但保留 traceback，文案改为"本路按空结果继续"（单路配置下并无另一路兜底）；提示词模板加载与配置验证成功从 INFO 降为 DEBUG；Agent 检索成功补 DEBUG。
+- **质量告警携带原因**：`summary_quality=low` 的 warning 附带具体触发规则（summary 空/过短、key_facts 为空、importance 越界、命中泛化词），不输出记忆正文。
+- **移除 `faiss-cpu` 依赖声明**：faiss 由 AstrBot core 提供，避免版本冲突（上游 #247）。
+
+测试：本地回归 531 项通过。
+
 ## [2.5.7-cm.1]
 
 ### 修复

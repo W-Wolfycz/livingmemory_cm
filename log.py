@@ -1,9 +1,10 @@
 """包内日志 wrapper：
 
-- ``log_with_bot_id``：在日志前缀中附加机器人实例标识
-  （如 ``[livingmemory_cm:bot-10000]``），区分多 bot 共存场景；前缀直接使用
-  AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出便于按 Bot ID
-  定位日志。会话/用户引用仍通过 ``log_ref`` 保持脱敏（如 ``[session:<hash>]``）。
+- ``log_with_bot_id``：在日志前缀中附加机器人实例标识，并与模块名并存
+  （如 ``[livingmemory_cm:bot-10000][recall]``），区分多 bot 共存场景；前缀直接
+  使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出便于按
+  Bot ID 定位日志。会话/用户引用仍通过 ``log_ref`` 保持脱敏（如
+  ``[session:<hash>]``）。
   前缀通过 ``tag(module, event)`` 在调用点拼装——只有能拿到 event 的调用点
   （hook/命令）才会带 bot 前缀，后台调度等无 event 的日志保持模块名或默认。
   需要真实体现 Bot ID 的关键事件入口（recall/reflection/session reset）
@@ -79,13 +80,15 @@ def tag(module: str | None = None, event=None) -> str:
     """日志前缀。
 
     优先级：
-    1. ``log_with_bot_id=True`` 且传入 event 且能取到 self_id → ``[livingmemory_cm:bot-<self_id>]``
+    1. ``log_with_bot_id=True`` 且传入 event 且能取到 self_id
+       → ``[livingmemory_cm:bot-<self_id>][module]``（无 module 时省略模块段）
     2. 传入 module → ``[livingmemory_cm:module]``
     3. 默认 → ``[livingmemory_cm]``
 
-    Bot 标识使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文
-    输出（如 ``[livingmemory_cm:bot-10000]``）便于定位；会话/用户引用请继续使用
-    ``log_ref`` 保持脱敏。
+    Bot 标识与模块名并存（双段形式），避免开启 bot 标识后丢失模块定位；Bot
+    标识使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出
+    （如 ``[livingmemory_cm:bot-10000][recall]``）便于定位；会话/用户引用请继续
+    使用 ``log_ref`` 保持脱敏。
 
     建议调用点固定一个 module 名，例如::
 
@@ -99,7 +102,8 @@ def tag(module: str | None = None, event=None) -> str:
         try:
             self_id = event.get_self_id()
             if self_id:
-                return f"[livingmemory_cm:bot-{self_id}]"
+                base = f"[livingmemory_cm:bot-{self_id}]"
+                return f"{base}[{module}]" if module else base
         except Exception:
             # 取不到 self_id（事件/平台未实现）时不加 bot 前缀，保持模块名。
             pass

@@ -109,7 +109,7 @@ class MemoryProcessor:
             with open(group_prompt_file, encoding="utf-8") as f:
                 self.group_chat_prompt = f.read()
 
-            logger.info(f"{tag('processor')} 提示词模板加载成功")
+            logger.debug(f"{tag('processor')} 提示词模板加载成功")
 
         except Exception as e:
             logger.error(f"{tag('processor')} 加载提示词模板失败: {e}")
@@ -223,11 +223,27 @@ class MemoryProcessor:
         )
         return any(signature in normalized for signature in signatures)
 
+    @staticmethod
+    def _supports_request_max_retries(provider: Any) -> bool:
+        """探测 Provider.text_chat 是否接受 ``request_max_retries`` 参数。
+
+        AstrBot 4.27.x 的 ``LLMProvider.text_chat`` 支持该参数；旧版无此参数时
+        直接透传会抛 TypeError。这里按签名探测，避免旧版兼容回退。
+        """
+        try:
+            import inspect
+
+            parameters = inspect.signature(provider.text_chat).parameters
+            return "request_max_retries" in parameters
+        except (TypeError, ValueError, AttributeError):
+            # provider 没有 text_chat / text_chat 不是可签名对象（如属性抛错）
+            return False
+
     async def _call_llm_with_retry(
         self,
         prompt: str,
         system_prompt: str,
-        max_retries: int = 3,
+        max_retries: int | None = None,
         response_validator: Callable[[str], Any] | None = None,
     ) -> str:
         """
@@ -236,20 +252,39 @@ class MemoryProcessor:
         Args:
             prompt: 提示词
             system_prompt: 系统提示词
-            max_retries: 最大重试次数
+            max_retries: 最大尝试次数（含首次）；None 时读取配置
+                ``llm_max_retries``（默认 5，对齐 AstrBot 请求重试默认值，最低钳制为 1）
 
         Returns:
             LLM 响应文本
+
+        本层统一控制重试：单次底层请求固定 ``request_max_retries=1``（关闭
+        AstrBot Provider 内部重试），由这里按配置重试网络失败与非法 JSON 响应，
+        避免两层默认重试叠加成 5×5 次底层请求。
         """
+        if max_retries is None:
+            raw_retries = self.config.get("llm_max_retries", 5)
+            try:
+                max_retries = int(raw_retries)
+            except (TypeError, ValueError):
+                max_retries = 5
+            max_retries = max(max_retries, 1)
         last_error = None
         for attempt in range(max_retries):
             try:
                 provider = self._get_current_llm_provider()
                 if not provider:
                     raise RuntimeError("LLM Provider 不可用")
-                response = await provider.text_chat(
-                    prompt=prompt, system_prompt=system_prompt
-                )
+                if self._supports_request_max_retries(provider):
+                    response = await provider.text_chat(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        request_max_retries=1,
+                    )
+                else:
+                    response = await provider.text_chat(
+                        prompt=prompt, system_prompt=system_prompt
+                    )
                 completion_text = str(response.completion_text or "")
                 if response_validator is not None:
                     response_validator(completion_text)
@@ -355,9 +390,10 @@ class MemoryProcessor:
             for index, structured_data in enumerate(structured_memories, 1):
                 quality = self._validate_summary_quality(structured_data)
                 if quality == "low":
+                    reason = self._quality_failure_reason(structured_data) or "未知原因"
                     logger.warning(
-                        f"{tag('processor')} 第 {index} 条记忆质量不达标（low），"
-                        "将标记但仍写入"
+                        f"{tag('processor')} 第 {index} 条记忆质量不达标"
+                        f"（low，原因：{reason}），将标记但仍写入"
                     )
                 structured_data["_quality"] = quality
                 content, metadata = self._build_storage_format(
@@ -743,6 +779,46 @@ class MemoryProcessor:
         }
         return defaults.get(field, "")
 
+    def _quality_failure_reason(self, structured_data: dict[str, Any]) -> str | None:
+        """返回质量不达标的具体原因；达标返回 None。
+
+        只输出规则名与数字（字符数/importance 值/命中泛化词），不输出记忆正文，
+        保持“插件日志不记录记忆正文”的隐私约定。
+        """
+        summary = str(structured_data.get("summary", "") or "")
+        key_facts = structured_data.get("key_facts", [])
+        importance = structured_data.get("importance", 0.5)
+
+        if not summary.strip():
+            return "summary 为空"
+        if len(summary.strip()) < 10:
+            return f"summary 过短（{len(summary.strip())} 字符）"
+        if not key_facts:
+            return "key_facts 为空"
+        if not isinstance(importance, (int, float)) or not (
+            0.0 <= importance <= 1.0
+        ):
+            # 只记数值或类型名：importance 来自模型输出，直接 repr 可能把
+            # 任意文本带进 WARNING 日志。
+            detail = (
+                repr(importance)
+                if isinstance(importance, (int, float))
+                else f"非数值类型 {type(importance).__name__}"
+            )
+            return f"importance 越界（{detail}）"
+        for term in (
+            "某用户",
+            "有人",
+            "某人",
+            "用户说",
+            "对方说",
+            "群成员",
+            "某群成员",
+        ):
+            if term in summary:
+                return f"summary 含泛化词「{term}」"
+        return None
+
     def _validate_summary_quality(self, structured_data: dict[str, Any]) -> str:
         """
         校验总结质量，返回质量等级。
@@ -756,31 +832,7 @@ class MemoryProcessor:
         Returns:
             "normal" 或 "low"
         """
-        summary = structured_data.get("summary", "")
-        key_facts = structured_data.get("key_facts", [])
-        importance = structured_data.get("importance", 0.5)
-
-        if not summary or len(summary.strip()) < 10:
-            return "low"
-        if not key_facts:
-            return "low"
-        if not isinstance(importance, (int, float)) or not (0.0 <= importance <= 1.0):
-            return "low"
-
-        # 泛化词检测
-        generic_terms = [
-            "某用户",
-            "有人",
-            "某人",
-            "用户说",
-            "对方说",
-            "群成员",
-            "某群成员",
-        ]
-        if any(term in summary for term in generic_terms):
-            return "low"
-
-        return "normal"
+        return "low" if self._quality_failure_reason(structured_data) else "normal"
 
     def classify_atoms_from_metadata(
         self,

@@ -24,6 +24,7 @@ class MemoryLifecycleContext:
     config: dict[str, Any]
     batch_delete_memories: Callable[[list[int]], Awaitable[int]]
     invalidate_search_cache: Callable[[], None]
+    freeze_store: Any = None
 
 
 class MemoryLifecycleService:
@@ -306,6 +307,20 @@ class MemoryLifecycleService:
             return 0
 
         cutoff_time = time.time() - days * 86400
+        protected_personas: set[str] = set()
+        freeze_store = getattr(context, "freeze_store", None)
+        if freeze_store is not None:
+            try:
+                protected_personas = await freeze_store.protected_personas()
+                # 顺手清掉已过期的解冻记录，避免状态文件与 /lmem freeze list
+                # 长期堆积（坏值不会被清，仍按 protected_personas 受保护）。
+                await freeze_store.grace_expired_personas()
+            except Exception as exc:
+                # 宁可不清理，也不冒误删冻结/豁免期记忆的风险
+                logger.error(
+                    f"{tag('engine')} [清理] 读取冷存储保护名单失败，本次跳过自动清理: {exc}"
+                )
+                return 0
         try:
             total_count = await context.faiss_db.document_storage.count_documents(
                 metadata_filters={}
@@ -316,6 +331,8 @@ class MemoryLifecycleService:
             batch_size = 500
             offset = 0
             to_delete_ids: list[int] = []
+            # doc_id → persona_id，供删除前按最新保护名单复查
+            candidate_personas: dict[int, str] = {}
             while offset < total_count:
                 batch_docs = (
                     await context.faiss_db.document_storage.get_documents(
@@ -341,8 +358,14 @@ class MemoryLifecycleService:
                         metadata.get("importance"),
                         default=0.5,
                     )
+                    persona = str(metadata.get("persona_id") or "")
+                    if protected_personas and persona in protected_personas:
+                        # 冻结中或解冻宽限期内的 persona 不自动删除
+                        continue
                     if create_time < cutoff_time and doc_importance < importance:
-                        to_delete_ids.append(doc["id"])
+                        doc_id = int(doc["id"])
+                        to_delete_ids.append(doc_id)
+                        candidate_personas[doc_id] = persona
 
                 offset += len(batch_docs)
                 if len(batch_docs) < batch_size:
@@ -350,6 +373,31 @@ class MemoryLifecycleService:
 
             if not to_delete_ids:
                 return 0
+
+            # 扫描期间可能有人冻结/解冻：删除前按最新保护名单复查一次
+            # （快照式保护会让"扫描中被冻结"的 persona 在同一轮被删掉）。
+            if freeze_store is not None:
+                try:
+                    refreshed_protected = await freeze_store.protected_personas()
+                except Exception as exc:
+                    logger.error(
+                        f"{tag('engine')} [清理] 删除前复查冷存储保护名单失败，"
+                        f"本次跳过自动清理: {exc}"
+                    )
+                    return 0
+                if refreshed_protected - protected_personas:
+                    new_protected = refreshed_protected - protected_personas
+                    to_delete_ids = [
+                        doc_id
+                        for doc_id in to_delete_ids
+                        if candidate_personas.get(doc_id, "") not in new_protected
+                    ]
+                    if not to_delete_ids:
+                        logger.info(
+                            f"{tag('engine')} [清理] 扫描期间有 persona 进入冻结/豁免，"
+                            "本轮无可删除记忆"
+                        )
+                        return 0
 
             logger.debug(
                 f"{tag('engine')} [清理] 发现 {len(to_delete_ids)} 条候选记忆，"
@@ -471,6 +519,62 @@ class MemoryLifecycleService:
                 f"({umo_ref}): {exc}",
                 exc_info=True,
             )
+
+    async def refresh_persona_access_time(
+        self,
+        context: MemoryLifecycleContext,
+        persona_id: str,
+    ) -> int:
+        """把该 persona 记忆的 last_access_time 刷新为当前时间（解冻唤醒）。
+
+        只更新访问时间（不改 create_time 与 importance），让解冻后的记忆在
+        排序加权与"近期访问"口径上立刻回到活跃状态。
+
+        注意：**这不产生清理豁免**——自动清理只看 ``create_time`` 与
+        ``importance``，解冻后的免删窗口完全由 ``freeze_grace_days`` 的
+        ``grace_until`` 提供。
+
+        查询用 ``json_extract`` 而不是 ``metadata LIKE``：AstrBot 的
+        ``document_storage.insert_document`` 用 ``json.dumps(metadata)`` 落库
+        （``ensure_ascii`` 默认 True），中文 persona_id 在库里是 ``\\uXXXX``
+        转义，子串匹配永远命中不了。
+        """
+        persona = str(persona_id or "").strip()
+        if not persona or context.db_connection is None:
+            return 0
+        now = time.time()
+        try:
+            cursor = await context.db_connection.execute(
+                "SELECT id, metadata FROM documents "
+                "WHERE CAST(json_extract(metadata, '$.persona_id') AS TEXT) = ?",
+                (persona,),
+            )
+            rows = await cursor.fetchall()
+            updates: list[tuple[str, int]] = []
+            for row in rows:
+                metadata = self.safe_json_dict(row["metadata"])
+                if str(metadata.get("persona_id") or "") != persona:
+                    continue
+                metadata["last_access_time"] = now
+                updates.append(
+                    (json.dumps(metadata, ensure_ascii=False), int(row["id"]))
+                )
+            if updates:
+                await context.db_connection.executemany(
+                    "UPDATE documents SET metadata = ? WHERE id = ?",
+                    updates,
+                )
+                await context.db_connection.commit()
+                context.invalidate_search_cache()
+            return len(updates)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"{tag('engine')} [解冻] 刷新 persona 访问时间失败: {exc}",
+                exc_info=True,
+            )
+            return 0
 
     @staticmethod
     def safe_json_dict(value: Any) -> dict[str, Any]:

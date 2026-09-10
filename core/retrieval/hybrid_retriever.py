@@ -121,7 +121,12 @@ class HybridRetriever:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"{tag('retrieval')} {route_name}检索异常: {e}", exc_info=True)
+            # 双路配置下另一路会兜底；单路配置（graph_memory.enabled=false）
+            # 下这就是整条召回失败，因此不要把"已由另一路兜底"写进日志。
+            logger.warning(
+                f"{tag('retrieval')} {route_name}检索异常，本路按空结果继续: {e}",
+                exc_info=True,
+            )
             return [], e
 
     def _apply_weighting(

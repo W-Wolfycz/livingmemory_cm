@@ -3,25 +3,37 @@
         "description": "日志区分机器人实例（全局配置项）",
         "type": "bool",
         "default": false,
-        "hint": "启用后，消息事件相关日志前缀从 [livingmemory_cm:module] 变为 [livingmemory_cm:bot-<self_id>]，便于多 Bot 实例定位。本项为全局配置、不属于任何配置段；日志级别跟随 AstrBot 原生配置。"
+        "hint": "多 Bot 共存时在关键事件日志前缀附加 self_id 原文，并与模块名并存（如 [livingmemory_cm:bot-10000][recall]）便于定位；关闭时不加 bot 前缀。会话/用户引用仍脱敏；日志级别跟随 AstrBot 原生配置。"
     },
     "provider_settings": {
         "description": "模型提供商",
-        "hint": "记忆系统使用的 AI 模型；两项均留空时使用 AstrBot 默认。",
+        "hint": "记忆系统使用的 AI 模型；两个 Provider ID 均留空时使用 AstrBot 默认。",
         "type": "object",
         "items": {
             "embedding_provider_id": {
                 "description": "Embedding 模型 ID",
-                "hint": "生成记忆向量的 Embedding Provider ID。留空使用 AstrBot 默认；可在 AstrBot 后台「LLM 配置」查看已有 ID（如 openai_embedding）。",
+                "hint": "生成记忆向量的 Embedding Provider ID。留空使用 AstrBot 默认。",
                 "type": "string",
                 "default": ""
             },
+            "embedding_batch_size": {
+                "description": "嵌入批量条数",
+                "hint": "索引重建时单次请求嵌入的文本条数（1-2048）。不同 Provider 上限不同：OpenAI 官方 2048、DashScope text-embedding-v4 仅 10；超出上限时插件会自动降批重试，但按实际上限配置可减少无效请求。默认 16。",
+                "type": "int",
+                "default": 16
+            },
             "llm_provider_id": {
                 "description": "LLM 模型 ID",
-                "hint": "用于中性事实萃取、主题拆分和重要性评估的 LLM Provider ID。留空使用 AstrBot 默认；推荐结构化输出稳定的模型。",
+                "hint": "萃取与重要性评估使用的 LLM Provider ID。留空使用 AstrBot 默认；推荐结构化输出稳定的模型。",
                 "type": "string",
                 "_special": "select_provider",
                 "default": ""
+            },
+            "llm_max_retries": {
+                "description": "LLM 最大尝试次数",
+                "hint": "萃取 LLM 调用的最大尝试次数（含首次，1-10）。底层请求固定单次，由本项统一重试（指数退避）；仅调用失败与非法 JSON 触发重试，status=skip 与内容安全拒绝不重试。默认 5，对齐 AstrBot 请求重试默认值。",
+                "type": "int",
+                "default": 5
             }
         }
     },
@@ -38,13 +50,13 @@
             },
             "max_k": {
                 "description": "主动检索最大数量",
-                "hint": "Agent 主动调用长期记忆检索工具时允许返回的最大条数，限制工具单次召回规模；不影响自动召回 top_k。建议 5-10。",
+                "hint": "Agent 主动检索工具单次最多返回条数；不影响自动召回 top_k。建议 5-10。",
                 "type": "int",
                 "default": 10
             },
             "injection_method": {
                 "description": "记忆注入位置",
-                "hint": "记忆注入 LLM 请求的位置。extra_user_content(推荐)：追加到用户消息末尾，不影响前缀缓存、不污染历史。user_message_before/after：作为用户消息前缀/后缀。fake_tool_call：伪造工具调用注入历史；Gemini 下自动降级为 extra_user_content。",
+                "hint": "记忆注入位置。extra_user_content（推荐）：追加到用户消息末尾，不污染历史；user_message_before/after：用户消息前/后缀；fake_tool_call：伪造工具调用注入历史，Gemini 下自动降级为 extra_user_content。",
                 "type": "string",
                 "default": "extra_user_content",
                 "options": [
@@ -56,114 +68,126 @@
             },
             "search_cache_ttl_seconds": {
                 "description": "检索缓存 TTL 秒数",
-                "hint": "相同会话、相同查询在 TTL 内复用检索结果，降低 SQLite/FAISS 开销；0=关闭缓存。默认 45 秒。",
+                "hint": "相同会话、相同查询在 TTL 内复用检索结果，降低 SQLite/FAISS 开销；0=关闭缓存。",
                 "type": "float",
                 "default": 45.0
             },
             "search_cache_max_size": {
                 "description": "检索缓存最大条目数",
-                "hint": "限制内存中保留的检索结果数量。超过上限时自动淘汰最久未使用的结果。",
+                "hint": "内存中保留的检索结果最大条目数；超限淘汰最久未使用项。",
                 "type": "int",
                 "default": 256
             },
             "query_context_rounds": {
                 "description": "召回查询历史轮数",
-                "hint": "仅用于构建召回查询（消解「那个」「继续」等指代），不注入上下文。单位跟随 CM llm_status_filter：仅 llm_success 时 N=完整问答轮；含其他状态时 N=消息条数。0=仅用当前发言。默认 2。",
+                "hint": "仅用于构建召回查询（消解「那个」「继续」等指代），不注入上下文。单位跟随 CM llm_status_filter：仅 llm_success 按完整问答轮，含其他状态按消息条数；0=仅用当前发言。",
                 "type": "int",
                 "default": 2
             },
             "query_context_max_chars": {
                 "description": "召回历史字符上限",
-                "hint": "对召回查询中的历史问答再施加字符上限，避免历史压过当前发言。0=不加入历史。默认 800。",
+                "hint": "召回查询中历史问答的字符上限，避免压过当前发言；0=不加入历史。",
                 "type": "int",
                 "default": 800
             },
             "query_context_max_age_seconds": {
                 "description": "召回历史最大年龄(秒)",
-                "hint": "只从该时间窗口内读取 CM 问答用于指代消歧。0=不限制时间；例如 7200=2 小时。",
+                "hint": "只读取该时间窗口内的 CM 问答用于指代消歧；0=不限时间（如 7200=2 小时）。",
                 "type": "int",
                 "default": 0
             },
             "injection_max_memories": {
                 "description": "单次注入最多记忆数",
-                "hint": "候选去重后，按检索排名最多注入该条数。建议 2-4，默认 3。",
+                "hint": "候选去重后按检索排名最多注入的条数。建议 2-4。",
                 "type": "int",
                 "default": 3
             },
             "injection_max_chars": {
                 "description": "单次注入字符预算",
-                "hint": "单次注入字符预算（含规则、参与者、摘要和关键事实）；低排名记忆超预算时不注入。默认 3200。",
+                "hint": "单次注入字符预算（含规则、参与者、摘要和关键事实）；低排名记忆超预算不注入。",
                 "type": "int",
                 "default": 3200
             },
             "min_importance_for_retrieval": {
                 "description": "召回最低重要性",
-                "hint": "过滤重要性低于该值的候选。范围 0-1；0=不过滤。",
+                "hint": "过滤重要性低于该值的候选；0=不过滤。",
                 "type": "float",
                 "default": 0.0
             },
             "min_similarity_for_retrieval": {
                 "description": "召回最低向量相似度",
-                "hint": "过滤所有可用向量信号均低于该值的候选；纯关键词或近期槽位候选不受影响。范围 0-1；0=不过滤。",
+                "hint": "过滤所有向量信号均低于该值的候选；纯关键词或近期槽位候选不受影响；0=不过滤。",
                 "type": "float",
                 "default": 0.0
             },
             "recent_memory_count": {
                 "description": "近期记忆保留数量",
-                "hint": "在最终 top-k 内为当前 session/persona 的近期 active 记忆保留槽位，不增加注入条数、也不是新数据源。0=关闭并保持旧排序；建议 1-2。",
+                "hint": "在最终 top-k 内为近期 active 记忆保留槽位，不增加注入条数；0=关闭，建议 1-2。",
                 "type": "int",
                 "default": 0
             },
             "recent_memory_max_age_hours": {
                 "description": "近期记忆时间窗口(小时)",
-                "hint": "近期槽位只从该时间窗口内取记忆，不新增检索数据源。默认 72 小时；0=不限时间。recent_memory_count=0 时不生效。",
+                "hint": "近期槽位的时间窗口（小时）；0=不限时间，recent_memory_count=0 时不生效。",
                 "type": "int",
                 "default": 72
             },
             "memory_type_filter": {
                 "description": "记忆类型过滤",
-                "hint": "all=召回全部记忆；event_only=仅排除已有 atom_types 明确为纯偏好/关系的新记忆，无 atom_types 的旧记录仍可召回。",
+                "hint": "all=召回全部；event_only=排除 atom_types 明确为纯偏好/关系的新记忆，无 atom_types 的旧记录仍可召回。",
                 "type": "string",
                 "options": [
                     "all",
                     "event_only"
                 ],
                 "default": "all"
+            },
+            "search_timeout_seconds": {
+                "description": "召回超时秒数",
+                "hint": "主链路记忆召回（含 embedding 检索）的最长等待秒数；超时跳过注入、不阻塞用户回复，避免 embedding 卡住拖慢 @bot 回复。0=不限时，默认 5。",
+                "type": "float",
+                "default": 5.0
+            },
+            "isolate_persona_memory": {
+                "description": "persona 记忆隔离",
+                "hint": "persona 记忆隔离（默认开启）：同群多 Bot 共用同一 session 时，按写入记忆的 Bot self_id 过滤，自动召回与 Agent 检索工具只返回当前 Bot 自己写入的记忆，避免 A Bot 召回 B Bot 的记忆；无 Bot 标识的旧记忆仍保留。单 Bot 部署可关闭。",
+                "type": "bool",
+                "default": true
             }
         }
     },
     "importance_decay": {
         "description": "重要性衰减",
-        "hint": "随时间逐步降低旧记忆的重要性，防止旧信息长期占据高权重",
+        "hint": "随时间逐步降低旧记忆的重要性，防止旧信息长期占据高权重。",
         "type": "object",
         "items": {
             "decay_rate": {
                 "description": "每日衰减率",
-                "hint": "每日重要性衰减比例，0.01=每天降 1%；0=禁用每日衰减。",
+                "hint": "每日重要性衰减比例，0.01=每天降 1%；0=禁用。",
                 "type": "float",
                 "default": 0.01
             },
             "access_decay_window_days": {
                 "description": "访问强化窗口(天)",
-                "hint": "判断“近期访问”的窗口（天）；窗口内访问对衰减保护更强。",
+                "hint": "判断「近期访问」的窗口（天）；窗口内访问对衰减保护更强。",
                 "type": "float",
                 "default": 30.0
             },
             "access_decay_max_count": {
                 "description": "访问强化次数上限",
-                "hint": "访问多少次达到最大衰减保护；超过该值不再增强。",
+                "hint": "达到最大衰减保护所需的访问次数。",
                 "type": "int",
                 "default": 10
             },
             "access_count_decay_multiplier": {
                 "description": "访问次数保留比例",
-                "hint": "每日衰减后访问次数乘以该比例，避免旧热点永久获得最大保护；0=每次清零，1=永不回落。",
+                "hint": "每日衰减后访问次数按该比例回落；0=每次清零，1=永不回落。",
                 "type": "float",
                 "default": 0.5
             },
             "protected_importance_threshold": {
                 "description": "重要记忆保护阈值",
-                "hint": "重要性≥该值的记忆跳过每日衰减。范围 0-1，默认 1.0 只保护满分记忆。",
+                "hint": "重要性≥该值的记忆跳过每日衰减；1.0 只保护满分记忆。",
                 "type": "float",
                 "default": 1.0
             }
@@ -171,39 +195,20 @@
     },
     "reflection_engine": {
         "description": "记忆生成设置",
-        "hint": "控制何时从 CM 历史触发中性事实萃取并生成长期记忆；触发/推进的单位跟随 CM llm_status_filter。",
+        "hint": "控制何时从 CM 历史触发萃取并生成长期记忆；单位跟随 CM llm_status_filter。",
         "type": "object",
         "items": {
             "trigger_count": {
                 "description": "触发数量",
-                "hint": "0=跟随 CM context_takeover.limit_rounds 的数值；正数覆盖数值，但单位都跟随 CM llm_status_filter（仅 llm_success=N 个完整问答轮；含其他状态=N 条消息）。",
+                "hint": "0=跟随 CM context_takeover.limit_rounds；正数覆盖数值，单位跟随 CM llm_status_filter（仅 llm_success 按轮，否则按条）。",
                 "type": "int",
                 "default": 0
             },
             "refusal_advance_count": {
                 "description": "模型拒绝后推进数量",
-                "hint": "仅当模型 status=skip 表示内容安全/政策拒绝，或 Provider 高置信内容安全拒绝（含 AstrBot content_filter）时，推进最旧 N 个 CM 单位；普通异常、非法 JSON、字段错误不推进。单位同 trigger_count。",
+                "hint": "模型 status=skip（内容安全/政策）或 Provider 高置信内容安全拒绝时，推进最旧的 N 个 CM 单位；普通异常、非法 JSON、字段错误不推进。单位同 trigger_count。",
                 "type": "int",
                 "default": 5
-            }
-        }
-    },
-    "agent_tools": {
-        "description": "Agent 主动记忆工具",
-        "hint": "控制是否向 AstrBot Agent 注册长期记忆回忆/写入工具；关闭工具不影响自动召回与自动反思。",
-        "type": "object",
-        "items": {
-            "enable_recall_tool": {
-                "description": "启用主动回忆工具",
-                "hint": "注册 recall_long_term_memory，允许 Agent 主动检索长期记忆；仍受 session/persona 隔离与召回过滤限制。",
-                "type": "bool",
-                "default": true
-            },
-            "enable_memorize_tool": {
-                "description": "启用主动记忆写入工具",
-                "hint": "注册 memorize_long_term_memory，允许 Agent 主动写入长期记忆；写入会改数据，建议仅在可信模型上开启。",
-                "type": "bool",
-                "default": false
             }
         }
     },
@@ -220,43 +225,43 @@
             },
             "graph_route_weight": {
                 "description": "图路权重",
-                "hint": "图路在最终双路融合中的权重；文档路权重自动为 1-图路权重，无需单独配置。范围 0-1，默认 0.35；旧配置 document_route_weight 会自动迁移。",
+                "hint": "图路在最终双路融合中的权重；文档路权重自动为 1-图路权重。范围 0-1。",
                 "type": "float",
                 "default": 0.35
             },
             "cross_route_bonus": {
                 "description": "双路命中加分",
-                "hint": "同一记忆同时被文档路和图路命中时追加的分数；过大可能压过更高质量的单路结果。",
+                "hint": "同一记忆同时被文档路和图路命中时追加的分数；过大会压过更高质量的单路结果。",
                 "type": "float",
                 "default": 0.08
             },
             "expansion_limit": {
                 "description": "图邻居扩展上限",
-                "hint": "图关键词检索从命中节点向邻居扩展的最大候选数；越大越可能召回间接关系，查询开销也越高。",
+                "hint": "图关键词检索从命中节点向邻居扩展的最大候选数；越大越可能召回间接关系，开销也越高。",
                 "type": "int",
                 "default": 24
             },
             "expansion_hops": {
                 "description": "图扩展跳数",
-                "hint": "图关键词检索从命中节点向外扩展的跳数。1=仅直接关联；2=额外召回间接关联但查询开销增加。默认 1。",
+                "hint": "图关键词检索的扩展跳数；1=仅直接关联，2=额外召回间接关联但开销增加。",
                 "type": "int",
                 "default": 1
             },
             "second_hop_weight": {
                 "description": "二跳扩展权重",
-                "hint": "二跳图候选的分数权重；值越高间接关系越容易进入最终召回。仅 expansion_hops=2 时生效。",
+                "hint": "二跳图候选的分数权重；仅 expansion_hops=2 时生效。",
                 "type": "float",
                 "default": 0.4
             },
             "dynamic_route_weighting": {
                 "description": "动态路由权重",
-                "hint": "根据查询中的关系、时间、定义类意图，自动调整文档路和图路权重。",
+                "hint": "根据查询中的关系、时间、定义类意图自动调整文档路和图路权重。",
                 "type": "bool",
                 "default": true
             },
             "max_topics_per_memory": {
                 "description": "单记忆最大主题数",
-                "hint": "每条来源记忆最多写入的主题节点数，防止图谱过快膨胀。",
+                "hint": "每条来源记忆最多写入的主题节点数。",
                 "type": "int",
                 "default": 6
             },
@@ -274,13 +279,13 @@
             },
             "atom_enabled": {
                 "description": "启用记忆原子化",
-                "hint": "开启后每条 key_fact 独立为记忆原子，拥有独立存活时间与衰减曲线；关闭则回退到粗粒度主记忆行为。",
+                "hint": "开启后每条 key_fact 独立为记忆原子，拥有独立存活时间与衰减曲线；关闭回退到粗粒度主记忆行为。",
                 "type": "bool",
                 "default": true
             },
             "atom_maintenance_interval_hours": {
                 "description": "原子维护间隔(小时)",
-                "hint": "原子生命周期任务每隔多少小时执行一次过期/遗忘/清理检查。",
+                "hint": "原子生命周期任务的执行间隔（小时）。",
                 "type": "float",
                 "default": 24.0
             },
@@ -292,7 +297,7 @@
             },
             "atom_purge_delay_days": {
                 "description": "遗忘原子物理清理延迟(天)",
-                "hint": "已软遗忘原子再过多少天从数据库物理删除以回收空间；建议大于 atom_forget_delay_days。",
+                "hint": "已软遗忘原子再过多少天物理删除；建议大于 atom_forget_delay_days。",
                 "type": "float",
                 "default": 30.0
             },
@@ -312,35 +317,27 @@
         "items": {
             "cleanup_days_threshold": {
                 "description": "清理天数阈值（天）",
-                "hint": "创建超过该天数且重要性低于阈值的旧记忆被自动删除；0=关闭自动清理任务。",
+                "hint": "创建超过该天数且重要性低于阈值的旧记忆被自动删除；0=关闭自动清理。",
                 "type": "int",
                 "default": 30
             },
             "cleanup_importance_threshold": {
                 "description": "清理重要性阈值",
-                "hint": "清理的重要性严格上限：importance < 该值才删除。0.3=低于 30% 的记忆；cleanup_days_threshold=0 时不生效。",
+                "hint": "清理的重要性严格上限（importance < 该值才删除）；cleanup_days_threshold=0 时不生效。",
                 "type": "float",
                 "default": 0.3
             },
             "backup_keep_days": {
                 "description": "备份保留天数",
-                "hint": "每日衰减后自动备份主库，并清除超过该天数的旧备份；0=关闭自动备份任务。",
+                "hint": "每日衰减后自动备份主库，并清除超过该天数的旧备份；0=关闭自动备份。",
                 "type": "int",
                 "default": 7
-            }
-        }
-    },
-    "log": {
-        "description": "旧配置兼容（隐藏）",
-        "hint": "旧配置 log.log_with_bot_id 的隐藏兼容组，不由用户配置；加载时迁移为顶层 log_with_bot_id 后移除。",
-        "type": "object",
-        "invisible": true,
-        "items": {
-            "log_with_bot_id": {
-                "description": "旧配置兼容（隐藏）",
-                "hint": "旧配置 log.log_with_bot_id 的隐藏兼容键，不由用户配置；加载时迁移为顶层 log_with_bot_id 后移除。",
-                "type": "bool",
-                "default": false
+            },
+            "freeze_grace_days": {
+                "description": "解冻豁免期(天)",
+                "hint": "解冻 persona 后多少天内跳过自动清理（0=不设豁免）。冻结期间该 persona 的记忆照常衰减但绝不被自动删除；解冻后给一段豁免期，避免刚解冻就因 importance 低于阈值且创建超期被清理。默认 7。",
+                "type": "int",
+                "default": 7
             }
         }
     }

@@ -195,10 +195,14 @@ class _FakeIndexBootstrap:
 
 
 class _FakeEmbeddingProvider:
-    def __init__(self, model: str, *, fail: bool = False) -> None:
+    def __init__(
+        self, model: str, *, fail: bool = False, max_batch: int | None = None
+    ) -> None:
         self.model = model
         self.fail = fail
+        self.max_batch = max_batch
         self.calls = 0
+        self.batches: list[int] = []
         self.provider_config = {
             "id": "embedding_demo",
             "type": "openai_embedding",
@@ -213,6 +217,12 @@ class _FakeEmbeddingProvider:
         self.calls += 1
         if self.fail:
             raise RuntimeError("provider unavailable")
+        if self.max_batch is not None and len(texts) > self.max_batch:
+            raise RuntimeError(
+                "Error code: 400 - InvalidParameter: Value error, batch size is "
+                f"invalid, it should not be larger than {self.max_batch}.: input.contents"
+            )
+        self.batches.append(len(texts))
         return [[float(len(text)), 1.0] for text in texts]
 
 
@@ -425,3 +435,69 @@ async def test_initialize_runs_database_preflight_before_provider_wait(
     assert initializer.is_failed is True
     assert "旧库不受支持" in str(initializer.error_message)
     initializer._wait_for_providers_non_blocking.assert_not_awaited()
+
+
+def test_embedding_default_batch_size_is_configurable_baseline() -> None:
+    """默认批大小保持 16，可由 provider_settings.embedding_batch_size 覆盖。"""
+    assert EmbeddingIndexBootstrapService.DEFAULT_BATCH_SIZE == 16
+    service = EmbeddingIndexBootstrapService(
+        "/tmp/unused_state.json", batch_size=10
+    )
+    assert service.batch_size == 10
+
+
+@pytest.mark.asyncio
+async def test_shadow_rebuild_downgrades_batch_size_on_provider_rejection(
+    monkeypatch, tmp_path
+) -> None:
+    """Provider 拒绝超限批大小时自动降批并完成重建（不再整体失败）。"""
+    monkeypatch.setitem(sys.modules, "faiss", _FakeFaiss)
+    db_path = tmp_path / "documents.db"
+    index_path = tmp_path / "memory.index"
+    state_path = tmp_path / "embedding_index_state.json"
+    with sqlite3.connect(db_path) as db:
+        db.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT)")
+        db.executemany(
+            "INSERT INTO documents(id, text) VALUES (?, ?)",
+            [(index, f"text-{index}") for index in range(1, 13)],
+        )
+    bootstrap = _FakeIndexBootstrap(_FakeIndex(2, list(range(1, 13))))
+    service = EmbeddingIndexBootstrapService(
+        state_path,
+        faiss_bootstrap=bootstrap,
+        batch_size=6,
+    )
+    provider = _FakeEmbeddingProvider("model_a", max_batch=2)
+
+    result = await service.prepare(
+        [EmbeddingIndexSpec("document", db_path, index_path)], provider
+    )
+
+    assert result[0].action == "rebuilt"
+    # 6 → 3 → 1：降批后每个实际成功的批次都不超过 Provider 上限
+    assert provider.batches
+    assert all(size <= 2 for size in provider.batches)
+    assert sum(provider.batches) == 12
+    assert bootstrap.index.id_map.tolist() == list(range(1, 13))
+
+
+def test_batch_limit_error_detection_ignores_unrelated_failures() -> None:
+    """只有批大小语义的错误才触发降批，维度/网络/token 超长错误不误判。"""
+    service = EmbeddingIndexBootstrapService("/tmp/unused_state.json")
+    assert service._is_batch_limit_error(
+        RuntimeError("batch size is invalid, it should not be larger than 10.")
+    )
+    assert service._is_batch_limit_error(
+        RuntimeError(
+            "Error code: 400 - InvalidParameter: Value error, batch size is "
+            "invalid, it should not be larger than 10.: input.contents"
+        )
+    )
+    assert not service._is_batch_limit_error(
+        RuntimeError("向量维度不匹配, 期望: 1024, 实际: 2048")
+    )
+    assert not service._is_batch_limit_error(RuntimeError("Connection error"))
+    # "larger than" 单独出现通常指 token 长度，不能当成批大小错误
+    assert not service._is_batch_limit_error(
+        RuntimeError("this input is larger than the maximum token length allowed")
+    )

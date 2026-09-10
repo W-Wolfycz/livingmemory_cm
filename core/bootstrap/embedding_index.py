@@ -107,7 +107,11 @@ class EmbeddingIndexBootstrapService:
     """校验 SQLite/FAISS 一致性，并在必要时安全构建影子索引。"""
 
     STATE_SCHEMA = 1
+    # 单请求嵌入的默认条数；不同 Provider 上限不同（OpenAI 官方 2048、
+    # DashScope text-embedding-v4 仅 10），可用 provider_settings.embedding_batch_size
+    # 覆盖；超出 Provider 上限时按 _is_batch_limit_error 自动降批兜底。
     DEFAULT_BATCH_SIZE = 16
+    _MIN_BATCH_SIZE = 1
 
     def __init__(
         self,
@@ -119,6 +123,61 @@ class EmbeddingIndexBootstrapService:
         self.state_path = Path(state_path)
         self.faiss_bootstrap = faiss_bootstrap or FaissBootstrapService()
         self.batch_size = max(1, int(batch_size))
+        self._effective_batch_size = self.batch_size
+
+    @staticmethod
+    def _is_batch_limit_error(exc: BaseException) -> bool:
+        """识别 Provider 拒绝批大小的错误（400 + batch size 语义）。
+
+        只匹配高置信特征，避免把维度不匹配、token 超长等其它 400 误判为需要
+        降批（"larger than" 单独出现往往指 token 长度，必须与 batch 共现）。
+        """
+        try:
+            message = str(exc).casefold()
+        except Exception:
+            return False
+        if "batch" in message and (
+            "batch size" in message
+            or "batch_size" in message
+            or "batch length" in message
+            or "larger than" in message
+            or "too many inputs" in message
+        ):
+            return True
+        return "input.contents" in message
+
+    async def _embed_texts(
+        self,
+        provider: Any,
+        texts: list[str],
+    ) -> list[list[float]]:
+        """按有效批大小分批嵌入，返回与输入等长且同序的向量列表。
+
+        命中 Provider 批大小限制时自动减半降级重试（并记住新批大小），
+        避免整次索引重建因单请求条目上限失败。
+        """
+        vectors: list[list[float]] = []
+        offset = 0
+        total = len(texts)
+        while offset < total:
+            size = min(self._effective_batch_size, total - offset)
+            chunk = texts[offset : offset + size]
+            try:
+                vectors.extend(await provider.get_embeddings(chunk))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if size > self._MIN_BATCH_SIZE and self._is_batch_limit_error(exc):
+                    new_size = max(self._MIN_BATCH_SIZE, size // 2)
+                    logger.warning(
+                        f"{tag('bootstrap')} Embedding 批大小 {size} 被 Provider 拒绝，"
+                        f"降为 {new_size} 后重试: {exc}"
+                    )
+                    self._effective_batch_size = new_size
+                    continue
+                raise
+            offset += size
+        return vectors
 
     async def prepare(
         self,
@@ -322,7 +381,7 @@ class EmbeddingIndexBootstrapService:
                 batch = documents[offset : offset + self.batch_size]
                 ids = [document_id for document_id, _ in batch]
                 texts = [text for _, text in batch]
-                vectors = await provider.get_embeddings(texts)
+                vectors = await self._embed_texts(provider, texts)
                 matrix = np.asarray(vectors, dtype=np.float32)
                 if matrix.ndim != 2 or matrix.shape[0] != len(batch):
                     raise InitializationError(

@@ -22,7 +22,7 @@ from .core.i18n_backend import init as i18n_init
 from .core.i18n_backend import t
 from .core.managers.backup_manager import BackupManager
 from .core.plugin_initializer import PluginInitializer
-from .core.tools import MemoryMemorizeTool, MemorySearchTool
+from .core.tools import MemorySearchTool
 from .core.utils import get_cm_status
 from .version import PLUGIN_REPOSITORY, PLUGIN_VERSION
 
@@ -108,8 +108,7 @@ class LivingMemoryCMPlugin(Star):
         i18n_init()
 
         # 多 bot 实例日志区分配置；日志级别跟随 AstrBot 原生配置，不做插件内提级。
-        # ConfigManager 会先完成隐藏兼容键迁移，这里必须读迁移后的顶层值，
-        # 避免 AstrBot 完整性注入的顶层默认 False 覆盖旧 log.log_with_bot_id=true。
+        # 顶层 log_with_bot_id 是唯一入口（旧的 log 配置组已不再支持）。
         configure_log(log_with_bot_id=bool(self.config_manager.get("log_with_bot_id", False)))
 
         # 初始化插件初始化器
@@ -252,34 +251,20 @@ class LivingMemoryCMPlugin(Star):
         return True
 
     def _register_agent_tools_if_needed(self) -> None:
-        """在核心组件就绪后注册 Agent 工具（回忆/写入）。"""
+        """在核心组件就绪后注册 Agent 记忆检索工具（恒开）。"""
         if self._llm_tools_registered:
             return
         if not self.initializer.memory_engine or not self.initializer.memory_processor:
             return
 
-        tools = []
-        if self.config_manager.get("agent_tools.enable_recall_tool", True):
-            tools.append(
-                MemorySearchTool(
-                    context=self.context,
-                    config_manager=self.config_manager,
-                    memory_engine=self.initializer.memory_engine,
-                )
+        self.context.add_llm_tools(
+            MemorySearchTool(
+                context=self.context,
+                config_manager=self.config_manager,
+                memory_engine=self.initializer.memory_engine,
             )
-        if self.config_manager.get("agent_tools.enable_memorize_tool", False):
-            tools.append(
-                MemoryMemorizeTool(
-                    context=self.context,
-                    memory_engine=self.initializer.memory_engine,
-                    memory_processor=self.initializer.memory_processor,
-                )
-            )
-
-        if tools:
-            self.context.add_llm_tools(*tools)
+        )
         # 标记注册流程完成，后续不再重复检查。
-        # 若用户中途修改 agent_tools 开关，需要重载插件才能生效。
         self._llm_tools_registered = True
 
     async def _ensure_plugin_ready(self) -> tuple[bool, str]:
@@ -358,7 +343,12 @@ class LivingMemoryCMPlugin(Star):
     @filter.after_message_sent()
     async def handle_session_reset(self, event: AstrMessageEvent):
         """[Event Hook] After message sent, check if plugin session context needs clearing (/reset or /new)"""
-        if not event.get_extra("_clean_ltm_session", False):
+        # AstrBot 4.27.x 的 /reset、/new 设置 _clean_group_context_session；
+        # 保留旧 _clean_ltm_session 兼容旧版核心。
+        if not (
+            event.get_extra("_clean_group_context_session", False)
+            or event.get_extra("_clean_ltm_session", False)
+        ):
             return
 
         ready, _ = await self._ensure_plugin_ready()
@@ -482,6 +472,50 @@ class LivingMemoryCMPlugin(Star):
             return
 
         async for message in self.command_handler.handle_reset(event):
+            yield message
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("freeze")
+    async def freeze(
+        self, event: AstrMessageEvent, persona: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """[Admin] Freeze a persona into cold storage (no recall, no cleanup)
+
+        Args:
+            persona: Persona ID, or "current" for the current session persona, or "list"
+        """
+        ready, message = await self._ensure_plugin_ready()
+        if not ready:
+            yield event.plain_result(message)
+            return
+
+        if not self.command_handler:
+            yield event.plain_result(self._command_handler_not_ready_message())
+            return
+
+        async for message in self.command_handler.handle_freeze(event, persona):
+            yield message
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("unfreeze")
+    async def unfreeze(
+        self, event: AstrMessageEvent, persona: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """[Admin] Unfreeze a persona and start the cleanup grace period
+
+        Args:
+            persona: Persona ID, or "current" for the current session persona
+        """
+        ready, message = await self._ensure_plugin_ready()
+        if not ready:
+            yield event.plain_result(message)
+            return
+
+        if not self.command_handler:
+            yield event.plain_result(self._command_handler_not_ready_message())
+            return
+
+        async for message in self.command_handler.handle_unfreeze(event, persona):
             yield message
 
     @permission_type(PermissionType.ADMIN)

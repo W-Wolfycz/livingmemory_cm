@@ -1,4 +1,4 @@
-faiss-cpu>=1.14.3
+# faiss 由 AstrBot core 提供，不在此声明（避免与 core 内置版本冲突，上游 #247）
 networkx>=3.0
 jieba>=0.42.1
 pytz>=2021.3

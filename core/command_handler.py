@@ -14,6 +14,7 @@ from .base.config_manager import ConfigManager
 from .i18n_backend import t, t_list
 from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
+from .utils import get_persona_id
 
 
 class CommandHandler:
@@ -299,6 +300,116 @@ class CommandHandler:
                     e,
                     t_list("error.suggestions.reset"),
                 )
+            )
+
+    async def handle_freeze(
+        self, event: AstrMessageEvent, persona_arg: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """处理 /lmem freeze [list|current|<persona>] 命令。"""
+        store = getattr(self.memory_engine, "freeze_store", None)
+        if store is None:
+            yield event.plain_result(
+                self._component_not_ready_message("记忆引擎", "/lmem freeze")
+            )
+            return
+
+        target = str(persona_arg or "").strip()
+        try:
+            if not target or target.casefold() == "list":
+                entries = await store.entries()
+                if not entries:
+                    yield event.plain_result(t("freeze.list_empty"))
+                    return
+                lines = [t("freeze.list_header")]
+                for item in entries:
+                    if item["state"] == "grace":
+                        lines.append(
+                            t(
+                                "freeze.list_item_grace",
+                                persona=item["persona_id"],
+                                grace_until=item["grace_until"] or "-",
+                            )
+                        )
+                    elif item["state"] == "expired":
+                        lines.append(
+                            t("freeze.list_item_expired", persona=item["persona_id"])
+                        )
+                    else:
+                        lines.append(
+                            t(
+                                "freeze.list_item",
+                                persona=item["persona_id"],
+                                frozen_at=item["frozen_at"] or "-",
+                            )
+                        )
+                yield event.plain_result("\n".join(lines))
+                return
+
+            if target.casefold() == "current":
+                target = str(await get_persona_id(self.context, event) or "").strip()
+                if not target:
+                    yield event.plain_result(t("freeze.no_current_persona"))
+                    return
+
+            await store.freeze(target)
+            yield event.plain_result(t("freeze.success", persona=target))
+        except Exception as e:
+            logger.error(f"{tag('cmd')} 冻结 persona 失败: {e}", exc_info=True)
+            yield event.plain_result(
+                self._format_error_message(t("freeze.action_name"), e)
+            )
+
+    async def handle_unfreeze(
+        self, event: AstrMessageEvent, persona_arg: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """处理 /lmem unfreeze <persona|current> 命令。"""
+        store = getattr(self.memory_engine, "freeze_store", None)
+        if store is None:
+            yield event.plain_result(
+                self._component_not_ready_message("记忆引擎", "/lmem unfreeze")
+            )
+            return
+
+        target = str(persona_arg or "").strip()
+        if not target or target.casefold() == "list":
+            yield event.plain_result(t("freeze.usage"))
+            return
+
+        try:
+            if target.casefold() == "current":
+                target = str(await get_persona_id(self.context, event) or "").strip()
+                if not target:
+                    yield event.plain_result(t("freeze.no_current_persona"))
+                    return
+
+            grace_days = float(
+                self.config_manager.get("maintenance.freeze_grace_days", 7) or 0
+            )
+            # 先确认该 persona 确实在冻结列表里，再执行解冻：unfreeze() 对
+            # "从未冻结 + grace_days>0" 会写入一条宽限记录，若先写后判，会让
+            # 从未冻结的 persona 凭空获得豁免期。
+            entries = await store.entries()
+            if target not in {item["persona_id"] for item in entries}:
+                yield event.plain_result(t("freeze.not_frozen", persona=target))
+                return
+
+            await store.unfreeze(target, grace_days=grace_days)
+            refreshed = 0
+            if self.memory_engine is not None:
+                refreshed = await self.memory_engine.refresh_persona_access_time(target)
+            grace_note = (
+                t("freeze.grace_note", days=int(grace_days))
+                if grace_days > 0
+                else t("freeze.grace_note_none")
+            )
+            message = t("freeze.unfreeze_success", persona=target, grace_note=grace_note)
+            if refreshed:
+                message = message + "\n" + t("freeze.refreshed", count=refreshed)
+            yield event.plain_result(message)
+        except Exception as e:
+            logger.error(f"{tag('cmd')} 解冻 persona 失败: {e}", exc_info=True)
+            yield event.plain_result(
+                self._format_error_message(t("freeze.unfreeze_action_name"), e)
             )
 
     async def handle_cleanup(

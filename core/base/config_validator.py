@@ -92,6 +92,23 @@ class RecallEngineConfig(BaseModel):
         pattern="^(all|event_only)$",
         description="记忆类型过滤：all 或 event_only",
     )
+    search_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=60.0,
+        description=(
+            "主链路记忆召回（含 embedding 检索）的最长等待秒数，"
+            "超时跳过注入、不阻塞用户回复；0 表示不限时"
+        ),
+    )
+    isolate_persona_memory: bool = Field(
+        default=True,
+        description=(
+            "persona 记忆隔离：同群多 Bot 共用同一 session 时，按写入记忆的 Bot "
+            "self_id 过滤，自动召回与检索工具只返回当前 Bot 自己写入的记忆；"
+            "无 Bot 标识的旧记忆仍保留，单 Bot 部署可关闭"
+        ),
+    )
 
 
 class ReflectionEngineConfig(BaseModel):
@@ -108,17 +125,6 @@ class ReflectionEngineConfig(BaseModel):
         ge=1,
         le=2000,
         description="模型内容安全/政策 skip 或 Provider 高置信内容安全拒绝（含 AstrBot content_filter）时推进的 CM 单位数",
-    )
-
-
-class AgentToolsConfig(BaseModel):
-    """Agent 工具配置"""
-
-    enable_recall_tool: bool = Field(
-        default=True, description="是否启用 Agent 主动回忆工具"
-    )
-    enable_memorize_tool: bool = Field(
-        default=False, description="是否启用 Agent 主动记忆写入工具"
     )
 
 
@@ -139,6 +145,15 @@ class MaintenanceConfig(BaseModel):
     backup_keep_days: int = Field(
         default=7, ge=0, le=365, description="备份保留天数（0 关闭）"
     )
+    freeze_grace_days: int = Field(
+        default=7,
+        ge=0,
+        le=3650,
+        description=(
+            "解冻 persona 后的清理豁免天数（0 关闭豁免）；"
+            "冻结期间照常衰减但绝不自动删除"
+        ),
+    )
 
 
 class ProviderConfig(BaseModel):
@@ -147,7 +162,27 @@ class ProviderConfig(BaseModel):
     embedding_provider_id: str | None = Field(
         default=None, description="Embedding Provider ID"
     )
+    embedding_batch_size: int = Field(
+        default=16,
+        ge=1,
+        le=2048,
+        description=(
+            "索引重建时单次请求嵌入的文本条数（1-2048）。不同 Provider 上限不同"
+            "（OpenAI 官方 2048、DashScope text-embedding-v4 仅 10）；超出上限时"
+            "插件会自动降批重试，但按上限配置可减少无效请求"
+        ),
+    )
     llm_provider_id: str | None = Field(default=None, description="LLM Provider ID")
+    llm_max_retries: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description=(
+            "萃取 LLM 调用的最大尝试次数（含首次，范围 1-10，默认对齐 AstrBot "
+            "provider_settings.request_max_retries 的 5 次）。"
+            "仅普通调用失败与非法 JSON 响应触发重试；status=skip 与内容安全拒绝不重试"
+        ),
+    )
 
 
 class ImportanceDecayConfig(BaseModel):
@@ -231,7 +266,6 @@ class LivingMemoryConfig(BaseModel):
     reflection_engine: ReflectionEngineConfig = Field(
         default_factory=ReflectionEngineConfig
     )
-    agent_tools: AgentToolsConfig = Field(default_factory=AgentToolsConfig)
     provider_settings: ProviderConfig = Field(default_factory=ProviderConfig)
     graph_memory: GraphMemoryConfig = Field(default_factory=GraphMemoryConfig)
     importance_decay: ImportanceDecayConfig = Field(
@@ -242,39 +276,6 @@ class LivingMemoryConfig(BaseModel):
     )
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容
-
-
-def _migrate_log_with_bot_id(config: dict[str, Any]) -> dict[str, Any]:
-    """旧配置 log.log_with_bot_id → 顶层全局配置 log_with_bot_id。
-
-    真实 AstrBot 4.27.3 会在插件 __init__ 之前用 _conf_schema.json 做完整性
-    注入：旧 `log` 配置组与顶层 `log_with_bot_id` 都是隐藏兼容键注入出来的默认值
-    （顶层恒为 False，旧 `log` 组内保留旧值）。因此：
-
-    - 顶层为 True：保留（用户显式开启）。
-    - 否则若旧 `log.log_with_bot_id` 为 True：视为旧用户意图，迁移为 True。
-      注意：注入后顶层 False 无法与“用户显式 False”区分，但隐藏 `log` 组对用户
-      不可见、旧配置又不存在顶层键，因此“顶层 False + legacy True”只会来自
-      完整性注入的旧配置迁移场景，必须以旧意图为准，否则真实迁移会静默失效。
-    - 否则保持默认 False。
-
-    迁移同时移除已废弃的 log 配置组，避免其作为 extra 字段残留。本函数幂等：
-    已迁移配置（无 log 组）会原样返回。
-    """
-    migrated = dict(config)
-    top_level = migrated.get("log_with_bot_id")
-    legacy_log = migrated.get("log")
-    legacy_value = None
-    if isinstance(legacy_log, dict):
-        legacy_value = legacy_log.get("log_with_bot_id")
-    if top_level is True:
-        migrated["log_with_bot_id"] = True
-    elif legacy_value is True:
-        migrated["log_with_bot_id"] = True
-    else:
-        migrated["log_with_bot_id"] = False
-    migrated.pop("log", None)
-    return migrated
 
 
 def _migrate_graph_route_weight(config: dict[str, Any]) -> dict[str, Any]:
@@ -324,10 +325,9 @@ def validate_config(raw_config: dict[str, Any]) -> LivingMemoryConfig:
         ValueError: 配置验证失败
     """
     migrated = _migrate_graph_route_weight(raw_config)
-    migrated = _migrate_log_with_bot_id(migrated)
     try:
         config = LivingMemoryConfig(**migrated)
-        logger.info(f"{tag('config')} 配置验证成功")
+        logger.debug(f"{tag('config')} 配置验证成功")
         return config
     except Exception as e:
         logger.error(f"{tag('config')} 配置验证失败: {e}")
@@ -373,7 +373,6 @@ def merge_config_with_defaults(user_config: dict[str, Any]) -> dict[str, Any]:
     # 旧配置迁移需在合并默认值之前执行：否则默认 graph_route_weight 已存在，
     # 文档-only 旧配置将无法推导（优先级：显式 graph > document 推导 > 默认）。
     migrated = _migrate_graph_route_weight(dict(user_config))
-    migrated = _migrate_log_with_bot_id(migrated)
     merged = deep_merge(default_config, migrated)
     logger.debug(f"{tag('config')} 配置已与默认值合并")
     return merged

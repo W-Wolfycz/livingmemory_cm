@@ -98,8 +98,21 @@ class ReflectionBatchWriter:
                     cursor_key, start_cursor, end_cursor
                 )
                 batch_size = len(candidates)
+                # persona 记忆隔离：把写入时的 Bot self_id 记入 metadata，供召回过滤。
+                # 一批 CM 记录同属当前会话的 Bot，取第一条非空 self_id 即可；
+                # 旧 CM 记录无该字段时留空（此类记忆按旧数据兼容处理，不过滤）。
+                bot_self_id = next(
+                    (
+                        str(message.get("self_id") or "").strip()
+                        for message in cm_messages
+                        if message.get("self_id")
+                    ),
+                    "",
+                )
                 for batch_index, candidate in enumerate(candidates, 1):
                     metadata = dict(candidate.metadata)
+                    if bot_self_id:
+                        metadata["self_id"] = bot_self_id
                     metadata["source_window"] = {
                         "session_id": session_id,
                         "mode": "cm_takeover",

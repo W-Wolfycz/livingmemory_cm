@@ -6,7 +6,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 [chat_memory](https://github.com/W-Wolfycz/chat_memory) 的上下文接管模式维护。
 本项目是独立的 CM-only fork，不是上游官方发行版。
 
-- 当前版本：`2.5.7-cm.1`
+- 当前版本：`2.5.7-cm.2`
 - 源码仓库：<https://github.com/W-Wolfycz/livingmemory_cm>
 - 许可证：GNU Affero General Public License v3.0（AGPL-3.0）
 
@@ -23,7 +23,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 - 记忆包含中性摘要、关键事实和独立记忆原子，支持 TTL、衰减、归档和图关系维护。
 - SQLite/FAISS 使用代际与 Embedding 指纹校验；索引重建采用影子存储，失败时保留旧索引。
 - Dashboard 采用中文单语言，保留 CM persona 筛选、批量编辑/删除和 2D 知识图谱。
-- 可选提供 `recall_long_term_memory` 与 `memorize_long_term_memory` 两个 Agent 工具。
+- 向 Agent 提供 `recall_long_term_memory` 检索工具（恒开）。
 
 相较上游，本 fork 不提供 PromptManager、JSON/CSV 导入导出、原始来源编辑和上游自管
 conversation history。
@@ -48,14 +48,19 @@ Release 包不包含 `data/`、数据库、FAISS 索引或用户配置。升级�
 
 - `provider_settings.embedding_provider_id`：Embedding Provider，留空使用 AstrBot 默认值。
 - `provider_settings.llm_provider_id`：LLM Provider，留空使用 AstrBot 默认值。
+- `provider_settings.embedding_batch_size`：索引重建时单次请求嵌入的文本条数，默认 `16`（OpenAI 官方上限 2048、DashScope text-embedding-v4 仅 10）。
+- `provider_settings.llm_max_retries`：萃取 LLM 调用的最大尝试次数（含首次），默认 `5`（对齐 AstrBot 请求重试默认值），范围 1-10；底层 Provider 请求固定单次尝试，由本项统一控制重试。
 - `recall_engine.injection_method`：长期记忆注入方式，默认 `extra_user_content`。
 - `recall_engine.query_context_rounds`：用于指代消歧的最近 CM 历史，单位跟随 CM `llm_status_filter`（仅 `llm_success` 按轮、含其他状态按条），默认 `2`。
+- `recall_engine.search_timeout_seconds`：主链路记忆召回（含 embedding 检索）超时降级，默认 `5` 秒；`0` 不限时。
+- `recall_engine.isolate_persona_memory`：persona 记忆隔离（默认开启），只召回当前 Bot 自己写入的记忆；无 Bot 标识的旧记忆仍保留。
 - `reflection_engine.trigger_count`：反思触发数量；`0` 跟随 ChatMemory 配置。
 - `graph_memory.graph_route_weight`：图路融合权重，默认 `0.35`；文档路权重自动为 `1 - graph_route_weight`。
-- `log_with_bot_id`（全局配置项，不属于配置段）：多 Bot 共存时在关键事件日志前缀附加 self_id 原文（如 `[livingmemory_cm:bot-10000]`），便于定位；会话/用户引用仍脱敏。
+- `log_with_bot_id`（全局配置项，不属于配置段）：多 Bot 共存时在关键事件日志前缀附加 self_id 原文并与模块名并存（如 `[livingmemory_cm:bot-10000][recall]`），便于定位；会话/用户引用仍脱敏。
 - `maintenance.cleanup_days_threshold`、`backup_keep_days`：`0` 表示关闭对应维护任务。
+- `maintenance.freeze_grace_days`：解冻 persona 后的清理豁免天数，默认 `7`；`0` 不设豁免。
 
-全部 7 个配置段 + 1 个全局配置项（`log_with_bot_id`）、共 44 个配置项的作用和建议见
+全部 6 个配置段 + 1 个全局配置项（`log_with_bot_id`）、共 47 个配置项的作用和建议见
 AstrBot 配置面板中各配置项的说明文案。
 
 ## 命令
@@ -68,6 +73,8 @@ AstrBot 配置面板中各配置项的说明文案。
 | `/lmem rebuild-graph` | 使用影子存储安全重建图索引 |
 | `/lmem webui` | 查看 Dashboard 入口 |
 | `/lmem reset` | 重置当前会话的记忆上下文 |
+| `/lmem freeze <persona\|current\|list>` | 冻结 persona 进入冷存储（不召回、不自动清理；冻结期间照常衰减） |
+| `/lmem unfreeze <persona\|current>` | 解冻 persona 并进入清理豁免期（刷新访问时间） |
 | `/lmem cleanup [preview\|exec]` | 预演或清理历史消息中的旧注入片段 |
 | `/lmem help` | 显示帮助和当前源码入口 |
 
@@ -81,7 +88,7 @@ python tests\run_tests.py
 本地测试只验证领域算法、状态机、存储协议和边界条件；`astrbot.api` 与 `astrbot.core`
 由 `tests/conftest.py` 提供最小 fake 类型树，不导入、也不安装真实 AstrBot
 core/backend，因此不再需要 `--astrbot-source` / `--astrbot-backend`。当前代码级
-回归为 `508 passed`；AstrBot reload、真实 core 兼容性、Provider、平台发送、
+回归为 `531 passed`；AstrBot reload、真实 core 兼容性、Provider、平台发送、
 ChatMemory Hook 顺序和 Dashboard 浏览器交互必须在部署端验收。
 
 ## 更新记录

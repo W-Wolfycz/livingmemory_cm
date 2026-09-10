@@ -11,6 +11,9 @@ from livingmemory_cm.core.event_handler_modules.memory_reflection import (
     MemoryReflection,
 )
 from livingmemory_cm.core.event_handler_modules.memory_recall import MemoryRecall
+from livingmemory_cm.core.event_handler_modules.memory_recall import (
+    _resolve_search_timeout,
+)
 from livingmemory_cm.core.event_handler_modules import (
     memory_reflection as reflection_hook_module,
 )
@@ -393,6 +396,9 @@ async def test_batch_writer_writes_all_generated_topic_memories() -> None:
     second_metadata = memory_engine.add_memory.await_args_list[1].kwargs[
         "metadata"
     ]
+    # persona 记忆隔离：写入时把 CM 记录中的 Bot self_id 记入 metadata
+    assert first_metadata["self_id"] == "10000"
+    assert second_metadata["self_id"] == "10000"
     assert first_metadata["source_window"]["batch_index"] == 1
     assert second_metadata["source_window"]["batch_index"] == 2
     assert second_metadata["source_window"]["batch_size"] == 2
@@ -859,6 +865,143 @@ async def test_recall_query_max_chars_zero_disables_history() -> None:
     recall.context.get_registered_star.assert_not_called()
 
 
+# ── 主链路召回超时降级 ───────────────────────────────────────────────────────
+
+
+def _make_timeout_recall(timeout: float) -> MemoryRecall:
+    recall = _make_recall()
+    recall.config_manager.get.side_effect = lambda key, default=None: {
+        "recall_engine.search_timeout_seconds": timeout,
+    }.get(key, default)
+    return recall
+
+
+@pytest.mark.asyncio
+async def test_recall_search_timeout_skips_injection() -> None:
+    """embedding 检索卡住时按 search_timeout_seconds 超时降级为空结果。"""
+    recall = _make_timeout_recall(0.2)
+
+    async def _hang(**kwargs):
+        await asyncio.sleep(10)
+        return ["不应返回"]
+
+    recall.memory_engine = SimpleNamespace(search_memories=_hang)
+
+    started = asyncio.get_event_loop().time()
+    results = await recall._search_memories_guarded(
+        session_ref="s:ref",
+        query="测试查询",
+        k=5,
+        session_id="demo:GroupMessage:group_demo",
+        persona_id="persona_demo",
+    )
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert results == []
+    assert elapsed < 5  # 远小于挂起的 10s，证明超时降级生效
+
+
+@pytest.mark.asyncio
+async def test_recall_search_timeout_zero_means_unlimited() -> None:
+    """search_timeout_seconds=0：不限时，正常返回检索结果。"""
+    recall = _make_timeout_recall(0)
+
+    async def _ok(**kwargs):
+        return ["记忆结果"]
+
+    recall.memory_engine = SimpleNamespace(search_memories=_ok)
+
+    results = await recall._search_memories_guarded(
+        session_ref="s:ref",
+        query="测试查询",
+        k=5,
+        session_id="demo:GroupMessage:group_demo",
+        persona_id="persona_demo",
+    )
+
+    assert results == ["记忆结果"]
+
+
+@pytest.mark.asyncio
+async def test_recall_search_timeout_defaults_to_five_seconds() -> None:
+    """未配置时默认 5 秒上限；快速返回不受影响。"""
+    recall = _make_recall()
+
+    async def _ok(**kwargs):
+        return ["记忆结果"]
+
+    recall.memory_engine = SimpleNamespace(search_memories=_ok)
+
+    results = await recall._search_memories_guarded(
+        session_ref="s:ref",
+        query="测试查询",
+        k=5,
+        session_id="demo:GroupMessage:group_demo",
+        persona_id="persona_demo",
+    )
+
+    assert results == ["记忆结果"]
+    assert recall.config_manager.get.call_args_list[0].args == (
+        "recall_engine.search_timeout_seconds",
+        5.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_search_inner_timeout_is_not_reported_as_recall_timeout() -> None:
+    """检索链内部抛出的 TimeoutError 必须原样上抛。
+
+    3.11+ 下 asyncio.TimeoutError is TimeoutError，若用 except TimeoutError 兜底，
+    内部真实超时会被伪装成"主链路召回超时"，掩盖故障来源。
+    """
+    recall = _make_timeout_recall(5.0)
+
+    async def _inner_timeout(**kwargs):
+        raise TimeoutError("inner embedding timeout")
+
+    recall.memory_engine = SimpleNamespace(search_memories=_inner_timeout)
+
+    with pytest.raises(TimeoutError):
+        await recall._search_memories_guarded(
+            session_ref="s:ref",
+            query="测试查询",
+            k=5,
+            session_id="demo:GroupMessage:group_demo",
+            persona_id="persona_demo",
+        )
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, 5.0),
+        ("", 5.0),
+        ([], 5.0),
+        ({}, 5.0),
+        ("abc", 5.0),
+        (0, 0.0),
+        (-1, -1.0),
+        ("3", 3.0),
+        (2.5, 2.5),
+    ],
+)
+def test_recall_search_timeout_config_parsing(value, expected) -> None:
+    """脏值回落默认 5s（不关掉保护），只有显式 0/负值才是不限时。"""
+    config_manager = Mock()
+    config_manager.get.side_effect = lambda key, default=None: {
+        "recall_engine.search_timeout_seconds": value,
+    }.get(key, default)
+
+    assert _resolve_search_timeout(config_manager) == expected
+
+
+def test_recall_search_timeout_missing_key_uses_default() -> None:
+    config_manager = Mock()
+    config_manager.get.side_effect = lambda key, default=None: default
+
+    assert _resolve_search_timeout(config_manager) == 5.0
+
+
 # ── 日志 bot 前缀（self_id 原文）与关键入口使用 event tag ─────────────────────
 
 
@@ -877,7 +1020,7 @@ class _FakeRecallEvent:
 
 
 def test_log_tag_event_uses_raw_self_id_bot_prefix() -> None:
-    """log_with_bot_id=True 时前缀用原始 self_id，不再输出 blake2s hash。"""
+    """log_with_bot_id=True 时 bot 标识与模块名并存，不再丢失模块定位。"""
     from livingmemory_cm import log as log_module
 
     log_module.configure(log_with_bot_id=True)
@@ -886,9 +1029,11 @@ def test_log_tag_event_uses_raw_self_id_bot_prefix() -> None:
         prefix = log_module.tag_event("recall", event)
         # 原文输出：包含完整 self_id，且不是 blake2s 脱敏短 hash
         assert "bot-10000" in prefix
-        assert prefix == "[livingmemory_cm:bot-10000]"
+        assert prefix == "[livingmemory_cm:bot-10000][recall]"
         assert log_module.tag_event("recall", event) == prefix
         assert log_module.tag("recall", event) == prefix
+        # 无 module 时只保留 bot 段
+        assert log_module.tag_event(None, event) == "[livingmemory_cm:bot-10000]"
     finally:
         log_module.configure(log_with_bot_id=False)
 

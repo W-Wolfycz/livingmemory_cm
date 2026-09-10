@@ -40,7 +40,7 @@ class ConfigManager:
             self._config = self._config_obj.model_dump()
             # 迁移成功后从原始配置对象移除隐藏兼容键，避免 AstrBot 完整性检查
             # 反复把旧值注入回磁盘，导致用户在 UI 的后续操作被 legacy 值覆盖
-            # （如关闭 log_with_bot_id、把 graph_route_weight 设回默认 0.35）。
+            # （如把 graph_route_weight 设回默认 0.35）。
             self._remove_legacy_keys_from_source()
         except Exception:
             logger.warning(f"{tag('config')} 配置验证失败，已降级为默认配置", exc_info=True)
@@ -52,25 +52,31 @@ class ConfigManager:
                 raise ConfigurationError(f"加载默认配置失败: {e2}") from e2
 
     def _remove_legacy_keys_from_source(self) -> None:
-        """从原始配置对象（内存）移除已迁移的隐藏兼容键。
+        """把迁移结果写回原始配置对象，并移除已迁移的隐藏兼容键。
 
-        迁移逻辑（config_validator）只在浅拷贝上工作，原始对象中的
-        ``log`` 组与 ``graph_memory.document_route_weight`` 仍然存在。AstrBot 的
-        ``check_config_integrity`` 会保留这些已存在键的值，因此不清除的话，
-        每次加载都会再次执行同一迁移，并把用户在 UI 上的新设置覆盖回旧值。
-        本方法只改内存；AstrBotConfig 路径的落盘由 ``persist_legacy_cleanup``
-        在异步初始化阶段完成。
+        迁移逻辑（config_validator）只在浅拷贝上工作；若只删除原始对象中的
+        ``graph_memory.document_route_weight`` 而不写回迁移值，
+        ``persist_legacy_cleanup`` 落盘的仍是 AstrBot 注入的默认值
+        （graph_route_weight=0.35），下次加载时迁移结果会静默丢失。因此这里同步
+        把 ``self._config`` 中迁移后的值写回原始对象：reload 后旧用户意图保持，
+        且 legacy 键已清除，用户在 UI 的新设置不再被旧值覆盖。本方法只改内存；
+        AstrBotConfig 路径的落盘由 ``persist_legacy_cleanup`` 在异步初始化阶段完成。
+
+        顶层 ``log_with_bot_id`` 是唯一入口，不存在旧 ``log`` 组的迁移。
         """
         source = self._raw_config
         if not isinstance(source, dict):
             return
-        source.pop("log", None)
         graph_memory = source.get("graph_memory")
-        if isinstance(graph_memory, dict):
+        migrated_graph = self._config.get("graph_memory")
+        if isinstance(graph_memory, dict) and isinstance(migrated_graph, dict):
             graph_memory.pop("document_route_weight", None)
+            graph_memory["graph_route_weight"] = migrated_graph.get(
+                "graph_route_weight", 0.35
+            )
 
     async def persist_legacy_cleanup(self) -> None:
-        """把隐藏兼容键的移除持久化到磁盘（仅 AstrBotConfig 路径）。
+        """把迁移结果与隐藏兼容键的清除持久化到磁盘（仅 AstrBotConfig 路径）。
 
         由 ``main.py`` 的 ``initialize()`` 调用：AstrBot 传入的配置对象是
         ``AstrBotConfig``（dict 子类），其 ``save_config_async`` 会落盘当前快照；
@@ -89,7 +95,7 @@ class ConfigManager:
             )
             return
         logger.debug(
-            f"{tag('config')} 已持久化隐藏兼容键清理（log/document_route_weight）"
+            f"{tag('config')} 已持久化隐藏兼容键清理（graph_memory.document_route_weight）"
         )
 
     def get(self, key: str, default: Any = None) -> Any:

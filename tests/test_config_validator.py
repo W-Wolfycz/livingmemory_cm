@@ -28,135 +28,65 @@ def test_graph_memory_config_has_single_graph_route_weight() -> None:
     assert "validate_route_weights" not in type(config).__dict__
 
 
-def test_validate_config_default_graph_route_weight() -> None:
-    validated = validate_config({})
-    assert validated.graph_memory.graph_route_weight == 0.35
-    dumped = validated.model_dump()["graph_memory"]
-    assert dumped.get("graph_route_weight") == 0.35
-    assert "document_route_weight" not in dumped
-
-
-def test_merge_legacy_both_weights_prefers_graph() -> None:
-    merged = merge_config_with_defaults(
-        {
-            "graph_memory": {
-                "document_route_weight": 0.6,
-                "graph_route_weight": 0.4,
-            }
-        }
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == 0.4
-    assert "document_route_weight" not in graph_mem
-
-
-def test_merge_legacy_document_only_derives_graph() -> None:
-    merged = merge_config_with_defaults(
-        {"graph_memory": {"document_route_weight": 0.6}}
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == pytest.approx(0.4)
-    assert "document_route_weight" not in graph_mem
-
-
-def test_merge_legacy_graph_only_keeps_graph() -> None:
-    merged = merge_config_with_defaults(
-        {"graph_memory": {"graph_route_weight": 0.7}}
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == 0.7
-    assert "document_route_weight" not in graph_mem
-
-
-def test_merge_no_legacy_keeps_default() -> None:
-    merged = merge_config_with_defaults({})
-    assert merged["graph_memory"]["graph_route_weight"] == 0.35
-    assert "document_route_weight" not in merged["graph_memory"]
-
-
-def test_validate_config_legacy_document_only() -> None:
-    validated = validate_config(
-        {"graph_memory": {"document_route_weight": 0.6}}
-    )
-    assert validated.graph_memory.graph_route_weight == pytest.approx(0.4)
-
-
-def test_validate_config_legacy_both_keeps_graph() -> None:
-    validated = validate_config(
-        {
-            "graph_memory": {
-                "document_route_weight": 0.6,
-                "graph_route_weight": 0.4,
-            }
-        }
-    )
-    assert validated.graph_memory.graph_route_weight == 0.4
-
-
-# ============ AstrBot 完整性注入后的 graph 迁移 ============
+# ============ graph_route_weight 迁移 ============
 # 注入后 document_route_weight 恒存在（默认 0.65 也会被注入），
 # 必须按值而非“键是否存在”判断旧配置。
 
 
-def test_merge_astrbot_injected_document_non_default_derives() -> None:
-    # 旧用户：document=0.6，graph 被注入为默认 0.35 → 推导 graph=0.4
-    merged = merge_config_with_defaults(
-        {
-            "graph_memory": {
-                "graph_route_weight": 0.35,
-                "document_route_weight": 0.6,
-            }
-        }
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == pytest.approx(0.4)
-    assert "document_route_weight" not in graph_mem
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        pytest.param({}, 0.35, id="no-legacy-keeps-default"),
+        pytest.param(
+            {"graph_memory": {"graph_route_weight": 0.7}}, 0.7, id="graph-only"
+        ),
+        pytest.param(
+            {"graph_memory": {"document_route_weight": 0.6}}, 0.4, id="document-only"
+        ),
+        pytest.param(
+            {
+                "graph_memory": {
+                    "graph_route_weight": 0.4,
+                    "document_route_weight": 0.6,
+                }
+            },
+            0.4,
+            id="explicit-graph-preferred",
+        ),
+        pytest.param(
+            {
+                "graph_memory": {
+                    "graph_route_weight": 0.35,
+                    "document_route_weight": 0.6,
+                }
+            },
+            0.4,
+            id="injected-default-graph-derives-from-document",
+        ),
+        pytest.param(
+            {
+                "graph_memory": {
+                    "graph_route_weight": 0.35,
+                    "document_route_weight": 0.65,
+                }
+            },
+            0.35,
+            id="injected-double-default-keeps-default",
+        ),
+    ],
+)
+def test_graph_route_weight_migration(raw, expected) -> None:
+    """merge 与 validate 两条路径一致：单一 graph_route_weight，legacy 键移除。"""
+    merged = merge_config_with_defaults(raw)
+    assert merged["graph_memory"]["graph_route_weight"] == pytest.approx(expected)
+    assert "document_route_weight" not in merged["graph_memory"]
 
-
-def test_merge_astrbot_injected_graph_explicit_preferred() -> None:
-    # 显式 graph 优先：即使 document 也非默认，仍保留 graph
-    merged = merge_config_with_defaults(
-        {
-            "graph_memory": {
-                "graph_route_weight": 0.4,
-                "document_route_weight": 0.6,
-            }
-        }
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == 0.4
-    assert "document_route_weight" not in graph_mem
-
-
-def test_merge_astrbot_injected_double_default_keeps_default() -> None:
-    # 双默认（graph=0.35、document=0.65）→ 保持默认 0.35
-    merged = merge_config_with_defaults(
-        {
-            "graph_memory": {
-                "graph_route_weight": 0.35,
-                "document_route_weight": 0.65,
-            }
-        }
-    )
-    graph_mem = merged["graph_memory"]
-    assert graph_mem["graph_route_weight"] == 0.35
-    assert "document_route_weight" not in graph_mem
-
-
-def test_validate_astrbot_injected_document_non_default_derives() -> None:
-    validated = validate_config(
-        {
-            "graph_memory": {
-                "graph_route_weight": 0.35,
-                "document_route_weight": 0.6,
-            }
-        }
-    )
-    assert validated.graph_memory.graph_route_weight == pytest.approx(0.4)
+    validated = validate_config(raw)
+    assert validated.graph_memory.graph_route_weight == pytest.approx(expected)
     assert "document_route_weight" not in validated.model_dump()["graph_memory"]
 
 
-# ==================== log_with_bot_id 顶层全局项迁移 ====================
+# ==================== log_with_bot_id 顶层全局项 ====================
 
 
 def test_config_section_order_log_with_bot_id_first() -> None:
@@ -164,159 +94,89 @@ def test_config_section_order_log_with_bot_id_first() -> None:
     keys = list(defaults.keys())
     assert keys[0] == "log_with_bot_id"
     assert "provider_settings" in keys
-    assert len(keys) == 8
+    assert len(keys) == 7
     assert "log" not in defaults
     assert "document_route_weight" not in defaults["graph_memory"]
 
 
-def test_default_log_with_bot_id_false() -> None:
-    defaults = get_default_config()
-    assert defaults["log_with_bot_id"] is False
-    validated = validate_config({})
-    assert validated.log_with_bot_id is False
-    assert not hasattr(validated, "log")
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        pytest.param({}, False, id="no-config-keeps-default"),
+        pytest.param({"log_with_bot_id": True}, True, id="top-level-true"),
+        pytest.param({"log_with_bot_id": False}, False, id="top-level-false"),
+        # 旧的 log 配置组已不再迁移：即便里面是 true 也不生效
+        pytest.param(
+            {"log": {"log_with_bot_id": True}}, False, id="legacy-group-ignored"
+        ),
+        pytest.param(
+            {"log_with_bot_id": True, "log": {"log_with_bot_id": False}},
+            True,
+            id="top-level-wins-over-legacy",
+        ),
+    ],
+)
+def test_log_with_bot_id_is_top_level_only(raw, expected) -> None:
+    """顶层 log_with_bot_id 是唯一入口，旧 log 组不参与解析。"""
+    assert validate_config(raw).log_with_bot_id is expected
 
 
-def test_merge_legacy_log_group_migrates_to_top_level() -> None:
-    merged = merge_config_with_defaults({"log": {"log_with_bot_id": True}})
-    assert merged["log_with_bot_id"] is True
-    assert "log" not in merged
-
-
-def test_merge_astrbot_injected_legacy_true_migrates() -> None:
-    # AstrBot 注入后：顶层 log_with_bot_id 恒为默认 False（旧配置无顶层键），
-    # 旧 log.log_with_bot_id=true 由隐藏兼容键保留 → 必须以旧意图迁移为 True，
-    # 否则真实旧用户迁移会静默失效。
-    merged = merge_config_with_defaults(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": True}}
-    )
-    assert merged["log_with_bot_id"] is True
-    assert "log" not in merged
-
-
-def test_merge_top_level_true_keeps_true() -> None:
-    merged = merge_config_with_defaults(
-        {"log_with_bot_id": True, "log": {"log_with_bot_id": False}}
-    )
-    assert merged["log_with_bot_id"] is True
-    assert "log" not in merged
-
-
-def test_merge_top_level_false_legacy_false_stays_false() -> None:
-    # 顶层显式 false（新 UI 关闭）且 legacy 为注入默认 false → 保持 false
-    merged = merge_config_with_defaults(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": False}}
-    )
-    assert merged["log_with_bot_id"] is False
-    assert "log" not in merged
-
-
-def test_merge_no_log_config_keeps_default() -> None:
-    merged = merge_config_with_defaults({})
-    assert merged["log_with_bot_id"] is False
-    assert "log" not in merged
-
-
-def test_validate_config_legacy_log_group_migrates() -> None:
-    validated = validate_config({"log": {"log_with_bot_id": True}})
-    assert validated.log_with_bot_id is True
-    assert not hasattr(validated, "log")
-
-
-def test_validate_config_legacy_log_group_disabled() -> None:
-    validated = validate_config({"log": {"log_with_bot_id": False}})
-    assert validated.log_with_bot_id is False
-
-
-def test_validate_astrbot_injected_legacy_true_migrates() -> None:
-    validated = validate_config(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": True}}
-    )
-    assert validated.log_with_bot_id is True
-    assert not hasattr(validated, "log")
-
-
-def test_validate_top_level_true_keeps_true() -> None:
-    validated = validate_config(
-        {"log_with_bot_id": True, "log": {"log_with_bot_id": True}}
-    )
-    assert validated.log_with_bot_id is True
-
-
-def test_validate_top_level_false_legacy_false_stays_false() -> None:
-    validated = validate_config(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": False}}
-    )
-    assert validated.log_with_bot_id is False
-
-
-def test_config_manager_get_top_level_log_with_bot_id() -> None:
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        pytest.param({"log_with_bot_id": True}, True, id="top-level-true"),
+        pytest.param({"log": {"log_with_bot_id": True}}, False, id="legacy-ignored"),
+        pytest.param({}, False, id="default"),
+    ],
+)
+def test_config_manager_get_log_with_bot_id(raw, expected) -> None:
     from livingmemory_cm.core.base.config_manager import ConfigManager
 
-    manager = ConfigManager({"log_with_bot_id": True})
-    assert manager.get("log_with_bot_id") is True
+    assert ConfigManager(raw).get("log_with_bot_id") is expected
 
 
-def test_config_manager_get_migrated_log_with_bot_id() -> None:
-    from livingmemory_cm.core.base.config_manager import ConfigManager
+def test_config_manager_removes_graph_legacy_key_from_source() -> None:
+    """graph 迁移结果写回原始配置对象，并移除隐藏兼容键。
 
-    manager = ConfigManager({"log": {"log_with_bot_id": True}})
-    assert manager.get("log_with_bot_id") is True
-
-
-def test_config_manager_get_default_log_with_bot_id() -> None:
-    from livingmemory_cm.core.base.config_manager import ConfigManager
-
-    manager = ConfigManager({})
-    assert manager.get("log_with_bot_id") is False
-
-
-def test_config_manager_astrbot_injected_legacy_true_migrates() -> None:
-    from livingmemory_cm.core.base.config_manager import ConfigManager
-
-    manager = ConfigManager(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": True}}
-    )
-    assert manager.get("log_with_bot_id") is True
-
-
-def test_config_manager_removes_legacy_keys_from_source() -> None:
-    """迁移成功后从原始配置对象移除隐藏兼容键，避免 UI 后续操作被覆盖。"""
+    legacy 键必须删除（避免 UI 后续操作被旧值覆盖），同时迁移结果要写回原始
+    对象（否则 reload 后迁移值随注入默认值一起丢失）。
+    """
     from livingmemory_cm.core.base.config_manager import ConfigManager
 
     source = {
-        "log_with_bot_id": False,
-        "log": {"log_with_bot_id": True},
         "graph_memory": {"graph_route_weight": 0.35, "document_route_weight": 0.6},
     }
     manager = ConfigManager(source)
 
-    assert manager.get("log_with_bot_id") is True
     assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.4)
-    assert "log" not in source
+    # legacy 键已从原始对象移除
     assert "document_route_weight" not in source["graph_memory"]
+    # 迁移后的值已写回原始对象，落盘/reload 后保持一致
+    assert source["graph_memory"]["graph_route_weight"] == pytest.approx(0.4)
 
 
 @pytest.mark.asyncio
 async def test_config_manager_persist_legacy_cleanup_calls_saver() -> None:
-    """AstrBotConfig 路径：落盘调用 save_config_async；失败只记日志不抛出。"""
+    """AstrBotConfig 路径：落盘快照含迁移结果，且不再含 legacy 键。"""
     from livingmemory_cm.core.base.config_manager import ConfigManager
 
     class _SavingConfig(dict):
         def __init__(self, data):
             super().__init__(data)
             self.saved = 0
+            self.snapshot = None
 
         async def save_config_async(self):
             self.saved += 1
+            self.snapshot = dict(self)
 
-    source = _SavingConfig(
-        {"log_with_bot_id": False, "log": {"log_with_bot_id": True}}
-    )
+    source = _SavingConfig({"graph_memory": {"document_route_weight": 0.6}})
     manager = ConfigManager(source)
     await manager.persist_legacy_cleanup()
     assert source.saved == 1
-    assert "log" not in source
+    # 落盘快照即 reload 后的输入：迁移值保持、legacy 键消失
+    assert source.snapshot["graph_memory"]["graph_route_weight"] == pytest.approx(0.4)
+    assert "document_route_weight" not in source.snapshot["graph_memory"]
 
 
 @pytest.mark.asyncio
@@ -324,10 +184,10 @@ async def test_config_manager_persist_legacy_cleanup_ignores_plain_dict() -> Non
     """普通 dict（本地测试/非 AstrBot 路径）没有落盘方法，静默跳过。"""
     from livingmemory_cm.core.base.config_manager import ConfigManager
 
-    source = {"log_with_bot_id": False, "log": {"log_with_bot_id": True}}
+    source = {"graph_memory": {"document_route_weight": 0.6}}
     manager = ConfigManager(source)
     await manager.persist_legacy_cleanup()  # 不应抛异常
-    assert manager.get("log_with_bot_id") is True
+    assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.4)
 
 
 @pytest.mark.asyncio
@@ -339,10 +199,10 @@ async def test_config_manager_persist_legacy_cleanup_saver_failure_is_logged() -
         async def save_config_async(self):
             raise RuntimeError("disk full")
 
-    source = _BrokenSavingConfig({"log": {"log_with_bot_id": True}})
+    source = _BrokenSavingConfig({"graph_memory": {"document_route_weight": 0.6}})
     manager = ConfigManager(source)
     await manager.persist_legacy_cleanup()  # 不应抛异常
-    assert manager.get("log_with_bot_id") is True
+    assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.4)
 
 
 # ==================== _conf_schema.json 隐藏兼容键 ====================
@@ -353,30 +213,22 @@ def _load_schema() -> dict:
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
-def test_conf_schema_hidden_log_group_and_document_weight() -> None:
+def test_conf_schema_has_only_document_weight_hidden_key() -> None:
     schema = _load_schema()
     keys = list(schema.keys())
     assert keys[0] == "log_with_bot_id"
-    # 隐藏兼容 log 组存在且 invisible
-    log_group = schema.get("log")
-    assert log_group is not None
-    assert log_group.get("invisible") is True
-    assert log_group.get("type") == "object"
-    assert isinstance(log_group.get("items"), dict)
-    assert set(log_group["items"].keys()) == {"log_with_bot_id"}
-    assert log_group["items"]["log_with_bot_id"]["type"] == "bool"
-    assert log_group["items"]["log_with_bot_id"]["default"] is False
-    # 隐藏兼容 document_route_weight 存在且 invisible
+    # 旧的 log 隐藏兼容组已删除，不再保留一次性迁移
+    assert "log" not in schema
+    # 唯一保留的隐藏兼容键：graph_memory.document_route_weight
     doc = schema["graph_memory"]["items"].get("document_route_weight")
     assert doc is not None
     assert doc.get("invisible") is True
     assert doc.get("type") == "float"
     assert doc.get("default") == 0.65
-    # 可见键不因新增隐藏键而改变
     assert schema["log_with_bot_id"].get("type") == "bool"
 
 
-def test_conf_schema_visible_structure_unchanged_7_plus_1() -> None:
+def test_conf_schema_visible_structure_unchanged_6_plus_1() -> None:
     schema = _load_schema()
     total = 0
     section_count = 0
@@ -391,8 +243,8 @@ def test_conf_schema_visible_structure_unchanged_7_plus_1() -> None:
             total += len(visible_items)
         else:
             total += 1
-    assert section_count == 7
-    assert total == 44
+    assert section_count == 6
+    assert total == 47
 
 
 def test_conf_schema_graph_document_visible_count_unaffected() -> None:
@@ -402,3 +254,86 @@ def test_conf_schema_graph_document_visible_count_unaffected() -> None:
     assert "document_route_weight" not in visible_graph
     # 可见图段项数与合并前一致（不含隐藏兼容键）
     assert len(visible_graph) == 14
+
+
+def test_llm_max_retries_default_and_schema() -> None:
+    """llm_max_retries 默认 5，validator 与 schema 一致，越界被拒绝。"""
+    from livingmemory_cm.core.base.config_validator import (
+        ProviderConfig,
+        validate_config,
+    )
+
+    assert ProviderConfig().llm_max_retries == 5
+    schema = _load_schema()
+    item = schema["provider_settings"]["items"]["llm_max_retries"]
+    assert item["type"] == "int"
+    assert item["default"] == 5
+
+    assert validate_config({}).provider_settings.llm_max_retries == 5
+    assert (
+        validate_config({"provider_settings": {"llm_max_retries": 7}})
+        .provider_settings.llm_max_retries
+        == 7
+    )
+
+    with pytest.raises(Exception):
+        validate_config({"provider_settings": {"llm_max_retries": 0}})
+    with pytest.raises(Exception):
+        validate_config({"provider_settings": {"llm_max_retries": 11}})
+
+
+def test_search_timeout_seconds_default_and_schema() -> None:
+    """search_timeout_seconds 默认 5 秒，validator 与 schema 一致，越界被拒绝。"""
+    from livingmemory_cm.core.base.config_validator import (
+        RecallEngineConfig,
+        validate_config,
+    )
+
+    assert RecallEngineConfig().search_timeout_seconds == 5.0
+    schema = _load_schema()
+    item = schema["recall_engine"]["items"]["search_timeout_seconds"]
+    assert item["type"] == "float"
+    assert item["default"] == 5.0
+
+    assert validate_config({}).recall_engine.search_timeout_seconds == 5.0
+    assert (
+        validate_config({"recall_engine": {"search_timeout_seconds": 12.5}})
+        .recall_engine.search_timeout_seconds
+        == 12.5
+    )
+    assert (
+        validate_config({"recall_engine": {"search_timeout_seconds": 0}})
+        .recall_engine.search_timeout_seconds
+        == 0.0
+    )
+
+    with pytest.raises(Exception):
+        validate_config({"recall_engine": {"search_timeout_seconds": -1}})
+    with pytest.raises(Exception):
+        validate_config({"recall_engine": {"search_timeout_seconds": 61}})
+
+
+def test_embedding_batch_size_default_and_schema() -> None:
+    """embedding_batch_size 默认 16，validator 与 schema 一致，越界被拒绝。"""
+    from livingmemory_cm.core.base.config_validator import (
+        ProviderConfig,
+        validate_config,
+    )
+
+    assert ProviderConfig().embedding_batch_size == 16
+    schema = _load_schema()
+    item = schema["provider_settings"]["items"]["embedding_batch_size"]
+    assert item["type"] == "int"
+    assert item["default"] == 16
+
+    assert validate_config({}).provider_settings.embedding_batch_size == 16
+    assert (
+        validate_config({"provider_settings": {"embedding_batch_size": 10}})
+        .provider_settings.embedding_batch_size
+        == 10
+    )
+
+    with pytest.raises(Exception):
+        validate_config({"provider_settings": {"embedding_batch_size": 0}})
+    with pytest.raises(Exception):
+        validate_config({"provider_settings": {"embedding_batch_size": 2049}})
