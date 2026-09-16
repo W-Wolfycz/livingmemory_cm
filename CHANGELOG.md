@@ -5,6 +5,39 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 2.5.7-cm.3 — 2026-09-16
+
+### 修复
+
+- **Dashboard 存储型 XSS**：`esc()` 原先走 `textContent → innerHTML`，只转义 `& < >` 不转义引号，而 `memory_type` 是自由文本并被拼进 `value="..."` 属性，可被引号 breakout 注入任意事件处理器（页面上下文持有插件 API bridge）。改为完整五字符转义，并补 Node 驱动的前端行为回归。
+- **记忆编辑重复创建**：Dashboard 的 ApiClient 对 POST 也默认重试 2 次，桥接超时但服务端已处理时，`memories/update`（结构化编辑会重建记忆 ID）与批量删除/编辑会重复创建记忆或重复副作用。改为 POST 默认不重试、GET 保持重试 2 次；写调用显式声明 `retries: 0`，只读的 `recall/test` 显式保留重试。
+- **召回候选被过滤吃空**：AstrBot 的 `FaissVecDB.retrieve()` 先取 `fetch_k` 条全局最近邻再按 metadata 过滤，而召回恒带 session/persona 过滤、原先 `fetch_k = k*2`，大库里经常只回来一两条。改为只做一次 embedding、按需扩大候选池（起点 `max(k*20, 64)`，上限 512），直到凑够 `k` 条或索引取空；`documents` 取数不再受 `get_documents` 默认 `limit=100` 限制。
+- **MMR 对中文近似重复失效**：`_apply_mmr` 用 `text.split()` 分词，中文整句只有一个 token，改写型重复（"喜欢吃寿司"/"爱吃寿司"）Jaccard 恒为 0。改用 `TextProcessor.segment`（jieba）并在单次调用内缓存 token 集合。
+- **配置越界不再整包回落默认**：任一配置项超出 pydantic 硬边界会让整份生效配置降级为默认值，用户在面板上调过的召回、萃取、图路、维护参数一起被静默重置。新增 `normalize_config()`：数值截断到最近边界、枚举/类型非法回退该项默认值、配置节结构损坏只重置该节，逐项 WARNING 并写回配置文件。
+- **`rerank_provider_id` 改为手填**：原先沿用 `_special: select_provider`，而 AstrBot 的模型选择器只列对话模型（4.27.x 只有 `select_provider` / `select_provider_stt` / `select_provider_tts`，没有 rerank 选择器），选不到 Rerank 提供商。现改为与 `embedding_provider_id` 一致的纯字符串手填，hint 说明 ID 来源与留空时的回退行为。
+- **坏 metadata 行会让近期记忆查询整条失败**：近期槽位 SQL 未加 `json_valid` 守卫，一行坏 JSON 即让查询报错并跳过本轮；改为与 WebUI 一致的守卫写法。
+
+### 新增
+
+- **`recall_engine.rerank_enabled` / `rerank_provider_id` / `rerank_candidates` / `rerank_weight`**：接入 AstrBot Rerank 提供商，对召回候选按查询相关性重打分后再注入（默认关闭）。重排分数在候选集内归一化并与原有「向量相关性 + 重要性 + 时间」加权混合，明细写入 `score_breakdown["rerank"]`；提供商缺失、调用失败、超时或返回空时一律沿用原排序。
+
+### 兼容
+
+- **记忆归属收敛到 session + persona（`self_id` 改为过渡兼容）**：写入侧不再把 Bot 实例 `self_id` 记进记忆 metadata，`recall_engine.isolate_persona_memory` 配置项删除（51 → 50）；读取侧**保留**对旧记忆 `self_id` 的过滤，但只影响 cm.3 之前写入、确实带该字段的记录，无字段的新记忆一律保留。于是新记忆即刻变成 persona 维度归属（换号、改适配器名不再导致记忆不可见），旧记忆随衰减/清理退场后这层过滤自然失效，无需数据迁移，也没有开关。原因：`platform_id`/`self_id` 会随换号与适配器改名变化，把它当隔离键会造成「同一 persona 换个 Bot 就看不到旧记忆」。命中剔除时 DEBUG 日志给出条数。
+
+### 变更
+
+- **记忆归因强化**：萃取提示词（群聊/私聊）要求每条 `key_facts` 自带发言人（「昵称：事实」，群级共识写「群内共识：……」），`summary` 不得使用无具名的「用户/你/对方」；注入块头部固定声明归因规则（第三人称陈述不得转述为「你」或当前发言者说过、无标注内容仅作背景），并标出当前发言者与参与者中的对应昵称。Agent 检索工具与伪工具调用输出补 `participants` 字段。背景见 `docs/MEMORY_ATTRIBUTION.md`（已同步落地状态）。
+- **日志前缀格式统一**：改为 `[livingmemory_cm][子模块][platform:{platform_id}]`，实例标识由 `self_id` 换成 `platform_id`（`event.get_platform_id()`，与 UMO 首段一致、平台内唯一、不含账号）；关闭 `log_with_bot_id` 时保留 `[livingmemory_cm][子模块]`，模块定位不再丢失。事件入口（recall / reflection / 命令等 36 处）改用 `tag_event(module, event)` 带出平台段，后台调度等无事件日志保持模块段。
+- **配置项总数 47 → 51**：新增上述 4 项重排序配置。
+
+### 性能
+
+- **表达式索引**：新增复合表达式索引 `idx_doc_status_created`（status + create_time 倒序 + id 倒序）与 `idx_doc_type_created`，同时服务 WebUI 列表/计数查询与近期记忆槽位。实测 2 万条：近期槽位 6.2ms → 0.04ms、列表 10.0ms → 0.01ms、计数 5.0ms → 0.41ms；5 万条分别为 15.5/25.2/12.7ms → 0.04/0.01/1.05ms。复合形式无需 `INDEXED BY` 钉计划（避免索引缺失时查询直接报错），写入放大实测可忽略（INSERT 0.03 → 0.04ms）。
+- **FAISS 检索移出事件循环**：AstrBot 的 `EmbeddingStorage.search` 在协程里直接调用同步 `index.search`，IndexFlatL2 在千维、数万条规模下是几十毫秒级阻塞；改为在线程池执行（拿不到内部对象时自动退回原调用）。
+
+测试：本地回归 555 项通过（含 Node 驱动的前端行为测试与 EXPLAIN QUERY PLAN 索引回归）。
+
 ## 2.5.7-cm.2 — 2026-09-11
 
 ### 新增

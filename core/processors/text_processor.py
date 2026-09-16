@@ -154,6 +154,14 @@ class TextProcessor:
 
         return await asyncio.to_thread(self.tokenize, text, remove_stopwords)
 
+    def segment(self, text: str) -> list[str]:
+        """同步分词（不含停用词过滤），供已在线程池中的调用方复用。
+
+        MMR 去重这类纯 CPU 逻辑本身跑在 ``asyncio.to_thread`` 里、不能再 await，
+        因此暴露同步入口，避免各模块自己再实现一遍 jieba 可用性判断与降级。
+        """
+        return self._segment(text)
+
     async def load_stopwords(self, stopwords_path: str) -> set[str]:
         """
         加载停用词表

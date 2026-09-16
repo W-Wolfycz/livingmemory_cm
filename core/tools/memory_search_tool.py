@@ -121,11 +121,6 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
                 session_id=recall_session_id,
                 persona_id=recall_persona_id,
                 self_id=bot_self_id,
-                isolate_persona_memory=bool(
-                    self.config_manager.get(
-                        "recall_engine.isolate_persona_memory", True
-                    )
-                ),
             )
 
             serialized_results = [
@@ -136,6 +131,9 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
                     "importance": memory.metadata.get("importance")
                     if isinstance(memory.metadata, dict)
                     else None,
+                    "participants": memory.metadata.get("participants", [])
+                    if isinstance(memory.metadata, dict)
+                    else [],
                     "session_id": memory.metadata.get("session_id")
                     if isinstance(memory.metadata, dict)
                     else None,

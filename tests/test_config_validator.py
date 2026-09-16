@@ -244,7 +244,7 @@ def test_conf_schema_visible_structure_unchanged_6_plus_1() -> None:
         else:
             total += 1
     assert section_count == 6
-    assert total == 47
+    assert total == 50
 
 
 def test_conf_schema_graph_document_visible_count_unaffected() -> None:
@@ -337,3 +337,90 @@ def test_embedding_batch_size_default_and_schema() -> None:
         validate_config({"provider_settings": {"embedding_batch_size": 0}})
     with pytest.raises(Exception):
         validate_config({"provider_settings": {"embedding_batch_size": 2049}})
+
+
+# ==================== 越界/非法配置逐项修正 ====================
+
+
+def test_normalize_config_clamps_out_of_range_values() -> None:
+    """越界数值截断到最近边界，而不是让整份配置回退默认。"""
+    from livingmemory_cm.core.base.config_validator import normalize_config
+
+    merged = merge_config_with_defaults(
+        {
+            "recall_engine": {"top_k": 60, "search_timeout_seconds": 100.0},
+            "provider_settings": {"llm_max_retries": 0},
+            "maintenance": {"cleanup_days_threshold": 99999},
+        }
+    )
+
+    normalized, corrections = normalize_config(merged)
+
+    assert normalized["recall_engine"]["top_k"] == 50
+    assert normalized["recall_engine"]["search_timeout_seconds"] == 60.0
+    assert normalized["provider_settings"]["llm_max_retries"] == 1
+    assert normalized["maintenance"]["cleanup_days_threshold"] == 3650
+    paths = {item["path"] for item in corrections}
+    assert paths == {
+        "recall_engine.top_k",
+        "recall_engine.search_timeout_seconds",
+        "provider_settings.llm_max_retries",
+        "maintenance.cleanup_days_threshold",
+    }
+    # 修正后必须能通过严格校验
+    validate_config(normalized)
+
+
+def test_normalize_config_resets_broken_section_and_enum() -> None:
+    """配置节不是对象 → 重置该节；枚举越界 → 回退默认值。"""
+    from livingmemory_cm.core.base.config_validator import normalize_config
+
+    merged = merge_config_with_defaults(
+        {
+            "importance_decay": "broken",
+            "graph_memory": {"enabled": False},
+            "recall_engine": {"memory_type_filter": "nonsense"},
+        }
+    )
+
+    normalized, corrections = normalize_config(merged)
+
+    assert normalized["importance_decay"] == {}
+    assert normalized["recall_engine"]["memory_type_filter"] == "all"
+    # 未越界的设置必须原样保留
+    assert normalized["graph_memory"]["enabled"] is False
+    reasons = {item["path"]: item["new"] for item in corrections}
+    assert reasons["importance_decay"] == {}
+    assert reasons["recall_engine.memory_type_filter"] == "all"
+    validate_config(normalized)
+
+
+def test_normalize_config_keeps_valid_config_untouched() -> None:
+    from livingmemory_cm.core.base.config_validator import normalize_config
+
+    merged = merge_config_with_defaults({"recall_engine": {"top_k": 7}})
+
+    normalized, corrections = normalize_config(merged)
+
+    assert corrections == []
+    assert normalized == merged
+
+
+def test_config_manager_keeps_other_settings_when_one_value_is_out_of_range() -> None:
+    """核心回归：单项越界不再让整份生效配置降级为默认值。"""
+    from livingmemory_cm.core.base.config_manager import ConfigManager
+
+    source = {
+        "recall_engine": {"top_k": 60},
+        "graph_memory": {"enabled": False, "graph_route_weight": 0.7},
+        "maintenance": {"freeze_grace_days": 3},
+    }
+
+    manager = ConfigManager(source)
+
+    assert manager.get("recall_engine.top_k") == 50
+    assert manager.get("graph_memory.enabled") is False
+    assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.7)
+    assert manager.get("maintenance.freeze_grace_days") == 3
+    # 修正结果写回原始对象，供 persist_legacy_cleanup 落盘
+    assert source["recall_engine"]["top_k"] == 50

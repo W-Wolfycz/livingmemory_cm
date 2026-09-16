@@ -168,6 +168,14 @@ class _EmbeddingProvider(_Provider):
     """
 
 
+class _RerankProvider(_Provider):
+    """Minimal base for ``astrbot.core.provider.provider.RerankProvider``.
+
+    The plugin only does ``isinstance(provider, RerankProvider)`` guards and calls
+    ``await provider.rerank(query, documents)``; tests supply their own fakes.
+    """
+
+
 class _FaissVecDB:
     """Type/factory placeholder for ``astrbot.core.db.vec_db.faiss_impl.vec_db.FaissVecDB``.
 
@@ -313,6 +321,7 @@ def _install_astrbot_core_fake() -> None:
     provider = _make_module("astrbot.core.provider.provider")
     provider.Provider = _Provider
     provider.EmbeddingProvider = _EmbeddingProvider
+    provider.RerankProvider = _RerankProvider
     provider_pkg.provider = provider
 
     message_pkg = _make_module("astrbot.core.message")

@@ -65,7 +65,8 @@ export class RecallPage {
       const params = { query, k };
       if (sessionId) params.session_id = sessionId;
 
-      const data = await this.api.post("recall/test", params);
+      // recall/test 只读（POST 仅为了带 body），显式保留重试
+      const data = await this.api.post("recall/test", params, { retries: 2 });
       const elapsed = Date.now() - startTime;
 
       this.state._recallCache = { data, elapsed };

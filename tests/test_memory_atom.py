@@ -495,7 +495,7 @@ async def test_lifecycle_manager_logs_and_backs_off_on_error(monkeypatch):
     await mgr._maintenance_loop()
 
     error_mock.assert_called_once()
-    assert error_mock.call_args.args[0] == "[livingmemory_cm:atom] 维护任务异常"
+    assert error_mock.call_args.args[0] == "[livingmemory_cm][atom] 维护任务异常"
     assert error_mock.call_args.kwargs["exc_info"] is True
     assert sleep_calls == [60.0]
 

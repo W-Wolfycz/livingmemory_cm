@@ -318,6 +318,8 @@ export class PeekPanel {
         return;
       }
 
+      // 写操作一律不重试：桥接超时不代表服务端未处理，content 编辑会重建
+      // 记忆 ID，重试将产生重复记忆。
       // 更新内容
       if (newContent !== getDetailText(detail)) {
         const result = await this.api.post("memories/update", {
@@ -325,7 +327,7 @@ export class PeekPanel {
           field: "content",
           value: newContent,
           reason: reason
-        });
+        }, { retries: 0 });
         if (result && result.new_memory_id) {
           messages.push(window.t("detail.contentUpdated", result.new_memory_id));
           id = parseInt(result.new_memory_id);
@@ -339,7 +341,7 @@ export class PeekPanel {
           field: "status",
           value: newStatus,
           reason: reason
-        });
+        }, { retries: 0 });
         messages.push(window.t("detail.statusUpdated", statusLabel(newStatus)));
       }
 
@@ -350,7 +352,7 @@ export class PeekPanel {
           field: "type",
           value: newType,
           reason: reason
-        });
+        }, { retries: 0 });
         messages.push(window.t("detail.typeUpdated", newType));
       }
 
@@ -362,7 +364,7 @@ export class PeekPanel {
           value: newImportance,
           value_scale: "display",
           reason: reason
-        });
+        }, { retries: 0 });
         messages.push(window.t("detail.importanceUpdated", newImportance.toFixed(1)));
       }
 
@@ -393,7 +395,7 @@ export class PeekPanel {
     if (!confirmed) return;
 
     try {
-      await this.api.post("memories/batch-delete", { memory_ids: [id] });
+      await this.api.post("memories/batch-delete", { memory_ids: [id] }, { retries: 0 });
       this.showToast(window.t("memory.deleted"));
       this.close();
 

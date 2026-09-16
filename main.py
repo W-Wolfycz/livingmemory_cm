@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from importlib import metadata as importlib_metadata
 from typing import Any
 
-from .log import logger, tag, configure as configure_log
+from .log import logger, tag, tag_event, configure as configure_log
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.event.filter import PermissionType, permission_type
 from astrbot.api.provider import ProviderRequest
@@ -312,7 +312,7 @@ class LivingMemoryCMPlugin(Star):
         """
         ready, _ = await self._ensure_plugin_ready()
         if not ready:
-            logger.debug(f"{tag('main')} 插件未完成初始化，跳过记忆召回")
+            logger.debug(f"{tag_event('main', event)} 插件未完成初始化，跳过记忆召回")
             return
 
         if not self.event_handler:
@@ -332,7 +332,7 @@ class LivingMemoryCMPlugin(Star):
         """
         ready, _ = await self._ensure_plugin_ready()
         if not ready:
-            logger.debug(f"{tag('main')} 插件未完成初始化，跳过记忆反思")
+            logger.debug(f"{tag_event('main', event)} 插件未完成初始化，跳过记忆反思")
             return
 
         if not self.event_handler:

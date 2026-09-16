@@ -5,7 +5,7 @@ config_validator.py - 配置验证模块
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ...log import logger, tag
 
@@ -101,12 +101,37 @@ class RecallEngineConfig(BaseModel):
             "超时跳过注入、不阻塞用户回复；0 表示不限时"
         ),
     )
-    isolate_persona_memory: bool = Field(
-        default=True,
+    rerank_enabled: bool = Field(
+        default=False,
         description=(
-            "persona 记忆隔离：同群多 Bot 共用同一 session 时，按写入记忆的 Bot "
-            "self_id 过滤，自动召回与检索工具只返回当前 Bot 自己写入的记忆；"
-            "无 Bot 标识的旧记忆仍保留，单 Bot 部署可关闭"
+            "启用 Rerank 重排序：召回候选交给 AstrBot 的 Rerank 提供商按查询相关性"
+            "重新打分，用于把真正相关的记忆排进注入列表。"
+            "提供商不可用、调用失败或返回空时自动沿用原排序"
+        ),
+    )
+    rerank_provider_id: str | None = Field(
+        default=None,
+        description=(
+            "Rerank 提供商 ID，需手填（AstrBot 的 provider 选择器只列对话模型，"
+            "没有 rerank 专用选择器）；留空时回退到已加载的第一个 Rerank 提供商"
+        ),
+    )
+    rerank_candidates: int = Field(
+        default=20,
+        ge=2,
+        le=100,
+        description=(
+            "参与重排序的候选条数（2-100）。候选越多重排越准、调用越慢；"
+            "重排后仍只注入 top_k 条"
+        ),
+    )
+    rerank_weight: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "重排序分数在最终得分中的占比（0-1）：0.6 表示六成看重排相关性、"
+            "四成沿用原有重要性/时间加权；1.0 完全按重排结果排序"
         ),
     )
 
@@ -260,7 +285,11 @@ class LivingMemoryConfig(BaseModel):
 
     log_with_bot_id: bool = Field(
         default=False,
-        description="日志前缀附加 AstrBot 事件 get_self_id() 的原始 Bot ID 区分多 bot 实例（全局配置项，不属于任何配置段）",
+        description=(
+            "日志前缀末尾附加事件所属平台的实例标识 platform_id（event.get_platform_id()，与 UMO 首段一致、不含账号），"
+            "格式 [livingmemory_cm][子模块][platform:xxx]；关闭时只保留模块与子模块段。"
+            "全局配置项，不属于任何配置段"
+        ),
     )
     recall_engine: RecallEngineConfig = Field(default_factory=RecallEngineConfig)
     reflection_engine: ReflectionEngineConfig = Field(
@@ -276,6 +305,120 @@ class LivingMemoryConfig(BaseModel):
     )
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容
+
+
+def normalize_config(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """逐项修正越界/非法配置，返回 (修正后的配置, 修正记录)。
+
+    AstrBot 配置页保存时只按 schema 校验类型、不校验范围，而 pydantic 的边界是硬
+    约束：任一项越界会让 ``validate_config`` 整体失败，``ConfigManager`` 于是把
+    **整份生效配置**降级为默认值——用户在面板上调过的召回、萃取、图路、维护参数
+    会一起被静默重置。这里在校验前逐项钳制：
+
+    - 数值越界 → 截断到最近边界（取 pydantic 错误里的 ``le``/``ge``）；
+    - 其它校验失败（类型、枚举、嵌套结构）→ 该项回退默认值；
+    - 某一节不是 dict → 整节重置（由后续合并补默认值）。
+
+    修正记录形如 ``{"path": "recall_engine.top_k", "old": 60, "new": 50, "reason": ...}``，
+    由调用方记日志并写回配置文件；无法修正的错误保持原样，交给 ``validate_config``
+    走既有的整包兜底。
+    """
+    normalized = dict(config)
+    corrections: list[dict[str, Any]] = []
+
+    for section_name, field_info in LivingMemoryConfig.model_fields.items():
+        section_model = field_info.annotation
+        if not (
+            isinstance(section_model, type)
+            and issubclass(section_model, BaseModel)
+        ):
+            continue
+
+        payload = normalized.get(section_name)
+        if payload is None:
+            continue
+        if not isinstance(payload, dict):
+            corrections.append(
+                {
+                    "path": section_name,
+                    "old": payload,
+                    "new": {},
+                    "reason": "配置节不是对象，已重置该节",
+                }
+            )
+            normalized[section_name] = {}
+            continue
+
+        payload = dict(payload)
+        normalized[section_name] = payload
+        for _ in range(32):  # 每轮至少修正一项，设上限防御异常输入
+            try:
+                section_model.model_validate(payload)
+                break
+            except ValidationError as exc:
+                fixed = False
+                for error in exc.errors():
+                    location = error.get("loc") or ()
+                    if len(location) != 1:
+                        continue  # 嵌套结构问题不在逐项修正范围内
+                    key = str(location[0])
+                    if key not in section_model.model_fields:
+                        continue
+                    old_value = payload.get(key)
+                    new_value = _corrected_value(
+                        section_model.model_fields[key],
+                        old_value,
+                        error,
+                    )
+                    if new_value is _UNCHANGED:
+                        continue
+                    payload[key] = new_value
+                    corrections.append(
+                        {
+                            "path": f"{section_name}.{key}",
+                            "old": old_value,
+                            "new": new_value,
+                            "reason": error.get("msg", ""),
+                        }
+                    )
+                    fixed = True
+                if not fixed:
+                    break
+            except Exception:
+                break
+
+    return normalized, corrections
+
+
+_UNCHANGED = object()
+
+_CLAMP_ERROR_TYPES = {
+    "less_than_equal": "le",
+    "greater_than_equal": "ge",
+    "less_than": "lt",
+    "greater_than": "gt",
+}
+
+
+def _corrected_value(field_info: Any, value: Any, error: dict[str, Any]) -> Any:
+    """按校验错误给出该字段的修正值；无法修正时返回 ``_UNCHANGED``。"""
+    context = error.get("ctx") or {}
+    bound_key = _CLAMP_ERROR_TYPES.get(str(error.get("type")))
+    if bound_key and bound_key in context and isinstance(value, (int, float)):
+        bound = context[bound_key]
+        if isinstance(bound, (int, float)):
+            if bound_key in ("lt", "gt"):
+                # 严格边界：整数退一格，浮点用极小步长
+                step = 1 if isinstance(bound, int) else abs(bound) * 1e-6 or 1e-6
+                bound = bound - step if bound_key == "lt" else bound + step
+            return type(value)(bound) if isinstance(bound, type(value)) else bound
+
+    default = field_info.get_default(call_default_factory=True)
+    if value == default:
+        return _UNCHANGED
+    return default
 
 
 def _migrate_graph_route_weight(config: dict[str, Any]) -> dict[str, Any]:

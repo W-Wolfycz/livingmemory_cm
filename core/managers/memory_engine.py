@@ -81,6 +81,7 @@ class MemoryEngine:
         llm_provider=None,
         config: dict[str, Any] | None = None,
         freeze_store=None,
+        rerank_provider=None,
     ):
         """
         初始化记忆引擎
@@ -102,6 +103,8 @@ class MemoryEngine:
         self.config = config or {}
         # 冻结（冷存储）状态：冻结中的 persona 不召回，且清理任务跳过
         self.freeze_store = freeze_store
+        # Rerank 提供商：召回后重排序，未配置时 None（自动跳过）
+        self.rerank_provider = rerank_provider
         self.graph_enabled = bool(self.config.get("graph_memory_enabled", False))
         self.atom_enabled = bool(
             self.config.get(
@@ -131,7 +134,9 @@ class MemoryEngine:
         self.atom_lifecycle_manager = None
         self.db_connection = None
         self._document_repository = DocumentRepository(self.faiss_db)
-        self._search_service = MemorySearchService(self.config)
+        self._search_service = MemorySearchService(
+            self.config, rerank_provider=self.rerank_provider
+        )
         self._statistics_service = MemoryStatisticsService(
             self.db_path,
             self.faiss_db,
@@ -169,7 +174,7 @@ class MemoryEngine:
 
         # 5. 初始化文档路检索器（纯向量 + 加权 + MMR）
         self.hybrid_retriever = HybridRetriever(
-            self.vector_retriever, self.config
+            self.vector_retriever, self.config, text_processor=self.text_processor
         )
 
         if self.graph_enabled and self.graph_vector_db is not None:
@@ -482,7 +487,6 @@ class MemoryEngine:
         session_id: str | None = None,
         persona_id: str | None = None,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         """
         检索相关记忆
@@ -492,8 +496,7 @@ class MemoryEngine:
             k: 返回数量
             session_id: 会话ID过滤(可选,应传入unified_msg_origin完整格式)
             persona_id: 人格ID过滤(可选)
-            self_id: 当前 Bot 的 self_id（persona 记忆隔离，可选）
-            isolate_persona_memory: 是否排除其他 Bot 写入的记忆（旧数据无 self_id 保留）
+            self_id: 当前 Bot 的 self_id；仅用于过滤 cm.3 之前带该字段的旧记忆
 
         Returns:
             List[HybridResult]: 检索结果列表
@@ -518,7 +521,6 @@ class MemoryEngine:
             session_id=session_id,
             persona_id=persona_id,
             self_id=self_id,
-            isolate_persona_memory=isolate_persona_memory,
             exclude_personas=excluded_personas,
             hybrid_retriever=self.hybrid_retriever,
             dual_route_retriever=self.dual_route_retriever,

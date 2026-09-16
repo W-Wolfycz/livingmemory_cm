@@ -43,15 +43,19 @@ class HybridRetriever:
         self,
         vector_retriever: VectorRetriever,
         config: dict[str, Any] | None = None,
+        text_processor: Any = None,
     ):
         """
         Args:
             vector_retriever: 向量检索器实例
             config: 配置字典,支持以下参数:
                 - decay_rate: 时间衰减率,默认0.01
+            text_processor: 文本处理器（提供同步 ``segment``），MMR 用它做词级
+                相似度；不传时退化为空格分词
         """
         self.vector_retriever = vector_retriever
         self.config = config or {}
+        self.text_processor = text_processor
 
         self.decay_rate = self.config.get("decay_rate", 0.01)
 
@@ -223,13 +227,32 @@ class HybridRetriever:
 
         使用内容词袋相似度作为轻量代理（无需额外向量计算）。
         mmr_lambda 越高越偏向相关性，越低越偏向多样性。
+
+        分词走 ``TextProcessor.segment``（jieba）：纯 ``text.split()`` 对中文整句只
+        产生一个 token，近似重复（"喜欢吃寿司" / "爱吃寿司"）的 Jaccard 恒为 0，
+        去重形同失效。token 集合在本次调用内缓存，避免逐个候选重复分词。
         """
         if len(results) <= k:
             return results
 
-        def _token_set(text: str) -> set[str]:
-            tokens = set(text.lower().split())
-            return tokens if tokens else {"<empty>"}
+        token_cache: dict[int, set[str]] = {}
+
+        def _token_set(result: HybridResult) -> set[str]:
+            cached = token_cache.get(result.doc_id)
+            if cached is not None:
+                return cached
+            text = (result.content or "").lower()
+            if self.text_processor is not None:
+                tokens = {
+                    token.strip()
+                    for token in self.text_processor.segment(text)
+                    if token and token.strip()
+                }
+            else:
+                tokens = set(text.split())
+            token_set = tokens if tokens else {"<empty>"}
+            token_cache[result.doc_id] = token_set
+            return token_set
 
         selected: list[HybridResult] = []
         candidates = list(results)
@@ -242,10 +265,10 @@ class HybridRetriever:
 
             best_idx = -1
             best_mmr = -1.0
-            selected_tokens = [_token_set(s.content) for s in selected]
+            selected_tokens = [_token_set(item) for item in selected]
 
             for i, cand in enumerate(candidates):
-                cand_tokens = _token_set(cand.content)
+                cand_tokens = _token_set(cand)
                 # 与已选结果的最大 Jaccard 相似度
                 max_sim = max(
                     len(cand_tokens & st) / max(len(cand_tokens | st), 1)

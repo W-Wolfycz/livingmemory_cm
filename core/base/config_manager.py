@@ -10,6 +10,7 @@ from ...log import logger, tag
 from .config_validator import (
     get_default_config,
     merge_config_with_defaults,
+    normalize_config,
     validate_config,
 )
 from .exceptions import ConfigurationError
@@ -31,10 +32,15 @@ class ConfigManager:
         self._load_config()
 
     def _load_config(self) -> None:
-        """加载并验证配置"""
+        """加载、逐项修正并验证配置"""
+        corrections: list[dict[str, Any]] = []
         try:
             # 合并默认配置
             merged_config = merge_config_with_defaults(self._raw_config)
+            # 逐项修正越界/非法值：AstrBot 配置页只校验类型不校验范围，
+            # 不修的话任一项越界都会让整份生效配置降级为默认值
+            merged_config, corrections = normalize_config(merged_config)
+            self._write_back_corrections(corrections)
             # 验证配置
             self._config_obj = validate_config(merged_config)
             self._config = self._config_obj.model_dump()
@@ -50,6 +56,32 @@ class ConfigManager:
                 self._config_obj = validate_config(self._config)
             except Exception as e2:
                 raise ConfigurationError(f"加载默认配置失败: {e2}") from e2
+
+        for item in corrections:
+            logger.warning(
+                f"{tag('config')} 配置项已自动修正 {item['path']}: "
+                f"{item['old']!r} → {item['new']!r}（{item['reason']}）"
+            )
+
+    def _write_back_corrections(self, corrections: list[dict[str, Any]]) -> None:
+        """把逐项修正结果写回原始配置对象。
+
+        这样 reload 后运行值与配置文件一致，配置面板也显示修正后的值；实际落盘由
+        ``persist_legacy_cleanup`` 在异步初始化阶段统一完成。
+        """
+        source = self._raw_config
+        if not isinstance(source, dict) or not corrections:
+            return
+        for item in corrections:
+            parts = str(item["path"]).split(".")
+            target: dict[str, Any] = source
+            for part in parts[:-1]:
+                child = target.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    target[part] = child
+                target = child
+            target[parts[-1]] = item["new"]
 
     def _remove_legacy_keys_from_source(self) -> None:
         """把迁移结果写回原始配置对象，并移除已迁移的隐藏兼容键。

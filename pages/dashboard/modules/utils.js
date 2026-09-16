@@ -26,13 +26,20 @@ export function getDetailText(detail) {
 
 /**
  * HTML 转义，防止 XSS
+ *
+ * 完整转义五个字符：`& < > " '`。不能只依赖 `textContent → innerHTML`
+ * （浏览器序列化文本节点时不转义引号），否则把它拼进 `value="..."` 这类属性
+ * 时会被引号 breakout，注入任意事件处理器。
  * @param {string} text - 原始文本
  * @returns {string} 转义后的 HTML 安全文本
  */
 export function esc(text) {
-  const div = document.createElement("div");
-  div.textContent = String(text);
-  return div.innerHTML;
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /**

@@ -396,9 +396,6 @@ async def test_batch_writer_writes_all_generated_topic_memories() -> None:
     second_metadata = memory_engine.add_memory.await_args_list[1].kwargs[
         "metadata"
     ]
-    # persona 记忆隔离：写入时把 CM 记录中的 Bot self_id 记入 metadata
-    assert first_metadata["self_id"] == "10000"
-    assert second_metadata["self_id"] == "10000"
     assert first_metadata["source_window"]["batch_index"] == 1
     assert second_metadata["source_window"]["batch_index"] == 2
     assert second_metadata["source_window"]["batch_size"] == 2
@@ -1002,68 +999,84 @@ def test_recall_search_timeout_missing_key_uses_default() -> None:
     assert _resolve_search_timeout(config_manager) == 5.0
 
 
-# ── 日志 bot 前缀（self_id 原文）与关键入口使用 event tag ─────────────────────
+# ── 日志前缀：模块 + 子模块 + platform 段 ────────────────────────────────────
 
 
 class _FakeRecallEvent:
-    """fake 事件：支持 get_self_id / get_sender_id，Bot 与用户均为虚构 ID。"""
+    """fake 事件：支持 get_self_id / get_sender_id / get_platform_id。
 
-    def __init__(self, self_id: str = "10000") -> None:
+    Bot、用户、平台实例均使用虚构占位符。
+    """
+
+    def __init__(self, self_id: str = "10000", platform_id: str = "BOT1") -> None:
         self._self_id = self_id
+        self._platform_id = platform_id
         self.unified_msg_origin = "demo:GroupMessage:group_demo"
 
     def get_self_id(self) -> str:
         return self._self_id
 
+    def get_platform_id(self) -> str:
+        return self._platform_id
+
     def get_sender_id(self) -> str:
         return "10001"
 
 
-def test_log_tag_event_uses_raw_self_id_bot_prefix() -> None:
-    """log_with_bot_id=True 时 bot 标识与模块名并存，不再丢失模块定位。"""
+def test_log_tag_event_appends_platform_segment() -> None:
+    """log_with_bot_id=True 时追加 platform 段，模块与子模块定位始终保留。"""
     from livingmemory_cm import log as log_module
 
     log_module.configure(log_with_bot_id=True)
-    event = _FakeRecallEvent(self_id="10000")
+    event = _FakeRecallEvent(platform_id="BOT1")
     try:
         prefix = log_module.tag_event("recall", event)
-        # 原文输出：包含完整 self_id，且不是 blake2s 脱敏短 hash
-        assert "bot-10000" in prefix
-        assert prefix == "[livingmemory_cm:bot-10000][recall]"
-        assert log_module.tag_event("recall", event) == prefix
+        assert prefix == "[livingmemory_cm][recall][platform:BOT1]"
         assert log_module.tag("recall", event) == prefix
-        # 无 module 时只保留 bot 段
-        assert log_module.tag_event(None, event) == "[livingmemory_cm:bot-10000]"
+        # 无子模块时只有模块段与平台段
+        assert log_module.tag_event(None, event) == "[livingmemory_cm][platform:BOT1]"
     finally:
         log_module.configure(log_with_bot_id=False)
 
 
-def test_log_tag_without_bot_id_has_no_bot_prefix() -> None:
+def test_log_tag_without_switch_has_no_platform_segment() -> None:
     from livingmemory_cm import log as log_module
 
     log_module.configure(log_with_bot_id=False)
-    event = _FakeRecallEvent(self_id="10000")
+    event = _FakeRecallEvent(platform_id="BOT1")
     try:
-        assert log_module.tag_event("recall", event) == "[livingmemory_cm:recall]"
-        assert log_module.tag("recall", event) == "[livingmemory_cm:recall]"
+        assert log_module.tag_event("recall", event) == "[livingmemory_cm][recall]"
+        assert log_module.tag("recall", event) == "[livingmemory_cm][recall]"
+        assert log_module.tag() == "[livingmemory_cm]"
     finally:
         log_module.configure(log_with_bot_id=False)
 
 
-def test_log_tag_falls_back_to_module_when_self_id_unavailable() -> None:
+def test_log_tag_falls_back_when_platform_unavailable() -> None:
     from livingmemory_cm import log as log_module
 
     log_module.configure(log_with_bot_id=True)
-    event = _FakeRecallEvent(self_id="")
     try:
-        assert log_module.tag_event("recall", event) == "[livingmemory_cm:recall]"
+        empty = _FakeRecallEvent(platform_id="")
+        assert log_module.tag_event("recall", empty) == "[livingmemory_cm][recall]"
+
+        class _NoPlatform:
+            def get_platform_id(self):
+                raise RuntimeError("平台未实现")
+
+        assert (
+            log_module.tag_event("recall", _NoPlatform())
+            == "[livingmemory_cm][recall]"
+        )
+        # 无 event 的后台调度日志同样保持模块定位
+        assert log_module.tag("engine") == "[livingmemory_cm][engine]"
     finally:
         log_module.configure(log_with_bot_id=False)
 
 
 @pytest.mark.asyncio
 async def test_session_reset_entry_uses_event_tag() -> None:
-    """关键入口（session reset）通过 tag_event 使用 event，能真实体现 Bot ID。"""
+    """关键入口（session reset）通过 tag_event 使用 event，可带出平台段。"""
     from unittest.mock import patch
 
     from livingmemory_cm.core.event_handler import EventHandler
@@ -1075,7 +1088,7 @@ async def test_session_reset_entry_uses_event_tag() -> None:
     event = _FakeRecallEvent(self_id="10000")
     with patch(
         "livingmemory_cm.core.event_handler.tag_event",
-        return_value="[livingmemory_cm:bot-tag]",
+        return_value="[livingmemory_cm][handler][platform:BOT1]",
     ) as mocked:
         await handler.handle_session_reset(event)
     mocked.assert_called_once_with("handler", event)

@@ -56,18 +56,23 @@ export class ApiClient {
   }
 
   /**
-   * 通用 API 请求（带重试）
+   * 通用 API 请求
+   *
+   * 重试策略：GET 默认重试 2 次（读操作幂等）；POST 默认**不重试**——桥接超时
+   * 不代表服务端没处理，`memories/update`（结构化编辑会重建记忆 ID）、批量删除
+   * 与批量编辑等写操作重试会造成重复记忆或重复副作用。确实幂等的 POST 调用方
+   * 需显式传 `retries`。
    * @param {string} path - API 路径
    * @param {Object} options - 请求选项
    * @param {string} options.method - HTTP 方法（GET/POST）
    * @param {Object} options.body - 请求体（POST）
-   * @param {number} options.retries - 重试次数
+   * @param {number} options.retries - 重试次数（不传按方法取默认值）
    * @returns {Promise<any>} API 响应
    */
   async request(path, options = {}) {
     const method = options.method || "GET";
     const body = options.body;
-    const retries = options.retries ?? 2;
+    const retries = options.retries ?? (method === "GET" ? 2 : 0);
 
     if (!this.bridge) {
       throw new Error(window.t ? window.t("bridge.error") : "Bridge not available");

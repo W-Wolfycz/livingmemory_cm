@@ -330,30 +330,6 @@ def test_memory_search_service_event_only_excludes_preference_keeps_events() -> 
     assert [result.doc_id for result in filtered] == [2, 3, 4, 5]
 
 
-def test_persona_memory_isolation_filters_other_bots() -> None:
-    """persona 记忆隔离：排除明确属于其他 Bot 的记忆，旧记忆（无 self_id）保留。"""
-    service = MemorySearchService({})
-    results = [
-        HybridResult(1, 0.9, 0.8, "本 Bot 记忆", {"self_id": "10000"}),
-        HybridResult(2, 0.9, 0.8, "其他 Bot 记忆", {"self_id": "10001"}),
-        HybridResult(3, 0.9, 0.8, "旧记忆无标识", {"importance": 0.8}),
-        HybridResult(4, 0.9, 0.8, "空标识记忆", {"self_id": ""}),
-    ]
-
-    filtered = service._isolate_persona_memory(results, "10000", True)
-    assert [result.doc_id for result in filtered] == [1, 3, 4]
-
-    # 关闭开关或拿不到 self_id：不过滤
-    assert [
-        result.doc_id
-        for result in service._isolate_persona_memory(results, "10000", False)
-    ] == [1, 2, 3, 4]
-    assert [
-        result.doc_id
-        for result in service._isolate_persona_memory(results, "", True)
-    ] == [1, 2, 3, 4]
-
-
 @pytest.mark.asyncio
 async def test_memory_search_recent_slot_keeps_session_and_persona_scope() -> None:
     connection = await aiosqlite.connect(":memory:")
@@ -419,79 +395,6 @@ async def test_memory_search_recent_slot_keeps_session_and_persona_scope() -> No
     )
 
     assert [result.doc_id for result in results] == [9, 1]
-    await connection.close()
-
-
-@pytest.mark.asyncio
-async def test_recent_slot_does_not_leak_other_bot_memory_under_isolation() -> None:
-    """近期槽位直查库，必须同样应用persona 记忆隔离（回归防护）。"""
-    connection = await aiosqlite.connect(":memory:")
-    await connection.execute(
-        "CREATE TABLE documents(id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)"
-    )
-    now = 1_900_000_000.0
-    rows = [
-        (
-            1,
-            "其他 Bot 的近期记忆",
-            json.dumps(
-                {
-                    "self_id": "10001",
-                    "session_id": "demo:private:10001",
-                    "persona_id": "persona_demo",
-                    "create_time": now + 10,
-                    "status": "active",
-                }
-            ),
-        ),
-        (
-            2,
-            "本 Bot 的近期记忆",
-            json.dumps(
-                {
-                    "self_id": "10000",
-                    "session_id": "demo:private:10001",
-                    "persona_id": "persona_demo",
-                    "create_time": now,
-                    "status": "active",
-                }
-            ),
-        ),
-    ]
-    await connection.executemany(
-        "INSERT INTO documents(id, text, metadata) VALUES (?, ?, ?)",
-        rows,
-    )
-    await connection.commit()
-
-    vector_result = HybridResult(9, 0.9, 0.8, "相关向量记忆", {"self_id": "10000"})
-    retriever = SimpleNamespace(search=AsyncMock(return_value=[vector_result]))
-    service = MemorySearchService(
-        {
-            "recent_memory_count": 1,
-            "recent_memory_max_age_hours": 0,
-        }
-    )
-
-    def close_task(coro) -> None:
-        coro.close()
-
-    results = await service.search(
-        query="查询",
-        k=2,
-        session_id="demo:private:10001",
-        persona_id="persona_demo",
-        self_id="10000",
-        isolate_persona_memory=True,
-        hybrid_retriever=retriever,
-        dual_route_retriever=None,
-        schedule_task=close_task,
-        update_access_time=AsyncMock(),
-        migrate_session=AsyncMock(),
-        db_connection=connection,
-    )
-
-    assert [result.doc_id for result in results] == [9, 2]
     await connection.close()
 
 
@@ -924,3 +827,92 @@ async def test_memory_schema_service_drops_only_legacy_fts_triggers(
         assert dropped == 1
         assert 'legacy"trigger' not in trigger_names
         assert "keep_trigger" in trigger_names
+
+
+# ── 旧记忆的 self_id 过渡过滤（写入侧已停写，读取侧保留兼容）──────────────
+
+
+def test_legacy_bot_scope_filter_keeps_memories_without_self_id() -> None:
+    """cm.3 起新记忆不再写 self_id → 一律保留；只有带别人的 self_id 的旧记忆被过滤。"""
+    service = MemorySearchService({})
+    results = [
+        HybridResult(1, 0.9, 0.8, "本 Bot 旧记忆", {"self_id": "10000"}),
+        HybridResult(2, 0.9, 0.8, "其他 Bot 旧记忆", {"self_id": "10001"}),
+        HybridResult(3, 0.9, 0.8, "新记忆（无 self_id）", {"importance": 0.8}),
+        HybridResult(4, 0.9, 0.8, "空标识旧记忆", {"self_id": ""}),
+    ]
+
+    filtered = service._filter_legacy_bot_scope(results, "10000")
+    assert [item.doc_id for item in filtered] == [1, 3, 4]
+
+    # 拿不到当前 self_id 时不过滤（平台未提供 self_id 的场景）
+    assert [
+        item.doc_id for item in service._filter_legacy_bot_scope(results, "")
+    ] == [1, 2, 3, 4]
+    assert [
+        item.doc_id for item in service._filter_legacy_bot_scope(results, None)
+    ] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_legacy_bot_scope_applies_to_recent_slot() -> None:
+    """近期槽位直查数据库，旧记忆的 self_id 过滤同样要生效（回归防护）。"""
+    connection = await aiosqlite.connect(":memory:")
+    connection.row_factory = aiosqlite.Row
+    await connection.execute(
+        "CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)"
+    )
+    now = 1_900_000_000.0
+    rows = [
+        (1, "其他 Bot 的旧近期记忆", {"self_id": "10001"}),
+        (2, "新近期记忆（无 self_id）", {}),
+    ]
+    await connection.executemany(
+        "INSERT INTO documents(id, text, metadata) VALUES (?, ?, ?)",
+        [
+            (
+                doc_id,
+                text,
+                json.dumps(
+                    {
+                        "session_id": "demo:GroupMessage:group_demo",
+                        "persona_id": "persona_demo",
+                        "status": "active",
+                        "importance": 0.6,
+                        "create_time": now - doc_id,
+                        "last_access_time": now - doc_id,
+                        **extra,
+                    }
+                ),
+            )
+            for doc_id, text, extra in rows
+        ],
+    )
+    await connection.commit()
+
+    class _EmptyHybrid:
+        async def search(self, query, k, session_id=None, persona_id=None):
+            return []
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    service = MemorySearchService(
+        {"recent_memory_count": 2, "recent_memory_max_age_hours": 0}
+    )
+    results = await service.search(
+        query="查询",
+        k=2,
+        session_id="demo:GroupMessage:group_demo",
+        persona_id="persona_demo",
+        self_id="10000",
+        hybrid_retriever=_EmptyHybrid(),
+        dual_route_retriever=None,
+        schedule_task=lambda coro: coro.close(),
+        update_access_time=_noop,
+        migrate_session=_noop,
+        db_connection=connection,
+    )
+
+    assert [item.doc_id for item in results] == [2]
+    await connection.close()

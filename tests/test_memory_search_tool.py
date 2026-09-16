@@ -68,7 +68,6 @@ async def test_memory_search_tool_always_filters_by_session_and_persona(
         session_id="test:private:session-1",
         persona_id="persona_a",
         self_id="10000",
-        isolate_persona_memory=True,
     )
 
 
@@ -87,6 +86,7 @@ async def test_memory_search_tool_serializes_results(memory_engine, astr_context
                 final_score=0.91,
                 metadata={
                     "importance": 0.8,
+                    "participants": ["群友A"],
                     "session_id": "test:private:session-1",
                     "persona_id": "persona_a",
                     "create_time": 100.0,
@@ -110,6 +110,7 @@ async def test_memory_search_tool_serializes_results(memory_engine, astr_context
         "content": "用户喜欢高难度动作游戏",
         "score": 0.91,
         "importance": 0.8,
+        "participants": ["群友A"],
         "session_id": "test:private:session-1",
         "persona_id": "persona_a",
         "create_time": 100.0,
@@ -150,6 +151,7 @@ async def test_memory_search_tool_serializes_non_dict_metadata(
         "content": "用户提到过想学摄影",
         "score": 0.55,
         "importance": None,
+        "participants": [],
         "session_id": None,
         "persona_id": None,
         "create_time": None,
@@ -178,7 +180,6 @@ async def test_memory_search_tool_limits_k_by_config(memory_engine, astr_context
         session_id="test:private:session-1",
         persona_id="persona_a",
         self_id="10000",
-        isolate_persona_memory=True,
     )
 
 
@@ -235,7 +236,6 @@ async def test_memory_search_tool_falls_back_to_default_k_for_invalid_input(
         session_id="test:private:session-1",
         persona_id="persona_a",
         self_id="10000",
-        isolate_persona_memory=True,
     )
 
 

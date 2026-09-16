@@ -601,3 +601,75 @@ def test_injection_adapter_keeps_fake_tool_call_without_provider(
         "fake_tool_call",
         None,
     )
+
+
+class TestInjectionAttribution:
+    """注入块的归因约束：避免把别人的事实记到当前发言者头上。"""
+
+    def _memory(self, participants):
+        return {
+            "content": "参与者：群友A、群友B | 事实：群友A 喜欢寿司",
+            "metadata": {
+                "neutral_summary": "群友A 提到自己喜欢寿司",
+                "key_facts": ["群友A：喜欢寿司"],
+                "participants": participants,
+                "event_time": "2026-09-01",
+            },
+        }
+
+    def test_header_declares_attribution_rule(self):
+        result = format_memories_for_injection([self._memory(["群友A", "群友B"])])
+
+        assert "归因规则" in result
+        assert "不得转述为「你」或当前发言者说过" in result
+        assert "不得当作当前发言者的信息使用" in result
+
+    def test_header_and_entry_mark_current_speaker(self):
+        result = format_memories_for_injection(
+            [self._memory(["群友A", "群友B"])],
+            current_speaker="群友B",
+        )
+
+        assert "当前发言者：群友B" in result
+        assert "群友B（当前发言者）" in result
+        # 非当前发言者不加标注
+        assert "群友A（当前发言者）" not in result
+
+    def test_without_current_speaker_no_marking(self):
+        result = format_memories_for_injection([self._memory(["群友A"])])
+
+        assert "当前发言者：" not in result
+        assert "（当前发言者）" not in result
+
+    def test_fake_tool_call_carries_participants(self):
+        from livingmemory_cm.core.utils import format_memories_for_fake_tool_call
+
+        messages = format_memories_for_fake_tool_call(
+            [
+                {
+                    "id": 3,
+                    "content": "参与者：群友A | 事实：群友A 喜欢寿司",
+                    "score": 0.8,
+                    "metadata": {"participants": ["群友A"], "importance": 0.6},
+                }
+            ],
+            query="寿司",
+        )
+
+        payload = json.loads(messages[1]["content"])
+        assert payload["results"][0]["participants"] == ["群友A"]
+
+
+def test_extraction_prompts_require_fact_attribution() -> None:
+    """提示词必须要求每条事实自带发言人，防止回归成无归属的「用户……」句式。"""
+    from pathlib import Path
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "core" / "prompts"
+    for name in ("group_chat_prompt.txt", "private_chat_prompt.txt"):
+        text = (prompts_dir / name).read_text(encoding="utf-8")
+        assert "key_facts` 必须自带归属" in text, name
+        assert "不得使用第二人称「你」" in text, name
+        assert "昵称" in text, name
+
+    group = (prompts_dir / "group_chat_prompt.txt").read_text(encoding="utf-8")
+    assert "群内共识" in group

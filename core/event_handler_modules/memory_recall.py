@@ -116,12 +116,15 @@ class MemoryRecall:
                 has_extra_parts = bool(extra_parts)
 
                 if not has_prompt_text and not has_extra_parts:
-                    logger.debug(f"{tag('recall')} [{session_ref}] 请求中无可用用户内容，跳过记忆召回")
+                    logger.debug(f"{tag_event('recall', event)} [{session_ref}] 请求中无可用用户内容，跳过记忆召回")
                     return
 
                 normalized = self._normalize_text_only_context_parts(req, session_id)
                 if normalized > 0:
-                    logger.debug(f"{tag('recall')} [{session_ref}] 已归一化 {normalized} 条纯文本历史消息")
+                    logger.debug(
+                        f"{tag_event('recall', event)} [{session_ref}] "
+                        f"已归一化 {normalized} 条纯文本历史消息"
+                    )
 
                 # 自动删除旧的注入记忆（恒开）
                 # extra_user_content 路径通过 mark_as_temp(_no_save=True) 已天然不持久化，
@@ -130,7 +133,7 @@ class MemoryRecall:
                 removed += self._remove_fake_tool_call_from_context(req, session_id)
                 if removed > 0:
                     logger.debug(
-                        f"{tag('recall')} [{session_ref}] 已清理 {removed} 处历史记忆注入片段"
+                        f"{tag_event('recall', event)} [{session_ref}] 已清理 {removed} 处历史记忆注入片段"
                     )
 
                 # 先提取用户消息（召回查询需要）
@@ -140,12 +143,12 @@ class MemoryRecall:
                 top_k = self.config_manager.get("recall_engine.top_k", 5)
                 if top_k <= 0:
                     logger.debug(
-                        f"{tag('recall')} [{session_ref}] top_k={top_k} <= 0，跳过记忆检索和注入"
+                        f"{tag_event('recall', event)} [{session_ref}] top_k={top_k} <= 0，跳过记忆检索和注入"
                     )
                     return
 
                 if not actual_query:
-                    logger.warning(f"{tag('recall')} [{session_ref}] 原始用户消息为空，跳过记忆召回")
+                    logger.warning(f"{tag_event('recall', event)} [{session_ref}] 原始用户消息为空，跳过记忆召回")
                     return
 
                 # 获取 persona_id，与 AstrBot 主流程保持一致的三级优先级：
@@ -172,14 +175,14 @@ class MemoryRecall:
                     )
                 except Exception as e:
                     logger.warning(
-                        f"{tag('recall')} [{session_ref}] 构建 CM 用户历史召回查询失败，"
+                        f"{tag_event('recall', event)} [{session_ref}] 构建 CM 用户历史召回查询失败，"
                         f"回退当前发言: {e}"
                     )
 
                 # 执行记忆召回（带超时降级：embedding 检索卡住时跳过注入，
                 # 不阻塞主链路 LLM 请求）
                 logger.debug(
-                    f"{tag('recall')} [{session_ref}] 开始记忆召回，"
+                    f"{tag_event('recall', event)} [{session_ref}] 开始记忆召回，"
                     f"查询长度={len(query_for_search)}"
                 )
 
@@ -195,16 +198,13 @@ class MemoryRecall:
                     session_id=recall_session_id,
                     persona_id=recall_persona_id,
                     self_id=bot_self_id,
-                    isolate_persona_memory=bool(
-                        self.config_manager.get(
-                            "recall_engine.isolate_persona_memory", True
-                        )
-                    ),
+                    event=event,
                 )
 
                 if recalled_memories:
                     logger.debug(
-                        f"{tag('recall')} [{session_ref}] 检索到 {len(recalled_memories)} 条记忆"
+                        f"{tag_event('recall', event)} [{session_ref}] "
+                        f"检索到 {len(recalled_memories)} 条记忆"
                     )
 
                     # 格式化并注入记忆
@@ -222,7 +222,8 @@ class MemoryRecall:
                     # 输出详细记忆信息
                     for i, mem in enumerate(recalled_memories, 1):
                         logger.debug(
-                            f"{tag('recall')} [{session_ref}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
+                            f"{tag_event('recall', event)} [{session_ref}] 记忆 #{i}: "
+                            f"得分={mem.final_score:.3f}, "
                             f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
                             f"内容长度={len(mem.content or '')}"
                         )
@@ -237,7 +238,7 @@ class MemoryRecall:
                             provider = self.context.get_using_provider(session_id)
                         except Exception as e:
                             logger.warning(
-                                f"{tag('recall')} [{session_ref}] 获取当前 Provider 失败，"
+                                f"{tag_event('recall', event)} [{session_ref}] 获取当前 Provider 失败，"
                                 f"将按无 Provider 继续解析注入模式: {e}"
                             )
                     injection_method, fallback_reason = (
@@ -245,10 +246,15 @@ class MemoryRecall:
                     )
                     if fallback_reason:
                         logger.warning(
-                        f"{tag('recall')} [{session_ref}] 注入模式从 {configured_method} 降级为 "
+                        f"{tag_event('recall', event)} [{session_ref}] "
+                        f"注入模式从 {configured_method} 降级为 "
                             f"{injection_method}: {fallback_reason}"
                         )
 
+                    try:
+                        current_speaker = event.get_sender_name() or ""
+                    except Exception:
+                        current_speaker = ""
                     memory_str = format_memories_for_injection(
                         memory_list,
                         max_memories=self.config_manager.get(
@@ -257,22 +263,25 @@ class MemoryRecall:
                         max_chars=self.config_manager.get(
                             "recall_engine.injection_max_chars", 3200
                         ),
+                        current_speaker=current_speaker,
                     )
                     if not memory_str:
                         logger.debug(
-                            f"{tag('recall')} [{session_ref}] 候选记忆去重/预算筛选后为空"
+                            f"{tag_event('recall', event)} [{session_ref}] 候选记忆去重/预算筛选后为空"
                         )
                         return
 
                     if injection_method == "user_message_before":
                         req.prompt = memory_str + "\n\n" + (req.prompt or "")
                         logger.info(
-                            f"{tag('recall')} [{session_ref}] 成功向用户消息前注入 {len(recalled_memories)} 条记忆"
+                            f"{tag_event('recall', event)} [{session_ref}] "
+                            f"成功向用户消息前注入 {len(recalled_memories)} 条记忆"
                         )
                     elif injection_method == "user_message_after":
                         req.prompt = (req.prompt or "") + "\n\n" + memory_str
                         logger.info(
-                            f"{tag('recall')} [{session_ref}] 成功向用户消息后注入 {len(recalled_memories)} 条记忆"
+                            f"{tag_event('recall', event)} [{session_ref}] "
+                            f"成功向用户消息后注入 {len(recalled_memories)} 条记忆"
                         )
                     elif injection_method == "fake_tool_call":
                         fake_messages = format_memories_for_fake_tool_call(
@@ -285,7 +294,7 @@ class MemoryRecall:
                         if fake_messages:
                             req.contexts.extend(fake_messages)
                             logger.info(
-                                f"{tag('recall')} [{session_ref}] 成功以伪造工具调用方式注入 "
+                                f"{tag_event('recall', event)} [{session_ref}] 成功以伪造工具调用方式注入 "
                                 f"{len(recalled_memories)} 条记忆"
                             )
                     else:
@@ -295,16 +304,19 @@ class MemoryRecall:
                             TextPart(text=memory_str).mark_as_temp()
                         )
                         logger.info(
-                            f"{tag('recall')} [{session_ref}] 成功向用户消息末尾注入 "
+                            f"{tag_event('recall', event)} [{session_ref}] 成功向用户消息末尾注入 "
                             f"{len(recalled_memories)} 条记忆"
                         )
                 else:
-                    logger.debug(f"{tag('recall')} [{session_ref}] 未找到相关记忆")
+                    logger.debug(f"{tag_event('recall', event)} [{session_ref}] 未找到相关记忆")
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"{tag('recall')} 处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+            logger.error(
+                f"{tag_event('recall', event)} 处理 on_llm_request 钩子时发生错误: {e}",
+                exc_info=True,
+            )
 
     async def _search_memories_guarded(
         self,
@@ -315,7 +327,7 @@ class MemoryRecall:
         session_id: str,
         persona_id: str | None,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
+        event=None,
     ) -> list[Any]:
         """带超时的记忆召回：embedding 检索卡住时降级为空结果。
 
@@ -338,7 +350,6 @@ class MemoryRecall:
             session_id=session_id,
             persona_id=persona_id,
             self_id=self_id,
-            isolate_persona_memory=isolate_persona_memory,
         )
         if timeout <= 0:
             return await search_coro
@@ -352,7 +363,7 @@ class MemoryRecall:
         task.cancel()
         task.add_done_callback(_consume_detached_task)
         logger.warning(
-            f"{tag('recall')} [{session_ref}] 记忆召回超时（>{timeout:.1f}s），"
+            f"{tag_event('recall', event)} [{session_ref}] 记忆召回超时（>{timeout:.1f}s），"
             "跳过本轮注入，不阻塞主请求"
         )
         return []

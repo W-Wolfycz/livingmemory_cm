@@ -101,6 +101,43 @@ class MemorySchemaService:
             CREATE INDEX IF NOT EXISTS idx_documents_doc_id
             ON documents(doc_id)
             """,
+            # 表达式索引：必须与召回/列表查询里的表达式同形（含 json_valid 守卫与
+            # COALESCE/CAST 包装）才会被命中。复合形式让同一个索引同时服务
+            # "status 过滤 + create_time 倒序截断"的列表/计数查询与近期记忆槽位，
+            # 无需 INDEXED BY 钉计划（索引不存在时钉计划会直接报错）。
+            """
+            CREATE INDEX IF NOT EXISTS idx_doc_status_created
+            ON documents(
+                COALESCE(
+                    CASE WHEN json_valid(metadata)
+                    THEN json_extract(metadata, '$.status') END,
+                    'active'
+                ),
+                COALESCE(
+                    CASE WHEN json_valid(metadata)
+                    THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,
+                    0
+                ) DESC,
+                id DESC
+            )
+            """,
+            # 按记忆类型过滤的列表查询（WebUI「类型」筛选）
+            """
+            CREATE INDEX IF NOT EXISTS idx_doc_type_created
+            ON documents(
+                UPPER(COALESCE(
+                    CASE WHEN json_valid(metadata)
+                    THEN json_extract(metadata, '$.memory_type') END,
+                    'GENERAL'
+                )),
+                COALESCE(
+                    CASE WHEN json_valid(metadata)
+                    THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,
+                    0
+                ) DESC,
+                id DESC
+            )
+            """,
         ):
             await connection.execute(index_sql)
 

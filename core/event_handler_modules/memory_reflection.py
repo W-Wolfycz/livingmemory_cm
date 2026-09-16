@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from ...log import logger, tag, tag_event
+from ...log import logger, tag_event
 from ..reflection import (
     CMHistoryReader,
     ReflectionBatchWriter,
@@ -72,18 +72,18 @@ class MemoryReflection:
         try:
             session_id = event.unified_msg_origin
             if not session_id:
-                logger.warning(f"{tag('reflection')} session_id 为空，跳过反思")
+                logger.warning(f"{tag_event('reflection', event)} session_id 为空，跳过反思")
                 return
 
             if "error:" in session_id.lower():
                 logger.warning(
-                    f"{tag('reflection')} 检测到异常 session_id，跳过详情记录"
+                    f"{tag_event('reflection', event)} 检测到异常 session_id，跳过详情记录"
                 )
 
             cm_on, cm_limit = get_cm_status(self.context)
             if not cm_on or cm_limit <= 0:
                 logger.warning(
-                    f"{tag('reflection')} CM 未接管（异常状态），跳过反思。"
+                    f"{tag_event('reflection', event)} CM 未接管（异常状态），跳过反思。"
                     f"ct_enable={cm_on}, ct_limit_rounds={cm_limit}"
                 )
                 return
@@ -106,7 +106,7 @@ class MemoryReflection:
             )
             unit = "轮" if extraction_mode == "rounds" else "条消息"
             logger.debug(
-                f"{tag('reflection')} 反思模式={extraction_mode}, "
+                f"{tag_event('reflection', event)} 反思模式={extraction_mode}, "
                 f"触发阈值={trigger_count}{unit}, "
                 f"主动拒绝推进={refusal_advance_count}{unit}"
             )
@@ -123,7 +123,7 @@ class MemoryReflection:
             raise
         except Exception as exc:
             logger.error(
-                f"{tag('reflection')} 处理记忆反思时发生错误: {exc}",
+                f"{tag_event('reflection', event)} 处理记忆反思时发生错误: {exc}",
                 exc_info=True,
             )
 

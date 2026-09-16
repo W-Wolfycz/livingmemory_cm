@@ -1,9 +1,9 @@
 {
     "log_with_bot_id": {
-        "description": "日志区分机器人实例（全局配置项）",
+        "description": "日志附加平台实例标识（全局配置项）",
         "type": "bool",
         "default": false,
-        "hint": "多 Bot 共存时在关键事件日志前缀附加 self_id 原文，并与模块名并存（如 [livingmemory_cm:bot-10000][recall]）便于定位；关闭时不加 bot 前缀。会话/用户引用仍脱敏；日志级别跟随 AstrBot 原生配置。"
+        "hint": "多 Bot / 多平台实例共存时，在日志前缀末尾追加事件所属平台的实例标识（platform_id，与 UMO 首段一致、不含账号）：[livingmemory_cm][子模块][platform:xxx]；关闭时只保留 [livingmemory_cm][子模块]，模块定位始终在。会话/用户引用仍脱敏；日志级别跟随 AstrBot 原生配置。"
     },
     "provider_settings": {
         "description": "模型提供商",
@@ -148,11 +148,29 @@
                 "type": "float",
                 "default": 5.0
             },
-            "isolate_persona_memory": {
-                "description": "persona 记忆隔离",
-                "hint": "persona 记忆隔离（默认开启）：同群多 Bot 共用同一 session 时，按写入记忆的 Bot self_id 过滤，自动召回与 Agent 检索工具只返回当前 Bot 自己写入的记忆，避免 A Bot 召回 B Bot 的记忆；无 Bot 标识的旧记忆仍保留。单 Bot 部署可关闭。",
+            "rerank_enabled": {
+                "description": "启用 Rerank 重排序",
+                "hint": "召回候选交给 AstrBot 的 Rerank 提供商按查询相关性重新打分，把真正相关的记忆排进注入列表。提供商不可用、调用失败或返回空时自动沿用原排序。默认关闭。",
                 "type": "bool",
-                "default": true
+                "default": false
+            },
+            "rerank_provider_id": {
+                "description": "Rerank 模型 ID（手填）",
+                "hint": "用于重排序的 Rerank 提供商 ID，需手填：AstrBot 的模型选择器只列对话模型，请到「模型提供商」页复制 Rerank 提供商的 ID 粘贴到此处。留空时回退到已加载的第一个 Rerank 提供商；填错或类型不符会记 WARNING 并关闭重排序。",
+                "type": "string",
+                "default": ""
+            },
+            "rerank_candidates": {
+                "description": "重排序候选条数",
+                "hint": "参与重排序的候选条数（2-100）。候选越多重排越准、外部调用越慢；重排后仍只注入 top_k 条。默认 20。",
+                "type": "int",
+                "default": 20
+            },
+            "rerank_weight": {
+                "description": "重排分数占比",
+                "hint": "重排序分数在最终得分中的占比（0-1）：0.6 表示六成看重排相关性、四成沿用原有重要性/时间加权；1.0 完全按重排结果排序。默认 0.6。",
+                "type": "float",
+                "default": 0.6
             }
         }
     },

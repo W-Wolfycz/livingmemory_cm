@@ -10,7 +10,11 @@ from typing import Any
 
 from ..log import logger, tag
 from astrbot.api.star import Context
-from astrbot.core.provider.provider import EmbeddingProvider, Provider
+from astrbot.core.provider.provider import (
+    EmbeddingProvider,
+    Provider,
+    RerankProvider,
+)
 
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
@@ -77,6 +81,7 @@ class PluginInitializer:
         # 组件实例
         self.embedding_provider: EmbeddingProvider | None = None
         self.llm_provider: Provider | None = None
+        self.rerank_provider: RerankProvider | None = None
         self.db: Any | None = None
         self.graph_db: Any | None = None
         self.memory_engine: MemoryEngine | None = None
@@ -315,6 +320,42 @@ class PluginInitializer:
                     logger.debug(f"{tag('init')} 获取默认 LLM Provider 失败: {e}")
                 self.llm_provider = None
 
+    def _resolve_rerank_provider(self):
+        """解析 Rerank Provider；未启用或不可用时返回 None（召回自动降级）。
+
+        留空 provider_id 时回退到 AstrBot 已加载的默认 Rerank 提供商（取第一个），
+        拿不到就保持关闭——绝不让重排失败影响召回本身。
+        """
+        if not bool(self.config_manager.get("recall_engine.rerank_enabled", False)):
+            return None
+
+        provider_id = str(
+            self.config_manager.get("recall_engine.rerank_provider_id") or ""
+        ).strip()
+        if provider_id:
+            provider = self._get_provider_by_id(provider_id, silent=True)
+            if provider is None:
+                logger.warning(
+                    f"{tag('init')} Rerank Provider {provider_id} 未找到，已关闭重排序"
+                )
+                return None
+            if not isinstance(provider, RerankProvider):
+                logger.warning(
+                    f"{tag('init')} Provider {provider_id} 不是 RerankProvider 类型，"
+                    "已关闭重排序"
+                )
+                return None
+            return provider
+
+        manager = getattr(self.context, "provider_manager", None)
+        for candidate in getattr(manager, "rerank_provider_insts", []) or []:
+            return candidate
+        logger.warning(
+            f"{tag('init')} 未找到可用的 Rerank Provider，已关闭重排序"
+            "（请在 AstrBot 模型提供商页面添加 Rerank 提供商）"
+        )
+        return None
+
     def _get_provider_by_id(self, provider_id: str, *, silent: bool):
         """静默检查阶段绕过会打印 warning 的 AstrBot 查询接口。"""
         if not provider_id:
@@ -453,6 +494,18 @@ class PluginInitializer:
                 "memory_type_filter": self.config_manager.get(
                     "recall_engine.memory_type_filter", "all"
                 ),
+                "rerank_enabled": self.config_manager.get(
+                    "recall_engine.rerank_enabled", False
+                ),
+                "rerank_candidates": self.config_manager.get(
+                    "recall_engine.rerank_candidates", 20
+                ),
+                "rerank_weight": self.config_manager.get(
+                    "recall_engine.rerank_weight", 0.6
+                ),
+                "search_timeout_seconds": self.config_manager.get(
+                    "recall_engine.search_timeout_seconds", 5.0
+                ),
                 "cleanup_days_threshold": self.config_manager.get(
                     "maintenance.cleanup_days_threshold", 30
                 ),
@@ -503,6 +556,7 @@ class PluginInitializer:
             }
 
             freeze_store = FreezeStore(data_dir_path / "frozen_personas.json")
+            self.rerank_provider = self._resolve_rerank_provider()
             self.memory_engine = MemoryEngine(
                 db_path=str(db_path),
                 faiss_db=self.db,
@@ -510,6 +564,7 @@ class PluginInitializer:
                 llm_provider=self.llm_provider,
                 config=memory_engine_config,
                 freeze_store=freeze_store,
+                rerank_provider=self.rerank_provider,
             )
             await self.memory_engine.initialize()
             logger.info(f"{tag('init')} MemoryEngine 已初始化")

@@ -7,7 +7,7 @@ import os
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
-from ..log import log_ref, logger, tag
+from ..log import log_ref, logger, tag_event
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
 from .base.config_manager import ConfigManager
@@ -137,7 +137,7 @@ class CommandHandler:
 
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"{tag('cmd')} 获取状态失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 获取状态失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("status.action_name"),
@@ -201,7 +201,7 @@ class CommandHandler:
 
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"{tag('cmd')} 搜索失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 搜索失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("search.action_name"),
@@ -232,7 +232,7 @@ class CommandHandler:
             else:
                 yield event.plain_result(t("forget.not_found", id=doc_id))
         except Exception as e:
-            logger.error(f"{tag('cmd')} 删除失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 删除失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("forget.action_name"),
@@ -262,7 +262,7 @@ class CommandHandler:
                 )
             )
         except Exception as e:
-            logger.error(f"{tag('cmd')} 重建图记忆失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 重建图记忆失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("rebuild_graph.action_name"),
@@ -293,7 +293,7 @@ class CommandHandler:
             message = t("reset.success")
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"{tag('cmd')} 手动重置记忆上下文失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 手动重置记忆上下文失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("reset.action_name"),
@@ -354,7 +354,7 @@ class CommandHandler:
             await store.freeze(target)
             yield event.plain_result(t("freeze.success", persona=target))
         except Exception as e:
-            logger.error(f"{tag('cmd')} 冻结 persona 失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 冻结 persona 失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(t("freeze.action_name"), e)
             )
@@ -407,7 +407,7 @@ class CommandHandler:
                 message = message + "\n" + t("freeze.refreshed", count=refreshed)
             yield event.plain_result(message)
         except Exception as e:
-            logger.error(f"{tag('cmd')} 解冻 persona 失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 解冻 persona 失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(t("freeze.unfreeze_action_name"), e)
             )
@@ -494,7 +494,7 @@ class CommandHandler:
                     if not cleaned_content:
                         stats["deleted"] += 1
                         logger.debug(
-                            f"{tag('cmd')} [cleanup] 删除纯记忆注入消息: role={msg.get('role')}"
+                            f"{tag_event('cmd', event)} [cleanup] 删除纯记忆注入消息: role={msg.get('role')}"
                         )
                         continue
 
@@ -505,7 +505,7 @@ class CommandHandler:
                         cleaned_history.append(msg_copy)
                         stats["cleaned"] += 1
                         logger.debug(
-                            f"{tag('cmd')} [cleanup] 清理消息内部记忆片段: "
+                            f"{tag_event('cmd', event)} [cleanup] 清理消息内部记忆片段: "
                             f"原长度={len(content)}, 新长度={len(cleaned_content)}"
                         )
                         continue
@@ -520,7 +520,7 @@ class CommandHandler:
                     history=cleaned_history,
                 )
                 logger.info(
-                    f"{tag('cmd')} [{log_ref(session_id, 'session')}] "
+                    f"{tag_event('cmd', event)} [{log_ref(session_id, 'session')}] "
                     "cleanup 已更新 AstrBot 对话历史: "
                     f"清理={stats['cleaned']}, 删除={stats['deleted']}"
                 )
@@ -542,7 +542,7 @@ class CommandHandler:
             yield event.plain_result(message)
 
         except Exception as e:
-            logger.error(f"{tag('cmd')} 清理历史消息失败: {e}", exc_info=True)
+            logger.error(f"{tag_event('cmd', event)} 清理历史消息失败: {e}", exc_info=True)
             yield event.plain_result(
                 self._format_error_message(
                     t("cleanup.action_name"),

@@ -1,14 +1,15 @@
 """包内日志 wrapper：
 
-- ``log_with_bot_id``：在日志前缀中附加机器人实例标识，并与模块名并存
-  （如 ``[livingmemory_cm:bot-10000][recall]``），区分多 bot 共存场景；前缀直接
-  使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出便于按
-  Bot ID 定位日志。会话/用户引用仍通过 ``log_ref`` 保持脱敏（如
-  ``[session:<hash>]``）。
+- ``log_with_bot_id``：在日志前缀末尾追加平台实例标识（``platform_id``），
+  与模块名、子模块名并存：``[livingmemory_cm][recall][platform:BOT1]``。
+  关闭时前缀为 ``[livingmemory_cm][recall]``，模块定位始终保留。
+- 标识取 AstrBot 事件 ``event.get_platform_id()``（即 ``platform_meta.id``，
+  与 UMO 首段一致、平台内唯一、不含账号），由核心在其文档中保证唯一性。
+  会话/用户引用仍通过 ``log_ref`` 保持脱敏（如 ``[session:<hash>]``）。
   前缀通过 ``tag(module, event)`` 在调用点拼装——只有能拿到 event 的调用点
-  （hook/命令）才会带 bot 前缀，后台调度等无 event 的日志保持模块名或默认。
-  需要真实体现 Bot ID 的关键事件入口（recall/reflection/session reset）
-  应使用 ``tag_event(module, event)`` 传入事件对象。
+  （hook/命令）才会带平台段，后台调度等无 event 的日志保持模块与子模块。
+  关键事件入口（recall/reflection/session reset）应使用
+  ``tag_event(module, event)`` 传入事件对象。
 
 日志级别完全跟随 AstrBot 原生配置，插件不再自行提级（debug→info）；需要查看
 详细运行信息时，请在 AstrBot 全局日志级别中开启 debug。
@@ -20,6 +21,9 @@
 import hashlib
 
 from astrbot.api import logger as _astrbot_logger
+
+# 前缀第一段固定为插件模块名；各调用点传入的名字作为子模块段。
+PLUGIN_TAG = "livingmemory_cm"
 
 
 class _LoggerProxy:
@@ -77,45 +81,52 @@ def set_log_with_bot_id(enabled: bool) -> None:
 
 
 def tag(module: str | None = None, event=None) -> str:
-    """日志前缀。
+    """日志前缀：``[livingmemory_cm][子模块][platform:{platform_id}]``。
 
-    优先级：
-    1. ``log_with_bot_id=True`` 且传入 event 且能取到 self_id
-       → ``[livingmemory_cm:bot-<self_id>][module]``（无 module 时省略模块段）
-    2. 传入 module → ``[livingmemory_cm:module]``
-    3. 默认 → ``[livingmemory_cm]``
+    段位规则：
+    1. 第一段恒为模块名 ``[livingmemory_cm]``；
+    2. 传入 ``module`` 时追加子模块段 ``[recall]``；
+    3. ``log_with_bot_id=True`` 且传入 event 且能取到 ``platform_id`` 时，
+       末尾追加 ``[platform:BOT1]``；取不到（事件/平台未实现）时省略该段。
 
-    Bot 标识与模块名并存（双段形式），避免开启 bot 标识后丢失模块定位；Bot
-    标识使用 AstrBot 事件 ``event.get_self_id()`` 的原始 self_id，按原文输出
-    （如 ``[livingmemory_cm:bot-10000][recall]``）便于定位；会话/用户引用请继续
-    使用 ``log_ref`` 保持脱敏。
+    平台标识用 AstrBot 事件 ``event.get_platform_id()``（``platform_meta.id``，
+    与 UMO 首段一致、平台内唯一、不含账号），不使用 self_id；关闭开关时保持
+    ``[模块][子模块]``，不会丢掉模块定位。会话/用户引用请继续使用 ``log_ref``
+    保持脱敏。
 
     建议调用点固定一个 module 名，例如::
 
         from ..log import logger, tag
         logger.info(f"{tag('recall')} 召回 5 条")
 
-    关键事件入口（recall/reflection/session reset）如需真实体现 Bot ID，请使用
-    ``tag_event(module, event)``。
+    关键事件入口（recall/reflection/session reset）如需平台标识，请使用
+    ``tag_event(module, event)`` 传入事件对象。
     """
-    if _with_bot_id and event is not None:
-        try:
-            self_id = event.get_self_id()
-            if self_id:
-                base = f"[livingmemory_cm:bot-{self_id}]"
-                return f"{base}[{module}]" if module else base
-        except Exception:
-            # 取不到 self_id（事件/平台未实现）时不加 bot 前缀，保持模块名。
-            pass
+    prefix = f"[{PLUGIN_TAG}]"
     if module:
-        return f"[livingmemory_cm:{module}]"
-    return "[livingmemory_cm]"
+        prefix += f"[{module}]"
+    platform_id = _platform_id(event) if _with_bot_id else ""
+    if platform_id:
+        prefix += f"[platform:{platform_id}]"
+    return prefix
+
+
+def _platform_id(event) -> str:
+    """取事件所属平台实例 ID；无 event 或取不到时返回空串。"""
+    if event is None:
+        return ""
+    try:
+        value = event.get_platform_id()
+    except Exception:
+        # 事件/平台未实现该接口时退化为无平台段，不影响模块定位。
+        return ""
+    return str(value or "").strip()
 
 
 def tag_event(module: str | None = None, event=None) -> str:
     """与 ``tag(module, event)`` 等价，语义上明确“这是事件入口”。
 
     供 recall/reflection/session reset 等有 event 的关键入口使用，以便
-    ``log_with_bot_id=True`` 时按原始 self_id 附加 Bot 前缀。
+    ``log_with_bot_id=True`` 时按 ``platform_id`` 附加平台段。
     """
     return tag(module, event)

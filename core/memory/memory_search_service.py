@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import time
@@ -9,15 +10,46 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ...log import logger, tag
 from ..retrieval.hybrid_retriever import HybridResult
 from ..utils.number_utils import clamp_float
+
+# documents 表 metadata 的规范表达式：必须与 memory_schema_service 里
+# idx_doc_status_created / idx_doc_type_created 的索引表达式同形才会被命中。
+# json_valid 守卫同时避免坏 JSON 行让整条查询直接报错。
+_DOC_STATUS_EXPR = (
+    "COALESCE(CASE WHEN json_valid(metadata) "
+    "THEN json_extract(metadata, '$.status') END, 'active')"
+)
+_DOC_CREATED_EXPR = (
+    "COALESCE(CASE WHEN json_valid(metadata) "
+    "THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END, 0)"
+)
+_DOC_SESSION_EXPR = (
+    "CASE WHEN json_valid(metadata) "
+    "THEN json_extract(metadata, '$.session_id') END"
+)
+_DOC_PERSONA_EXPR = (
+    "CASE WHEN json_valid(metadata) "
+    "THEN json_extract(metadata, '$.persona_id') END"
+)
 
 
 class MemorySearchService:
     """协调文档/图双路检索，并维护进程内 TTL 缓存。"""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], rerank_provider=None) -> None:
         self.config = config
+        # Rerank 提供商（可选）：启用后对合并结果重排序，失败自动沿用原排序
+        self.rerank_provider = rerank_provider
+        self._rerank_enabled = bool(config.get("rerank_enabled", False)) and (
+            rerank_provider is not None
+        )
+        self._rerank_candidates = max(2, int(config.get("rerank_candidates", 20)))
+        self._rerank_weight = min(
+            1.0, max(0.0, float(config.get("rerank_weight", 0.6)))
+        )
+        self._rerank_timeout = float(config.get("search_timeout_seconds", 5.0) or 0.0)
         self._cache_ttl = float(config.get("search_cache_ttl_seconds", 45.0))
         self._cache_max_size = int(config.get("search_cache_max_size", 256))
         self._cache_generation = 0
@@ -33,7 +65,6 @@ class MemorySearchService:
         session_id: str | None,
         persona_id: str | None,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
         exclude_personas: set[str] | None = None,
         hybrid_retriever,
         dual_route_retriever,
@@ -54,7 +85,6 @@ class MemorySearchService:
             persona_id,
             dual_route_enabled=dual_route_retriever is not None,
             self_id=self_id,
-            isolate_persona_memory=isolate_persona_memory,
             excluded_personas=excluded,
         )
         cached_results = self._get_cached_results(cache_key)
@@ -84,27 +114,28 @@ class MemorySearchService:
             )
 
         results = self._filter_by_retrieval_policy(results)
-        results = self._isolate_persona_memory(
-            results, self_id, isolate_persona_memory
-        )
+        results = self._filter_legacy_bot_scope(results, self_id)
         results = self._filter_frozen_personas(results, excluded)
+        # 启用重排时先保留更大的候选池，重排后再截断到 k——否则候选在重排前
+        # 就已经被裁掉，重排只能在同一批里换顺序。
+        candidate_k = (
+            max(k, self._rerank_candidates) if self._rerank_enabled else k
+        )
         results = await self._merge_recent_memories(
             results,
-            k,
+            candidate_k,
             session_id,
             persona_id,
             db_connection,
             excluded_personas=excluded,
-            self_id=self_id,
-            isolate_persona_memory=isolate_persona_memory,
         )
         # 近期槽位直接查库、不经过向量过滤，而它的 SQL 只按 session/persona
-        # 过滤，因此这里必须把冻结与 persona 记忆隔离两道过滤都再兜一次，
-        # 确保两者都不会从该路径泄漏回注入结果。
+        # 过滤，因此冻结与旧 Bot 归属两道过滤都要再兜一次，确保两者都不会
+        # 从该路径泄漏回注入结果。
         results = self._filter_frozen_personas(results, excluded)
-        results = self._isolate_persona_memory(
-            results, self_id, isolate_persona_memory
-        )
+        results = self._filter_legacy_bot_scope(results, self_id)
+        results = await self._apply_rerank(query, results)
+        results = results[:k]
 
         for result in results:
             schedule_task(update_access_time(result.doc_id))
@@ -134,19 +165,21 @@ class MemorySearchService:
         return filtered
 
     @staticmethod
-    def _isolate_persona_memory(
+    def _filter_legacy_bot_scope(
         results: list[Any],
         self_id: str | None,
-        enabled: bool,
     ) -> list[Any]:
-        """persona 记忆隔离：排除 metadata.self_id 明确属于其他 Bot 的结果。
+        """过渡兼容：按旧记忆里记录的 ``metadata.self_id`` 过滤其他 Bot 实例的记忆。
 
-        同群多 Bot 共用同一 session（umo），需要按写入时的 Bot 标识过滤，避免
-        A Bot 召回 B Bot 的记忆。兼容策略：没有 self_id 字段的旧记忆保留
-        （迁移前写入的数据无法回溯归属）；self_id 为空或开关关闭时不过滤。
+        ``2.5.7-cm.3`` 起写入侧不再记录 ``self_id``（platform_id 会随换号、改适配器名
+        而变，不适合当隔离键），但**在过渡期保留读取侧过滤**：只有 cm.3 之前写入、
+        确实带 ``self_id`` 的老记录会被过滤，没有该字段的新记录一律保留。因此随着
+        旧记忆衰减/清理，这层过滤会自然变成空操作，记忆归属收敛到 session + persona
+        两个稳定维度。这是兼容逻辑而非用户开关，不需要配置项。
         """
-        if not enabled or not self_id:
+        if not self_id:
             return results
+        current = str(self_id)
         filtered: list[Any] = []
         for result in results:
             metadata = getattr(result, "metadata", None)
@@ -155,10 +188,86 @@ class MemorySearchService:
                 if isinstance(metadata, dict)
                 else ""
             )
-            if owner and owner != str(self_id):
+            if owner and owner != current:
                 continue
             filtered.append(result)
+        dropped = len(results) - len(filtered)
+        if dropped:
+            logger.debug(
+                f"{tag('retrieval')} 旧记忆 self_id 过渡过滤: 候选 {len(results)} 条，"
+                f"剔除其他 Bot 实例写入的旧记忆 {dropped} 条"
+            )
         return filtered
+
+    async def _apply_rerank(
+        self,
+        query: str,
+        results: list[HybridResult],
+    ) -> list[HybridResult]:
+        """用 AstrBot 的 Rerank 提供商对候选重排序。
+
+        语义：候选集内把重排分数归一化到 [0,1]，与原有 final_score 按
+        ``rerank_weight`` 线性混合后重新排序，明细写入 ``score_breakdown["rerank"]``。
+        提供商不可用、调用超时、抛异常或返回空时**原样返回**，召回不受影响；
+        超出候选上限的部分保持在尾部（它们没有参与重排）。
+        """
+        if not self._rerank_enabled or len(results) < 2:
+            return results
+
+        head = results[: self._rerank_candidates]
+        tail = results[len(head) :]
+        documents = [item.content or "" for item in head]
+
+        try:
+            rerank_call = self.rerank_provider.rerank(query, documents)
+            if self._rerank_timeout > 0:
+                scored = await asyncio.wait_for(
+                    rerank_call, timeout=self._rerank_timeout
+                )
+            else:
+                scored = await rerank_call
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"{tag('retrieval')} Rerank 调用失败，沿用原排序: {exc}")
+            return results
+
+        raw_scores: dict[int, float] = {}
+        for item in scored or []:
+            try:
+                index = int(getattr(item, "index", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(head):
+                raw_scores[index] = float(
+                    getattr(item, "relevance_score", 0.0) or 0.0
+                )
+        if not raw_scores:
+            logger.debug(f"{tag('retrieval')} Rerank 未返回可用分数，沿用原排序")
+            return results
+
+        highest = max(raw_scores.values())
+        lowest = min(raw_scores.values())
+        span = highest - lowest
+
+        weight = self._rerank_weight
+        for index, item in enumerate(head):
+            if index not in raw_scores:
+                continue  # 未被打分的候选保留原分数
+            normalized = 1.0 if span <= 0 else (raw_scores[index] - lowest) / span
+            blended = weight * normalized + (1.0 - weight) * item.final_score
+            breakdown = dict(item.score_breakdown or {})
+            breakdown["rerank"] = round(normalized, 4)
+            breakdown["final_score"] = round(blended, 4)
+            item.score_breakdown = breakdown
+            item.final_score = blended
+
+        head.sort(key=lambda item: item.final_score, reverse=True)
+        logger.debug(
+            f"{tag('retrieval')} Rerank 完成: 候选 {len(head)} 条，"
+            f"权重 {weight:.2f}，最高/最低分 {highest:.4f}/{lowest:.4f}"
+        )
+        return head + tail
 
     def invalidate(self) -> None:
         """写操作后使全部检索缓存失效。"""
@@ -178,7 +287,6 @@ class MemorySearchService:
         *,
         dual_route_enabled: bool,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
         excluded_personas: set[str] | None = None,
     ) -> tuple[Any, ...]:
         return (
@@ -189,7 +297,6 @@ class MemorySearchService:
             persona_id or "",
             dual_route_enabled,
             self_id or "",
-            bool(isolate_persona_memory),
             tuple(sorted(str(item) for item in (excluded_personas or set()))),
             round(
                 float(
@@ -290,37 +397,31 @@ class MemorySearchService:
         db_connection,
         excluded_personas: set[str] | None = None,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         if count <= 0 or db_connection is None:
             return []
 
-        conditions = [
-            "COALESCE(json_extract(metadata, '$.status'), 'active') = 'active'"
-        ]
+        conditions = [f"{_DOC_STATUS_EXPR} = 'active'"]
         params: list[Any] = []
         if session_id is not None:
-            conditions.append("json_extract(metadata, '$.session_id') = ?")
+            conditions.append(f"{_DOC_SESSION_EXPR} = ?")
             params.append(session_id)
         if persona_id is not None:
-            conditions.append("json_extract(metadata, '$.persona_id') = ?")
+            conditions.append(f"{_DOC_PERSONA_EXPR} = ?")
             params.append(persona_id)
         max_age_hours = max(
             0,
             int(self.config.get("recent_memory_max_age_hours", 72)),
         )
         if max_age_hours > 0:
-            conditions.append(
-                "CAST(json_extract(metadata, '$.create_time') AS REAL) >= ?"
-            )
+            conditions.append(f"{_DOC_CREATED_EXPR} >= ?")
             params.append(time.time() - max_age_hours * 3600)
         params.append(max(count * 3, count))
 
         cursor = await db_connection.execute(
             "SELECT id, text, metadata FROM documents WHERE "
             + " AND ".join(conditions)
-            + " ORDER BY CAST(json_extract(metadata, '$.create_time') AS REAL) "
-            "DESC, id DESC LIMIT ?",
+            + f" ORDER BY {_DOC_CREATED_EXPR} DESC, id DESC LIMIT ?",
             params,
         )
         rows = await cursor.fetchall()
@@ -339,9 +440,7 @@ class MemorySearchService:
         # 最终返回条数少于 k（该路径直查数据库，不经过向量过滤）。
         recent = self._filter_by_retrieval_policy(recent)
         recent = self._filter_frozen_personas(recent, excluded_personas or set())
-        recent = self._isolate_persona_memory(
-            recent, self_id, isolate_persona_memory
-        )
+        recent = self._filter_legacy_bot_scope(recent, self_id)
         return recent[:count]
 
     async def _merge_recent_memories(
@@ -353,7 +452,6 @@ class MemorySearchService:
         db_connection,
         excluded_personas: set[str] | None = None,
         self_id: str | None = None,
-        isolate_persona_memory: bool = True,
     ) -> list[HybridResult]:
         recent_count = min(
             max(0, int(self.config.get("recent_memory_count", 0))),
@@ -369,7 +467,6 @@ class MemorySearchService:
             db_connection,
             excluded_personas=excluded_personas,
             self_id=self_id,
-            isolate_persona_memory=isolate_persona_memory,
         )
         if not recent:
             return results[:k]

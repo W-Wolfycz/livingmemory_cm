@@ -6,7 +6,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 [chat_memory](https://github.com/W-Wolfycz/chat_memory) 的上下文接管模式维护。
 本项目是独立的 CM-only fork，不是上游官方发行版。
 
-- 当前版本：`2.5.7-cm.2`
+- 当前版本：`2.5.7-cm.3`
 - 源码仓库：<https://github.com/W-Wolfycz/livingmemory_cm>
 - 许可证：GNU Affero General Public License v3.0（AGPL-3.0）
 
@@ -53,14 +53,14 @@ Release 包不包含 `data/`、数据库、FAISS 索引或用户配置。升级�
 - `recall_engine.injection_method`：长期记忆注入方式，默认 `extra_user_content`。
 - `recall_engine.query_context_rounds`：用于指代消歧的最近 CM 历史，单位跟随 CM `llm_status_filter`（仅 `llm_success` 按轮、含其他状态按条），默认 `2`。
 - `recall_engine.search_timeout_seconds`：主链路记忆召回（含 embedding 检索）超时降级，默认 `5` 秒；`0` 不限时。
-- `recall_engine.isolate_persona_memory`：persona 记忆隔离（默认开启），只召回当前 Bot 自己写入的记忆；无 Bot 标识的旧记忆仍保留。
+- `recall_engine.rerank_enabled` / `rerank_provider_id` / `rerank_candidates` / `rerank_weight`：启用 Rerank 重排序（默认关闭），对召回候选按查询相关性重打分后再注入；`rerank_provider_id` 需手填 Rerank 提供商 ID（模型选择器只列对话模型）。
 - `reflection_engine.trigger_count`：反思触发数量；`0` 跟随 ChatMemory 配置。
 - `graph_memory.graph_route_weight`：图路融合权重，默认 `0.35`；文档路权重自动为 `1 - graph_route_weight`。
-- `log_with_bot_id`（全局配置项，不属于配置段）：多 Bot 共存时在关键事件日志前缀附加 self_id 原文并与模块名并存（如 `[livingmemory_cm:bot-10000][recall]`），便于定位；会话/用户引用仍脱敏。
+- `log_with_bot_id`（全局配置项，不属于配置段）：多 Bot / 多平台实例共存时在日志前缀末尾附加平台实例标识 `platform_id`（如 `[livingmemory_cm][recall][platform:BOT1]`）；关闭时只保留 `[livingmemory_cm][recall]`，模块定位始终在。会话/用户引用仍脱敏。
 - `maintenance.cleanup_days_threshold`、`backup_keep_days`：`0` 表示关闭对应维护任务。
 - `maintenance.freeze_grace_days`：解冻 persona 后的清理豁免天数，默认 `7`；`0` 不设豁免。
 
-全部 6 个配置段 + 1 个全局配置项（`log_with_bot_id`）、共 47 个配置项的作用和建议见
+全部 6 个配置段 + 1 个全局配置项（`log_with_bot_id`）、共 50 个配置项的作用和建议见
 AstrBot 配置面板中各配置项的说明文案。
 
 ## 命令
@@ -88,7 +88,7 @@ python tests\run_tests.py
 本地测试只验证领域算法、状态机、存储协议和边界条件；`astrbot.api` 与 `astrbot.core`
 由 `tests/conftest.py` 提供最小 fake 类型树，不导入、也不安装真实 AstrBot
 core/backend，因此不再需要 `--astrbot-source` / `--astrbot-backend`。当前代码级
-回归为 `531 passed`；AstrBot reload、真实 core 兼容性、Provider、平台发送、
+回归为 `555 passed`；AstrBot reload、真实 core 兼容性、Provider、平台发送、
 ChatMemory Hook 顺序和 Dashboard 浏览器交互必须在部署端验收。
 
 ## 更新记录
