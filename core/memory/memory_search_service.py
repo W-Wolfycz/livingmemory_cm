@@ -14,25 +14,12 @@ from ...log import logger, tag
 from ..retrieval.hybrid_retriever import HybridResult
 from ..utils.number_utils import clamp_float
 
-# documents 表 metadata 的规范表达式：必须与 memory_schema_service 里
-# idx_doc_status_created / idx_doc_type_created 的索引表达式同形才会被命中。
-# json_valid 守卫同时避免坏 JSON 行让整条查询直接报错。
-_DOC_STATUS_EXPR = (
-    "COALESCE(CASE WHEN json_valid(metadata) "
-    "THEN json_extract(metadata, '$.status') END, 'active')"
-)
-_DOC_CREATED_EXPR = (
-    "COALESCE(CASE WHEN json_valid(metadata) "
-    "THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END, 0)"
-)
-_DOC_SESSION_EXPR = (
-    "CASE WHEN json_valid(metadata) "
-    "THEN json_extract(metadata, '$.session_id') END"
-)
-_DOC_PERSONA_EXPR = (
-    "CASE WHEN json_valid(metadata) "
-    "THEN json_extract(metadata, '$.persona_id') END"
-)
+# documents 表 metadata 的规范表达式：与 memory_schema_service 里的表达式索引
+# （idx_doc_status_created / idx_doc_type_created）同源，定义见 metadata_expr。
+from .metadata_expr import CREATED_EXPR as _DOC_CREATED_EXPR
+from .metadata_expr import PERSONA_EXPR as _DOC_PERSONA_EXPR
+from .metadata_expr import SESSION_EXPR as _DOC_SESSION_EXPR
+from .metadata_expr import STATUS_EXPR as _DOC_STATUS_EXPR
 
 
 class MemorySearchService:

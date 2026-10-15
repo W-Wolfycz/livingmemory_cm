@@ -64,6 +64,24 @@ check(
 );
 check("esc 保留普通文本与中文", utils.esc("人格 记忆") === "人格 记忆");
 
+// detailImportance：详情缓存已是 0-10 展示刻度，再归一化会把 1/10 放大成 10/10
+check(
+  "detailImportance 不再二次放大展示刻度",
+  utils.detailImportance({ importance: 1.0, importance_scale: "display" }) === 1,
+  utils.detailImportance({ importance: 1.0, importance_scale: "display" })
+);
+check(
+  "detailImportance 对存储刻度仍然归一化",
+  utils.detailImportance({ importance: 0.1 }) === 1,
+  utils.detailImportance({ importance: 0.1 })
+);
+check(
+  "detailImportance 越界/非法值被夹紧",
+  utils.detailImportance({ importance: 99, importance_scale: "display" }) === 10 &&
+    utils.detailImportance({ importance: "x", importance_scale: "display" }) === 5,
+  utils.detailImportance({ importance: 99, importance_scale: "display" })
+);
+
 const payload = '"><img src=x onerror=alert(1)>';
 const attr = '<input type="text" value="' + utils.esc(payload) + '" />';
 check(

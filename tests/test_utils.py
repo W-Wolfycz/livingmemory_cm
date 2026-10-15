@@ -545,62 +545,26 @@ def injection_adapter() -> InjectionAdapter:
     return InjectionAdapter()
 
 
-def test_injection_adapter_keeps_non_fake_modes(
+def test_injection_adapter_downgrades_legacy_modes_with_reason(
     injection_adapter: InjectionAdapter,
 ) -> None:
-    assert injection_adapter.resolve(None, "user_message_before") == (
-        "user_message_before",
-        None,
-    )
-    assert injection_adapter.resolve(None, "extra_user_content") == (
+    """守的静默失效：旧配置值一旦被静默忽略，用户会以为注入方式还生效。
+
+    现在只剩 add-only（extra_user_content），旧的三档必须降级并给出可日志化的原因。
+    """
+    assert injection_adapter.resolve("extra_user_content") == (
         "extra_user_content",
         None,
     )
 
+    for legacy in ("user_message_before", "user_message_after", "fake_tool_call"):
+        mode, reason = injection_adapter.resolve(legacy)
+        assert mode == "extra_user_content"
+        assert reason and legacy in reason and "移除" in reason, (legacy, reason)
 
-@pytest.mark.parametrize(
-    ("provider_type", "model"),
-    [
-        ("googlegenai_chat_completion", "gemini-2.5-pro"),
-        ("some_other_type", "gemini-1.5-flash"),
-    ],
-)
-def test_injection_adapter_falls_back_for_gemini(
-    injection_adapter: InjectionAdapter,
-    provider_type: str,
-    model: str,
-) -> None:
-    provider = Mock()
-    provider.provider_config = {"type": provider_type}
-    provider.get_model.return_value = model
-
-    mode, reason = injection_adapter.resolve(provider, "fake_tool_call")
-
+    mode, reason = injection_adapter.resolve("something_else")
     assert mode == "extra_user_content"
-    assert reason is not None
-    assert "fake_tool_call is not fully compatible" in reason
-
-
-def test_injection_adapter_keeps_openai_fake_tool_call(
-    injection_adapter: InjectionAdapter,
-) -> None:
-    provider = Mock()
-    provider.provider_config = {"type": "openai_chat_completion"}
-    provider.get_model.return_value = "gpt-4o"
-
-    assert injection_adapter.resolve(provider, "fake_tool_call") == (
-        "fake_tool_call",
-        None,
-    )
-
-
-def test_injection_adapter_keeps_fake_tool_call_without_provider(
-    injection_adapter: InjectionAdapter,
-) -> None:
-    assert injection_adapter.resolve(None, "fake_tool_call") == (
-        "fake_tool_call",
-        None,
-    )
+    assert reason and "未知注入方式" in reason
 
 
 class TestInjectionAttribution:
@@ -640,25 +604,6 @@ class TestInjectionAttribution:
 
         assert "当前发言者：" not in result
         assert "（当前发言者）" not in result
-
-    def test_fake_tool_call_carries_participants(self):
-        from livingmemory_cm.core.utils import format_memories_for_fake_tool_call
-
-        messages = format_memories_for_fake_tool_call(
-            [
-                {
-                    "id": 3,
-                    "content": "参与者：群友A | 事实：群友A 喜欢寿司",
-                    "score": 0.8,
-                    "metadata": {"participants": ["群友A"], "importance": 0.6},
-                }
-            ],
-            query="寿司",
-        )
-
-        payload = json.loads(messages[1]["content"])
-        assert payload["results"][0]["participants"] == ["群友A"]
-
 
 def test_extraction_prompts_require_fact_attribution() -> None:
     """提示词必须要求每条事实自带发言人，防止回归成无归属的「用户……」句式。"""

@@ -15,7 +15,6 @@ from astrbot.core.agent.message import TextPart
 
 from ..utils import (
     OperationContext,
-    format_memories_for_fake_tool_call,
     format_memories_for_injection,
     get_cm_plugin,
     get_persona_id,
@@ -126,11 +125,9 @@ class MemoryRecall:
                         f"已归一化 {normalized} 条纯文本历史消息"
                     )
 
-                # 自动删除旧的注入记忆（恒开）
-                # extra_user_content 路径通过 mark_as_temp(_no_save=True) 已天然不持久化，
-                # 此处对它无副作用；user_message_*/fake_tool_call 路径需要主动清理。
+                # 清理本轮之前残留的记忆片段：tool loop 会对同一请求多次触发
+                # on_llm_request，不清理就会重复注入同一块记忆。
                 removed = self._remove_injected_memories_from_context(req, session_id)
-                removed += self._remove_fake_tool_call_from_context(req, session_id)
                 if removed > 0:
                     logger.debug(
                         f"{tag_event('recall', event)} [{session_ref}] 已清理 {removed} 处历史记忆注入片段"
@@ -228,27 +225,16 @@ class MemoryRecall:
                             f"内容长度={len(mem.content or '')}"
                         )
 
-                    # 根据配置选择注入方式（含 Provider 兼容降级）
+                    # 注入方式解析：只剩 add-only（extra_user_content），旧配置值降级并告警
                     configured_method = self.config_manager.get(
                         "recall_engine.injection_method", "extra_user_content"
                     )
-                    provider = None
-                    if configured_method in ("fake_tool_call",):
-                        try:
-                            provider = self.context.get_using_provider(session_id)
-                        except Exception as e:
-                            logger.warning(
-                                f"{tag_event('recall', event)} [{session_ref}] 获取当前 Provider 失败，"
-                                f"将按无 Provider 继续解析注入模式: {e}"
-                            )
-                    injection_method, fallback_reason = (
-                        self.injection_adapter.resolve(provider, configured_method)
+                    injection_method, fallback_reason = self.injection_adapter.resolve(
+                        configured_method
                     )
                     if fallback_reason:
                         logger.warning(
-                        f"{tag_event('recall', event)} [{session_ref}] "
-                        f"注入模式从 {configured_method} 降级为 "
-                            f"{injection_method}: {fallback_reason}"
+                            f"{tag_event('recall', event)} [{session_ref}] {fallback_reason}"
                         )
 
                     try:
@@ -271,42 +257,15 @@ class MemoryRecall:
                         )
                         return
 
-                    if injection_method == "user_message_before":
-                        req.prompt = memory_str + "\n\n" + (req.prompt or "")
-                        logger.info(
-                            f"{tag_event('recall', event)} [{session_ref}] "
-                            f"成功向用户消息前注入 {len(recalled_memories)} 条记忆"
-                        )
-                    elif injection_method == "user_message_after":
-                        req.prompt = (req.prompt or "") + "\n\n" + memory_str
-                        logger.info(
-                            f"{tag_event('recall', event)} [{session_ref}] "
-                            f"成功向用户消息后注入 {len(recalled_memories)} 条记忆"
-                        )
-                    elif injection_method == "fake_tool_call":
-                        fake_messages = format_memories_for_fake_tool_call(
-                            memory_list,
-                            query=actual_query,
-                            k=self.config_manager.get("recall_engine.top_k", 5),
-                            session_filtered=True,
-                            persona_filtered=True,
-                        )
-                        if fake_messages:
-                            req.contexts.extend(fake_messages)
-                            logger.info(
-                                f"{tag_event('recall', event)} [{session_ref}] 成功以伪造工具调用方式注入 "
-                                f"{len(recalled_memories)} 条记忆"
-                            )
-                    else:
-                        # extra_user_content（推荐）：追加到用户消息末尾，
-                        # 不影响前缀缓存且 mark_as_temp 后不污染对话历史
-                        req.extra_user_content_parts.append(
-                            TextPart(text=memory_str).mark_as_temp()
-                        )
-                        logger.info(
-                            f"{tag_event('recall', event)} [{session_ref}] 成功向用户消息末尾注入 "
-                            f"{len(recalled_memories)} 条记忆"
-                        )
+                    # add-only 注入：追加到用户消息末尾的临时附加段，不改写宿主历史。
+                    # 前缀缓存不受影响（块在末尾），mark_as_temp 后也不会进历史。
+                    req.extra_user_content_parts.append(
+                        TextPart(text=memory_str).mark_as_temp()
+                    )
+                    logger.info(
+                        f"{tag_event('recall', event)} [{session_ref}] 成功向用户消息末尾注入 "
+                        f"{len(recalled_memories)} 条记忆"
+                    )
                 else:
                     logger.debug(f"{tag_event('recall', event)} [{session_ref}] 未找到相关记忆")
 
@@ -496,34 +455,14 @@ class MemoryRecall:
     def _remove_injected_memories_from_context(
         self, req: ProviderRequest, session_id: str
     ) -> int:
-        """从请求上下文中移除临时注入的记忆片段"""
-        import re
-        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
+        """从请求上下文中移除上一轮残留的临时注入片段。
 
+        add-only 路径下这层清理仍必要：tool loop 会在同一请求里多次触发
+        `on_llm_request`，而 `extra_user_content_parts` 会被复用，不清理就会
+        把同一块记忆重复注入多次。
+        """
         removed = 0
 
-        # 清理 system_prompt（兼容旧版本注入残留）
-        if hasattr(req, "system_prompt") and req.system_prompt:
-            if isinstance(req.system_prompt, str):
-                original_prompt = req.system_prompt
-                if (
-                    MEMORY_INJECTION_HEADER in original_prompt
-                    and MEMORY_INJECTION_FOOTER in original_prompt
-                ):
-                    # 使用正则清理记忆片段
-                    pattern = re.compile(
-                        re.escape(MEMORY_INJECTION_HEADER)
-                        + r".*?"
-                        + re.escape(MEMORY_INJECTION_FOOTER),
-                        re.DOTALL,
-                    )
-                    cleaned_prompt = pattern.sub("", original_prompt)
-                    cleaned_prompt = re.sub(r"\n{3,}", "\n\n", cleaned_prompt).strip()
-                    req.system_prompt = cleaned_prompt
-                    if cleaned_prompt != original_prompt:
-                        removed += 1
-
-        # 清理 extra_user_content_parts（通过 mark_as_temp/_no_save 标记）
         parts_before = len(getattr(req, "extra_user_content_parts", []))
         if parts_before > 0:
             req.extra_user_content_parts = [
@@ -586,51 +525,3 @@ class MemoryRecall:
                 f"{normalized} 条纯文本历史 content parts"
             )
         return normalized
-
-    def _remove_fake_tool_call_from_context(
-        self, req: ProviderRequest, session_id: str
-    ) -> int:
-        """从请求上下文中移除伪造的工具调用记忆（fake_tool_call 注入方式）
-
-        识别并移除以 FAKE_TOOL_CALL_ID_PREFIX 为 ID 前缀的
-        assistant(tool_calls) + tool(result) 消息对。
-        """
-        from ..base.constants import FAKE_TOOL_CALL_ID_PREFIX
-
-        if not hasattr(req, "contexts") or not req.contexts:
-            return 0
-
-        removed = 0
-        indices_to_remove: set[int] = set()
-        fake_call_ids: set[str] = set()
-
-        try:
-            # 单轮扫描：同时收集伪造 assistant(tool_calls) 和对应 tool(result) 消息
-            for i, msg in enumerate(req.contexts):
-                if not isinstance(msg, dict):
-                    continue
-                role = msg.get("role")
-                if role == "assistant" and msg.get("tool_calls"):
-                    for tc in msg["tool_calls"]:
-                        tc_id = (
-                            tc.get("id", "")
-                            if isinstance(tc, dict)
-                            else getattr(tc, "id", "")
-                        )
-                        if tc_id.startswith(FAKE_TOOL_CALL_ID_PREFIX):
-                            fake_call_ids.add(tc_id)
-                            indices_to_remove.add(i)
-                elif role == "tool":
-                    tc_id = msg.get("tool_call_id", "")
-                    if tc_id in fake_call_ids:
-                        indices_to_remove.add(i)
-
-            # 从后往前删除，避免索引偏移
-            for i in sorted(indices_to_remove, reverse=True):
-                req.contexts.pop(i)
-                removed += 1
-
-        except Exception:
-            pass
-
-        return removed

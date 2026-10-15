@@ -199,7 +199,7 @@ class EmbeddingIndexBootstrapService:
                 spec.document_path,
             )
             stored = state.get("indexes", {}).get(spec.key, {}).get("fingerprint")
-            consistent, reason = self._validate_existing_index(
+            consistent, reason = await self._validate_existing_index(
                 spec.index_path,
                 documents,
                 dimension,
@@ -315,22 +315,29 @@ class EmbeddingIndexBootstrapService:
             documents.append((document_id, str(raw_text or "")))
         return documents
 
-    def _validate_existing_index(
+    async def _validate_existing_index(
         self,
         index_path: Path,
         documents: list[tuple[int, str]],
         dimension: int,
     ) -> tuple[bool, str]:
+        """校验既有索引与文档是否一致。
+
+        读取索引文件与遍历 ID 都是重 I/O / 重 CPU（索引可达数百 MB），
+        必须走线程池，否则重建/启动期间会卡住整个事件循环。
+        """
         expected_ids = {document_id for document_id, _ in documents}
         if not index_path.exists():
             return (not expected_ids, "missing_index")
         try:
             if index_path.stat().st_size <= 0:
                 return False, "empty_index_file"
-            index = self.faiss_bootstrap.faiss_read_index_safe(str(index_path))
+            index = await asyncio.to_thread(
+                self.faiss_bootstrap.faiss_read_index_safe, str(index_path)
+            )
             if int(getattr(index, "d", 0) or 0) != dimension:
                 return False, "dimension_mismatch"
-            actual_ids = self._index_ids(index)
+            actual_ids = await asyncio.to_thread(self._index_ids, index)
             if actual_ids is None:
                 return False, "unreadable_index_ids"
             if actual_ids != expected_ids:
@@ -391,22 +398,30 @@ class EmbeddingIndexBootstrapService:
                     raise InitializationError(
                         "Embedding Provider 返回的实际维度与配置维度不一致。"
                     )
-                index.add_with_ids(matrix, np.asarray(ids, dtype=np.int64))
+                await asyncio.to_thread(
+                    index.add_with_ids,
+                    matrix,
+                    np.asarray(ids, dtype=np.int64),
+                )
 
             if int(getattr(index, "ntotal", -1)) != len(documents):
                 raise InitializationError("影子索引向量数量校验失败。")
-            if self._index_ids(index) != expected_ids:
+            if await asyncio.to_thread(self._index_ids, index) != expected_ids:
                 raise InitializationError("影子索引文档 ID 集校验失败。")
 
             spec.index_path.parent.mkdir(parents=True, exist_ok=True)
-            self.faiss_bootstrap.faiss_write_index_safe(index, str(writing_path))
+            await asyncio.to_thread(
+                self.faiss_bootstrap.faiss_write_index_safe, index, str(writing_path)
+            )
             os.replace(writing_path, shadow_path)
-            candidate = self.faiss_bootstrap.faiss_read_index_safe(str(shadow_path))
+            candidate = await asyncio.to_thread(
+                self.faiss_bootstrap.faiss_read_index_safe, str(shadow_path)
+            )
             if int(getattr(candidate, "d", 0) or 0) != dimension:
                 raise InitializationError("落盘后的影子索引维度校验失败。")
             if int(getattr(candidate, "ntotal", -1)) != len(documents):
                 raise InitializationError("落盘后的影子索引数量校验失败。")
-            if self._index_ids(candidate) != expected_ids:
+            if await asyncio.to_thread(self._index_ids, candidate) != expected_ids:
                 raise InitializationError("落盘后的影子索引 ID 集校验失败。")
 
             os.replace(shadow_path, spec.index_path)

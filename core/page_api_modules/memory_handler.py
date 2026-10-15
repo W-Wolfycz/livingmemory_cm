@@ -10,6 +10,15 @@ import aiosqlite
 from quart import request
 
 from ...log import logger, tag
+from ..memory.metadata_expr import (
+    CREATED_EXPR,
+    IMPORTANCE_EXPR,
+    PERSONA_EXPR,
+    SESSION_EXPR,
+    STATUS_EXPR,
+    TYPE_EXPR,
+    UPDATED_EXPR,
+)
 
 if TYPE_CHECKING:
     from .utils import PageApiUtils
@@ -166,40 +175,21 @@ class MemoryHandler:
 
         where_clauses: list[str] = []
         params: list[Any] = []
-        type_expr = (
-            "UPPER(COALESCE("
-            "CASE WHEN json_valid(metadata) "
-            "THEN json_extract(metadata, '$.memory_type') END,"
-            "'GENERAL'"
-            "))"
-        )
 
         if session_id:
-            where_clauses.append(
-                "CASE WHEN json_valid(metadata) "
-                "THEN json_extract(metadata, '$.session_id') END = ?"
-            )
+            where_clauses.append(f"{SESSION_EXPR} = ?")
             params.append(session_id)
 
         if persona_id:
-            where_clauses.append(
-                "CASE WHEN json_valid(metadata) "
-                "THEN json_extract(metadata, '$.persona_id') END = ?"
-            )
+            where_clauses.append(f"{PERSONA_EXPR} = ?")
             params.append(persona_id)
 
         if status_filter != "all":
-            where_clauses.append(
-                "COALESCE("
-                "CASE WHEN json_valid(metadata) "
-                "THEN json_extract(metadata, '$.status') END,"
-                "'active'"
-                ") = ?"
-            )
+            where_clauses.append(f"{STATUS_EXPR} = ?")
             params.append(status_filter)
 
         if type_filter:
-            where_clauses.append(f"{type_expr} = ?")
+            where_clauses.append(f"{TYPE_EXPR} = ?")
             params.append(type_filter.upper())
 
         if keyword:
@@ -211,51 +201,21 @@ class MemoryHandler:
                 params.extend([keyword, keyword_like])
             else:
                 where_clauses.append(
-                    "("
-                    "text LIKE ? COLLATE NOCASE "
-                    "OR COALESCE("
-                    "CASE WHEN json_valid(metadata) "
-                    "THEN json_extract(metadata, '$.memory_type') END,"
-                    "''"
-                    ") LIKE ? COLLATE NOCASE"
-                    ")"
+                    "(text LIKE ? COLLATE NOCASE "
+                    f"OR {TYPE_EXPR} LIKE ? COLLATE NOCASE)"
                 )
                 params.extend([keyword_like, keyword_like])
 
         where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        created_expr = (
-            "COALESCE("
-            "CASE WHEN json_valid(metadata) "
-            "THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,"
-            "0)"
-        )
-        updated_expr = (
-            "COALESCE("
-            "CASE WHEN json_valid(metadata) "
-            "THEN CAST(json_extract(metadata, '$.updated_at') AS REAL) END,"
-            "CASE WHEN json_valid(metadata) "
-            "THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,"
-            "0)"
-        )
-        importance_raw_expr = (
-            "COALESCE("
-            "CASE WHEN json_valid(metadata) "
-            "THEN CAST(json_extract(metadata, '$.importance') AS REAL) END,"
-            "0.5)"
-        )
-        importance_expr = (
-            f"CASE WHEN {importance_raw_expr} <= 1.0 "
-            f"THEN {importance_raw_expr} * 10.0 ELSE {importance_raw_expr} END"
-        )
         sort_options = {
-            "created_desc": f"{created_expr} DESC, id DESC",
-            "created_asc": f"{created_expr} ASC, id ASC",
-            "updated_desc": f"{updated_expr} DESC, id DESC",
-            "updated_asc": f"{updated_expr} ASC, id ASC",
-            "importance_desc": f"{importance_expr} DESC, id DESC",
-            "importance_asc": f"{importance_expr} ASC, id ASC",
-            "type_asc": f"{type_expr} ASC, id DESC",
-            "type_desc": f"{type_expr} DESC, id DESC",
+            "created_desc": f"{CREATED_EXPR} DESC, id DESC",
+            "created_asc": f"{CREATED_EXPR} ASC, id ASC",
+            "updated_desc": f"{UPDATED_EXPR} DESC, id DESC",
+            "updated_asc": f"{UPDATED_EXPR} ASC, id ASC",
+            "importance_desc": f"{IMPORTANCE_EXPR} DESC, id DESC",
+            "importance_asc": f"{IMPORTANCE_EXPR} ASC, id ASC",
+            "type_asc": f"{TYPE_EXPR} ASC, id DESC",
+            "type_desc": f"{TYPE_EXPR} DESC, id DESC",
             "id_desc": "id DESC",
             "id_asc": "id ASC",
         }

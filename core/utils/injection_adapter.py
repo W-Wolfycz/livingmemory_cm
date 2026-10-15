@@ -1,81 +1,49 @@
 """
 注入策略适配层
 
-按 Provider/模型自动选择记忆注入策略，将兼容性降级规则与业务逻辑解耦。
+只支持 add-only 注入（`extra_user_content`）：记忆块追加到 `extra_user_content_parts`
+并标记 `mark_as_temp()`，**不改写宿主对话历史**，因此不存在"注入内容被持久化、
+下一轮再清理"的往返。
+
+历史上还有三档会改写历史的模式（`user_message_before` / `user_message_after` /
+`fake_tool_call`），已在 2.7.0-beta-cm 移除：它们都要依赖"下一轮开头把注入内容从
+历史里抹掉"，一旦清理漏掉（会话切换、插件卸载、流式路径），注入块或伪造的工具调用
+就会留在真实历史里。此处保留对旧配置值的降级说明，避免升级后静默改变行为。
 """
 
-from typing import Any
+from __future__ import annotations
+
+# 唯一受支持的注入方式
+SUPPORTED_MODE = "extra_user_content"
+
+# 已移除的历史模式 → 降级说明（旧配置命中时给出可见告警）
+_DEPRECATED_MODES: dict[str, str] = {
+    "user_message_before": "该模式会改写宿主对话历史，已在 2.7.0-beta-cm 移除",
+    "user_message_after": "该模式会改写宿主对话历史，已在 2.7.0-beta-cm 移除",
+    "fake_tool_call": "伪造工具调用会留在历史里，已在 2.7.0-beta-cm 移除",
+}
 
 
 class InjectionAdapter:
-    """根据 Provider/模型自动选择记忆注入策略的适配层。"""
+    """把配置里的注入方式解析成实际使用的（唯一）模式。"""
 
-    # 降级规则表：按 provider_type / model_name 匹配，执行注入方式降级
-    _RULES: list[dict[str, Any]] = [
-        {
-            "provider_types": ["googlegenai_chat_completion"],
-            "model_patterns": ["gemini"],
-            "downgrades": {"fake_tool_call": "extra_user_content"},
-        },
-    ]
-
-    def resolve(self, provider: Any, configured_mode: str) -> tuple[str, str | None]:
-        """
-        根据当前 Provider 解析最终使用的注入模式。
-
-        Args:
-            provider: AstrBot 的 provider 实例
-            configured_mode: 用户在配置中指定的注入方式
+    def resolve(self, configured_mode: str) -> tuple[str, str | None]:
+        """解析注入模式。
 
         Returns:
             (resolved_mode, fallback_reason)
-            - resolved_mode: 实际使用的注入方式
-            - fallback_reason: 降级原因描述；未降级时为 None
+            - resolved_mode: 实际使用的注入方式（恒为 `extra_user_content`）
+            - fallback_reason: 旧配置降级说明；未降级时为 None
         """
-        if configured_mode != "fake_tool_call":
-            return configured_mode, None
-
-        try:
-            provider_type, model_name = self._extract_provider_info(provider)
-        except Exception:
-            return configured_mode, None
-
-        for rule in self._RULES:
-            if self._matches_rule(rule, provider_type, model_name):
-                downgrade = rule["downgrades"].get(configured_mode)
-                if downgrade:
-                    reason = (
-                        f"fake_tool_call is not fully compatible with Gemini "
-                        f"(type={provider_type}, model={model_name}); "
-                        f"falling back to {downgrade}"
-                    )
-                    return downgrade, reason
-
-        return configured_mode, None
-
-    @staticmethod
-    def _extract_provider_info(provider: Any) -> tuple[str, str]:
-        """从 provider 对象中提取 provider_type 和 model_name。"""
-        provider_type = ""
-        model_name = ""
-
-        if provider is None:
-            return provider_type, model_name
-
-        config = getattr(provider, "provider_config", {})
-        provider_type = str(config.get("type", "")) if isinstance(config, dict) else ""
-        raw_model = provider.get_model() if hasattr(provider, "get_model") else ""
-        model_name = str(raw_model) if raw_model is not None else ""
-
-        return provider_type, model_name
-
-    @staticmethod
-    def _matches_rule(
-        rule: dict[str, Any], provider_type: str, model_name: str
-    ) -> bool:
-        """判断当前 provider 是否命中某条降级规则。"""
-        type_match = provider_type in rule.get("provider_types", [])
-        model_match = any(
-            pat.lower() in model_name.lower() for pat in rule.get("model_patterns", [])
-        )
-        return type_match or model_match
+        mode = str(configured_mode or "").strip()
+        if mode == SUPPORTED_MODE:
+            return SUPPORTED_MODE, None
+        if mode in _DEPRECATED_MODES:
+            return (
+                SUPPORTED_MODE,
+                f"{mode} → {SUPPORTED_MODE}：{_DEPRECATED_MODES[mode]}，"
+                "该配置项已无实际开关作用",
+            )
+        if mode:
+            return SUPPORTED_MODE, f"未知注入方式 {mode} → {SUPPORTED_MODE}"
+        return SUPPORTED_MODE, None

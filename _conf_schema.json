@@ -55,15 +55,12 @@
                 "default": 10
             },
             "injection_method": {
-                "description": "记忆注入位置",
-                "hint": "记忆注入位置。extra_user_content（推荐）：追加到用户消息末尾，不污染历史；user_message_before/after：用户消息前/后缀；fake_tool_call：伪造工具调用注入历史，Gemini 下自动降级为 extra_user_content。",
+                "description": "记忆注入方式",
+                "hint": "记忆注入位置，只支持 extra_user_content（临时附加到用户消息末尾的独立段，不改写宿主对话历史、不影响前缀缓存）。2.7.0-beta-cm 已移除会改写历史的 user_message_before / user_message_after / fake_tool_call 三档，旧配置值会自动降级为本项并在日志给出 WARNING。",
                 "type": "string",
                 "default": "extra_user_content",
                 "options": [
-                    "extra_user_content",
-                    "user_message_before",
-                    "user_message_after",
-                    "fake_tool_call"
+                    "extra_user_content"
                 ]
             },
             "search_cache_ttl_seconds": {

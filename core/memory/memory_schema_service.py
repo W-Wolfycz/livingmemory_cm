@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ...log import logger, tag
+from .metadata_expr import CREATED_EXPR, STATUS_EXPR, TYPE_EXPR
 
 
 @dataclass(slots=True)
@@ -101,45 +102,41 @@ class MemorySchemaService:
             CREATE INDEX IF NOT EXISTS idx_documents_doc_id
             ON documents(doc_id)
             """,
-            # 表达式索引：必须与召回/列表查询里的表达式同形（含 json_valid 守卫与
-            # COALESCE/CAST 包装）才会被命中。复合形式让同一个索引同时服务
-            # "status 过滤 + create_time 倒序截断"的列表/计数查询与近期记忆槽位，
-            # 无需 INDEXED BY 钉计划（索引不存在时钉计划会直接报错）。
-            """
+            # 表达式索引：表达式来自 metadata_expr 单一来源，与召回/列表查询里的
+            # 表达式同形（含 json_valid 守卫与 COALESCE/CAST 包装）才会被命中。
+            # 复合形式让同一个索引同时服务 "status 过滤 + create_time 倒序截断" 的
+            # 列表/计数查询与近期记忆槽位；不用 INDEXED BY 钉计划——索引万一缺失时
+            # 钉计划会让用户查询直接报错，宁可退化扫描并由 EXPLAIN 测试守住计划。
+            f"""
             CREATE INDEX IF NOT EXISTS idx_doc_status_created
             ON documents(
-                COALESCE(
-                    CASE WHEN json_valid(metadata)
-                    THEN json_extract(metadata, '$.status') END,
-                    'active'
-                ),
-                COALESCE(
-                    CASE WHEN json_valid(metadata)
-                    THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,
-                    0
-                ) DESC,
+                {STATUS_EXPR},
+                {CREATED_EXPR} DESC,
                 id DESC
             )
             """,
             # 按记忆类型过滤的列表查询（WebUI「类型」筛选）
-            """
+            f"""
             CREATE INDEX IF NOT EXISTS idx_doc_type_created
             ON documents(
-                UPPER(COALESCE(
-                    CASE WHEN json_valid(metadata)
-                    THEN json_extract(metadata, '$.memory_type') END,
-                    'GENERAL'
-                )),
-                COALESCE(
-                    CASE WHEN json_valid(metadata)
-                    THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,
-                    0
-                ) DESC,
+                {TYPE_EXPR},
+                {CREATED_EXPR} DESC,
+                id DESC
+            )
+            """,
+            # 不带筛选的列表/导出：只有独立的 create_time 索引才能直接提供排序，
+            # 否则 SQLite 要对全表建 TEMP B-TREE 再截断（数据量越大越慢）。
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_doc_created
+            ON documents(
+                {CREATED_EXPR} DESC,
                 id DESC
             )
             """,
         ):
             await connection.execute(index_sql)
+
+        await self._assert_expression_indexes(connection)
 
         await context.create_write_ops_table()
         await connection.execute("""
@@ -186,6 +183,28 @@ class MemorySchemaService:
             f"{tag('schema')} 已初始化数据库版本信息: "
             f"v{DBMigration.CURRENT_VERSION}"
         )
+
+    @staticmethod
+    async def _assert_expression_indexes(connection) -> None:
+        """表达式索引缺失时大声报警。
+
+        ``CREATE INDEX IF NOT EXISTS`` 在索引被手工删除、或迁移中断时会静默通过，
+        此后热路径退化为全表扫描且没有任何症状——这里补一条可见的 ERROR。
+        不抛异常：索引缺失仍能正常读写（只是慢），不该因此拦住插件启动。
+        """
+        expected = {
+            "idx_doc_status_created",
+            "idx_doc_type_created",
+            "idx_doc_created",
+        }
+        cursor = await connection.execute("PRAGMA index_list(documents)")
+        present = {row[1] for row in await cursor.fetchall()}
+        missing = sorted(expected - present)
+        if missing:
+            logger.error(
+                f"{tag('schema')} 表达式索引缺失: {', '.join(missing)}"
+                "；列表/检索查询会退化为全表扫描，请检查数据库迁移是否完成"
+            )
 
     async def drop_legacy_documents_fts_triggers(
         self,

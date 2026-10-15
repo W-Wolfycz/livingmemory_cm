@@ -25,6 +25,25 @@ export function getDetailText(detail) {
 }
 
 /**
+ * 读取详情的重要性（已是 UI 的 0-10 展示刻度时不再重新归一化）。
+ *
+ * 详情缓存里的 `importance` 被转换成展示刻度后带 `importance_scale: "display"`；
+ * 若再走一次 `normalizeImportance`，会把展示值 1.0 当成存储值再乘 10 —— 低重要性
+ * 记忆渲染成 10/10，且"没改过重要性"的编辑会被判定为有变化，把错误值写回库。
+ *
+ * @param {Object} detail - 记忆详情对象
+ * @returns {number} 0-10 范围的重要性值
+ */
+export function detailImportance(detail) {
+  if (!detail || detail.importance_scale !== "display") {
+    return normalizeImportance(detail ? detail.importance : undefined);
+  }
+  const value = Number(detail.importance);
+  if (!Number.isFinite(value)) return 5;
+  return Math.min(10, Math.max(0, value));
+}
+
+/**
  * HTML 转义，防止 XSS
  *
  * 完整转义五个字符：`& < > " '`。不能只依赖 `textContent → innerHTML`

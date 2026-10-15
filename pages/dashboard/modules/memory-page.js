@@ -18,6 +18,12 @@ export class MemoryPage {
     this.ROW_HEIGHT = 56;
     this.SCROLL_BUFFER = 15;
     this._fetchGeneration = 0;
+    // 实测行高与视口尺寸：样式与 56px 不一致时不测量会整体漂移
+    this._measuredRowHeight = null;
+    this._measuringRowHeight = false;
+    this._viewWidth = 0;
+    this._viewHeight = 0;
+    this._scrollFramePending = false;
   }
 
   /**
@@ -106,15 +112,57 @@ export class MemoryPage {
       return;
     }
 
-    // 绑定滚动事件（仅绑定一次）
+    // 绑定滚动事件（仅绑定一次）：rAF 合帧，避免滚动风暴里排队几十次渲染
     if (scrollEl && !scrollEl._virtualScrollBound) {
       scrollEl._virtualScrollBound = true;
-      scrollEl.addEventListener("scroll", () => {
-        window.requestAnimationFrame(() => this.renderVirtualSlice());
-      }, { passive: true });
+      scrollEl.addEventListener("scroll", () => this.scheduleVirtualRender(), {
+        passive: true
+      });
     }
 
+    // 视口尺寸变化会改变换行行高：重新测量，否则行偏移量越滚越偏
+    this.bindViewportResize(scrollEl);
+
     this.renderVirtualSlice();
+  }
+
+  /**
+   * 尺寸变化监听（仅绑定一次）：宽度变化时作废已测行高并重渲染
+   */
+  bindViewportResize(scrollEl) {
+    if (!scrollEl || scrollEl._virtualResizeBound) return;
+    scrollEl._virtualResizeBound = true;
+
+    const onResize = () => {
+      const width = scrollEl.clientWidth;
+      const height = scrollEl.clientHeight;
+      if (width === this._viewWidth && height === this._viewHeight) return;
+      if (width !== this._viewWidth) this._measuredRowHeight = null;
+      this._viewWidth = width;
+      this._viewHeight = height;
+      this.scheduleVirtualRender();
+    };
+
+    this._onViewportResize = onResize;
+    if (typeof ResizeObserver === "function") {
+      this._viewportObserver = new ResizeObserver(onResize);
+      this._viewportObserver.observe(scrollEl);
+    } else {
+      window.addEventListener("resize", onResize, { passive: true });
+    }
+    onResize();
+  }
+
+  /**
+   * 合帧调度：同一帧内只渲染一次
+   */
+  scheduleVirtualRender() {
+    if (this._scrollFramePending) return;
+    this._scrollFramePending = true;
+    window.requestAnimationFrame(() => {
+      this._scrollFramePending = false;
+      this.renderVirtualSlice();
+    });
   }
 
   renderVirtualSlice() {
@@ -125,16 +173,20 @@ export class MemoryPage {
       return;
     }
 
-    const totalHeight = this.state.memory.items.length * this.ROW_HEIGHT;
-    const scrollTop = scrollEl ? scrollEl.scrollTop : 0;
+    // 行高优先用实测值：样式/字体/换行与 56px 不一致时，硬编码会让行偏移整体漂移
+    const rowHeight = this._measuredRowHeight || this.ROW_HEIGHT;
+    const totalHeight = this.state.memory.items.length * rowHeight;
     const viewHeight = scrollEl ? scrollEl.clientHeight : 600;
-    const start = Math.max(0, Math.floor(scrollTop / this.ROW_HEIGHT) - this.SCROLL_BUFFER);
+    const rawScrollTop = scrollEl ? scrollEl.scrollTop : 0;
+    // 末尾回弹/重渲染瞬间的越界滚动会让整屏空白：夹到合法范围
+    const scrollTop = Math.max(0, Math.min(rawScrollTop, totalHeight - viewHeight));
+    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - this.SCROLL_BUFFER);
     const end = Math.min(
       this.state.memory.items.length,
-      Math.ceil((scrollTop + viewHeight) / this.ROW_HEIGHT) + this.SCROLL_BUFFER
+      Math.ceil((scrollTop + viewHeight) / rowHeight) + this.SCROLL_BUFFER
     );
-    const padTop = start * this.ROW_HEIGHT;
-    const padBottom = totalHeight - end * this.ROW_HEIGHT;
+    const padTop = start * rowHeight;
+    const padBottom = Math.max(0, totalHeight - end * rowHeight);
     const spacerRow = (height) => height > 0
       ? '<tr class="virtual-spacer" aria-hidden="true" style="height:' + height + 'px"><td colspan="7" style="height:' + height + 'px;padding:0;border:0"></td></tr>'
       : "";
@@ -148,7 +200,7 @@ export class MemoryPage {
       const impCls = impNum >= 7 ? "high" : impNum >= 4 ? "medium" : "low";
 
       const selected = this.state.memory.selectedIds.has(item.memory_id);
-      html += '<tr data-key="' + key + '" class="' + (selected ? 'is-selected' : '') + '" style="height:' + this.ROW_HEIGHT + 'px">';
+      html += '<tr data-key="' + key + '" class="' + (selected ? 'is-selected' : '') + '" style="height:' + rowHeight + 'px">';
       html += '<td class="cell-select"><input type="checkbox" class="memory-select" data-memory-id="' + item.memory_id + '" ' + (selected ? 'checked' : '') + ' aria-label="' + esc(window.t("delete.selectOne", item.memory_id)) + '" /></td>';
       html += '<td class="cell-mono cell-id">' + item.memory_id + '</td>';
       html += '<td class="cell-summary"><div class="memory-summary-text">' + esc(item.summary || "") + '</div><div class="memory-summary-meta">' + esc(window.t("table.updated", item.updated_at || "--")) + '</div></td>';
@@ -165,6 +217,22 @@ export class MemoryPage {
     tbody.style.paddingTop = "0";
     tbody.style.paddingBottom = "0";
     this.updateSelectionControls();
+    this.measureRowHeight(tbody);
+  }
+
+  /**
+   * 测量真实行高（只测一次，直到宽度变化时作废）
+   */
+  measureRowHeight(tbody) {
+    if (this._measuredRowHeight != null || this._measuringRowHeight) return;
+    const row = tbody.querySelector("tr[data-key]");
+    if (!row) return;
+    this._measuringRowHeight = true;
+    const measured = row.getBoundingClientRect().height;
+    this._measuringRowHeight = false;
+    if (!measured || Math.abs(measured - this.ROW_HEIGHT) < 0.5) return;
+    this._measuredRowHeight = measured;
+    this.scheduleVirtualRender();
   }
 
   /**

@@ -6,7 +6,7 @@ LivingMemoryCM 是面向 AstrBot 的长期记忆插件，基于
 [chat_memory](https://github.com/W-Wolfycz/chat_memory) 的上下文接管模式维护。
 本项目是独立的 CM-only fork，不是上游官方发行版。
 
-- 当前版本：`2.5.7-cm.4`
+- 当前版本：`2.7.0-beta-cm`
 - 源码仓库：<https://github.com/W-Wolfycz/livingmemory_cm>
 - 许可证：GNU Affero General Public License v3.0（AGPL-3.0）
 

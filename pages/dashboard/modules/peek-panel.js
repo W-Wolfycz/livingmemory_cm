@@ -4,6 +4,7 @@
  */
 
 import {
+  detailImportance,
   normalizeImportance,
   getDetailText,
   esc,
@@ -17,6 +18,8 @@ import {
 export class PeekPanel {
   constructor(state, apiClient) {
     this.state = state;
+    // 请求代际：慢响应不得覆盖更新的点击/已关闭的面板
+    this._detailGeneration = 0;
     this.api = apiClient;
     this._confirmResolve = null;
     this._batchEditResolve = null;
@@ -67,6 +70,7 @@ export class PeekPanel {
    * @param {Object} memory - 记忆对象
    */
   async renderMemory(memory) {
+    const generation = ++this._detailGeneration;
     this.state.selectedMemory = memory;
     this.state.isEditing = false;
     this.state._nodeDetailCache = null;
@@ -77,8 +81,10 @@ export class PeekPanel {
     let detail = null;
     try {
       detail = await this.api.get("memories/detail", { memory_id: memoryId });
+      if (generation !== this._detailGeneration) return;
       if (detail) this.state._detailCache = detail;
     } catch (_) {
+      if (generation !== this._detailGeneration) return;
       detail = null;
     }
 
@@ -91,6 +97,7 @@ export class PeekPanel {
         summary: memory.summary || "",
         memory_type: memory.memory_type || rawMeta.memory_type || "GENERAL",
         importance: memory.importance != null ? Number(memory.importance) : 5,
+        importance_scale: "display",
         status: memory.status || rawMeta.status || "active",
         session_id: rawMeta.session_id || "--",
         persona_id: rawMeta.persona_id || "--",
@@ -103,9 +110,12 @@ export class PeekPanel {
       };
     }
 
-    // 确保数值类型正确
+    // 确保数值类型正确。GET 响应对象可能被复用，这里复制一份再转刻度，
+    // 并打上 display 标记，避免渲染/比较时被二次归一化（1/10 会变成 10/10）。
+    detail = { ...detail };
     if (detail.memory_id != null) detail.memory_id = parseInt(detail.memory_id);
-    detail.importance = normalizeImportance(detail.importance);
+    detail.importance = detailImportance(detail);
+    detail.importance_scale = "display";
 
     this.renderDetailView(detail);
     this.open(true);
@@ -123,7 +133,7 @@ export class PeekPanel {
     const id = detail.memory_id;
     const type = detail.memory_type || "GENERAL";
     const status = detail.status || "active";
-    const importance = normalizeImportance(detail.importance).toFixed(1);
+    const importance = detailImportance(detail).toFixed(1);
     const content = getDetailText(detail);
     const created = detail.created_at || "--";
     const updated = detail.updated_at || "--";
@@ -228,7 +238,7 @@ export class PeekPanel {
 
     const id = detail.memory_id;
     const content = getDetailText(detail);
-    const importance = normalizeImportance(detail.importance).toFixed(1);
+    const importance = detailImportance(detail).toFixed(1);
     const type = detail.memory_type || "GENERAL";
     const status = detail.status || "active";
 
@@ -357,7 +367,7 @@ export class PeekPanel {
       }
 
       // 更新重要性
-      if (Math.abs(newImportance - normalizeImportance(detail.importance)) > 0.01) {
+      if (Math.abs(newImportance - detailImportance(detail)) > 0.01) {
         await this.api.post("memories/update", {
           memory_id: id,
           field: "importance",

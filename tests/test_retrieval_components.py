@@ -223,8 +223,14 @@ def test_mmr_without_tokenizer_still_returns_k() -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_created_index_is_used_by_list_and_recent_queries(tmp_path) -> None:
-    """表达式索引必须与查询同形；用 EXPLAIN QUERY PLAN 锁住，防止表达式漂移。"""
+async def test_metadata_expression_indexes_back_every_hot_query(tmp_path) -> None:
+    """EXPLAIN QUERY PLAN 锁住热路径的索引命中，守住"表达式漂移→静默全表扫描"。
+
+    表达式只在 `core/memory/metadata_expr.py` 定义一次，索引 DDL 与查询都从这里取；
+    一旦哪边被手写副本改歪，计划会退化为 SCAN / TEMP B-TREE，本用例就会失败。
+    已知且接受的例外：按重要性排序（WebUI 手动排序）仍会走 TEMP B-TREE——它没有
+    对应的表达式索引，这里不为其断言。
+    """
     import json
     import time
 
@@ -236,8 +242,13 @@ async def test_status_created_index_is_used_by_list_and_recent_queries(tmp_path)
     )
     from livingmemory_cm.core.memory.memory_search_service import (
         _DOC_CREATED_EXPR,
+        _DOC_PERSONA_EXPR,
+        _DOC_SESSION_EXPR,
         _DOC_STATUS_EXPR,
     )
+    from livingmemory_cm.core.memory.metadata_expr import TYPE_EXPR as _DOC_TYPE_EXPR
+    from livingmemory_cm.core.page_api_modules.memory_handler import MemoryHandler
+    from livingmemory_cm.core.page_api_modules.utils import PageApiUtils
 
     connection = await aiosqlite.connect(tmp_path / "indexes.db")
     connection.row_factory = aiosqlite.Row
@@ -260,41 +271,82 @@ async def test_status_created_index_is_used_by_list_and_recent_queries(tmp_path)
                 f"记忆 {i}",
                 json.dumps(
                     {
-                        "session_id": f"demo:GroupMessage:group_{i % 20}",
-                        "persona_id": f"persona_{i % 4}",
-                        "status": "active" if i % 10 else "archived",
-                        "memory_type": "GENERAL",
-                        "create_time": now - (500 - i) * 60,
+                        "session_id": f"demo:GroupMessage:group_{i % 30}",
+                        "persona_id": f"persona_{i % 5}",
+                        "status": "active" if i % 7 else "archived",
+                        "memory_type": ["GENERAL", "FACT", "PREFERENCE"][i % 3],
+                        "importance": (i % 10) / 10,
+                        "create_time": now - (2000 - i) * 60,
                     }
                 ),
             )
-            for i in range(1, 501)
+            for i in range(1, 2001)
         ],
     )
     await connection.commit()
+    await connection.execute("ANALYZE")
 
     async def plan(sql: str, params=()) -> str:
         cursor = await connection.execute("EXPLAIN QUERY PLAN " + sql, params)
         rows = await cursor.fetchall()
         return " | ".join(str(row["detail"]) for row in rows)
 
-    list_plan = await plan(
+    class _Query(dict):
+        """页面 API 的过滤参数替身（只用到 .get）。"""
+
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    handler = MemoryHandler(PageApiUtils())
+    plans: dict[str, str] = {}
+    for label, args in (
+        ("all", {"status": "all", "sort": "created_desc"}),
+        ("status", {"status": "active", "sort": "created_desc"}),
+        ("type", {"type": "FACT", "sort": "created_desc"}),
+    ):
+        spec, error = handler._build_query_spec(_Query(args))
+        assert error is None
+        where_clause, sort_expr = spec["where_clause"], spec["sort_expr"]
+        plans[label + "/count"] = await plan(
+            f"SELECT COUNT(*) FROM documents {where_clause}", spec["params"]
+        )
+        plans[label + "/page"] = await plan(
+            f"SELECT id FROM documents {where_clause} ORDER BY {sort_expr}"
+            " LIMIT 20 OFFSET 0",
+            spec["params"],
+        )
+
+    plans["recent"] = await plan(
         f"SELECT id FROM documents WHERE {_DOC_STATUS_EXPR} = 'active' "
-        f"ORDER BY {_DOC_CREATED_EXPR} DESC, id DESC LIMIT 20"
-    )
-    recent_plan = await plan(
-        f"SELECT id FROM documents WHERE {_DOC_STATUS_EXPR} = 'active' "
-        "AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, "
-        "'$.session_id') END = ? "
+        f"AND {_DOC_SESSION_EXPR} = ? AND {_DOC_PERSONA_EXPR} = ? "
         f"AND {_DOC_CREATED_EXPR} >= ? "
         f"ORDER BY {_DOC_CREATED_EXPR} DESC, id DESC LIMIT 6",
-        ("demo:GroupMessage:group_1", now - 72 * 3600),
+        ("demo:GroupMessage:group_1", "persona_1", now - 72 * 3600),
     )
-
-    assert "idx_doc_status_created" in list_plan, list_plan
-    assert "idx_doc_status_created" in recent_plan, recent_plan
-
+    plans["type_prefix"] = await plan(
+        f"SELECT id FROM documents WHERE {_DOC_TYPE_EXPR} = ? LIMIT 5", ("FACT",)
+    )
+    plans["status_prefix"] = await plan(
+        f"SELECT id FROM documents WHERE {_DOC_STATUS_EXPR} = ? LIMIT 5", ("active",)
+    )
     await connection.close()
+
+    # 每个热路径都必须命中对应索引，且过滤类查询不能退化成全表扫描
+    assert "idx_doc_created" in plans["all/page"], plans["all/page"]
+    assert "idx_doc_status_created" in plans["status/count"], plans["status/count"]
+    assert "idx_doc_status_created" in plans["status/page"], plans["status/page"]
+    assert "idx_doc_type_created" in plans["type/count"], plans["type/count"]
+    assert "idx_doc_type_created" in plans["type/page"], plans["type/page"]
+    assert "idx_doc_status_created" in plans["recent"], plans["recent"]
+    assert "SCAN documents" not in plans["status/count"], plans["status/count"]
+    assert "SCAN documents" not in plans["type/count"], plans["type/count"]
+    assert "SCAN documents" not in plans["recent"], plans["recent"]
+    # 排序由索引直接提供 → 不应再建临时 B-TREE（否则等于排了全表再截断）
+    for key in ("all/page", "status/page", "type/page", "recent"):
+        assert "TEMP B-TREE" not in plans[key], f"{key}: {plans[key]}"
+    # 索引单独可用（用 status/type 做前缀过滤时仍是覆盖索引扫描）
+    assert "idx_doc_type_created" in plans["type_prefix"], plans["type_prefix"]
+    assert "idx_doc_status_created" in plans["status_prefix"], plans["status_prefix"]
 
 
 # ── Rerank 重排序 ────────────────────────────────────────────────────────────

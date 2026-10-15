@@ -22,11 +22,9 @@ class RecallEngineConfig(BaseModel):
     injection_method: str = Field(
         default="extra_user_content",
         description=(
-            "记忆注入方式: "
-            "extra_user_content(推荐，临时消息追加到用户消息末尾，不影响前缀缓存且不污染对话历史), "
-            "user_message_before(用户消息前), "
-            "user_message_after(用户消息后), "
-            "fake_tool_call(伪造工具调用)"
+            "记忆注入方式，只支持 extra_user_content（临时附加段，不改写宿主对话历史）；"
+            "2.7.0-beta-cm 前的 user_message_before/user_message_after/fake_tool_call "
+            "已移除，旧配置值会降级并给出 WARNING"
         ),
     )
     search_cache_ttl_seconds: float = Field(
