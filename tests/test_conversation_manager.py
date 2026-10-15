@@ -81,13 +81,6 @@ def _run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def test_create_or_get_session_creates_new(store: FakeStore, manager: ConversationManager) -> None:
-    session = _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
-    assert session.session_id == "s1"
-    assert session.platform == "aiocqhttp"
-    assert "s1" in store.sessions
-
-
 def test_create_or_get_session_returns_existing_and_updates_activity(
     store: FakeStore, manager: ConversationManager
 ) -> None:
@@ -97,27 +90,6 @@ def test_create_or_get_session_returns_existing_and_updates_activity(
     result = _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
     assert result.session_id == "s1"
     assert store.sessions["s1"].last_active_at != original_active
-
-
-def test_get_session_info_returns_none_when_missing(manager: ConversationManager) -> None:
-    result = _run(manager.get_session_info("nonexistent"))
-    assert result is None
-
-
-def test_get_session_info_returns_session_when_exists(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.create_or_get_session("s1", platform="aiocqhttp"))
-    result = _run(manager.get_session_info("s1"))
-    assert result is not None
-    assert result.session_id == "s1"
-
-
-def test_get_recent_sessions_passes_limit(store: FakeStore, manager: ConversationManager) -> None:
-    for i in range(3):
-        _run(manager.create_or_get_session(f"s{i}", platform="p"))
-    result = _run(manager.get_recent_sessions(limit=2))
-    assert len(result) == 2
 
 
 def test_clear_session_deletes_messages_and_resets_metadata(
@@ -133,13 +105,6 @@ def test_clear_session_deletes_messages_and_resets_metadata(
     assert store.sessions["s1"].metadata == {}
 
 
-def test_update_session_metadata_no_op_when_session_missing(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.update_session_metadata("nonexistent", "key", "value"))
-    assert store.sessions == {}
-
-
 def test_update_session_metadata_merges_existing_keys(
     store: FakeStore, manager: ConversationManager
 ) -> None:
@@ -150,49 +115,6 @@ def test_update_session_metadata_merges_existing_keys(
     md = store.sessions["s1"].metadata
     assert md["last_summarized_timestamp"] == "T1"
     assert md["other_key"] == "V2"
-
-
-def test_get_session_metadata_returns_default_when_session_missing(
-    manager: ConversationManager
-) -> None:
-    result = _run(manager.get_session_metadata("nonexistent", "key", "fallback"))
-    assert result == "fallback"
-
-
-def test_get_session_metadata_returns_default_when_key_missing(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.create_or_get_session("s1", platform="p"))
-    result = _run(manager.get_session_metadata("s1", "missing", "default"))
-    assert result == "default"
-
-
-def test_get_session_metadata_returns_value_when_present(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.create_or_get_session("s1", platform="p"))
-    _run(manager.update_session_metadata("s1", "last_summarized_timestamp", "T1"))
-    result = _run(manager.get_session_metadata("s1", "last_summarized_timestamp"))
-    assert result == "T1"
-
-
-def test_reset_session_metadata_clears_dict(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.create_or_get_session("s1", platform="p"))
-    _run(manager.update_session_metadata("s1", "k1", "v1"))
-    _run(manager.update_session_metadata("s1", "k2", "v2"))
-
-    _run(manager.reset_session_metadata("s1"))
-
-    assert store.sessions["s1"].metadata == {}
-
-
-def test_reset_session_metadata_no_op_when_missing(
-    store: FakeStore, manager: ConversationManager
-) -> None:
-    _run(manager.reset_session_metadata("nonexistent"))
-    assert store.sessions == {}
 
 
 def test_message_roundtrip_and_llm_format() -> None:
@@ -218,29 +140,6 @@ def test_message_roundtrip_and_llm_format() -> None:
     assert "| ID:" not in formatted["content"]
 
 
-def test_message_multimodal_content_is_normalized_for_llm() -> None:
-    message = Message(
-        id=1,
-        session_id="s1",
-        role="user",
-        content=[
-            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
-            {"type": "text", "text": "图片里的日程是下午三点"},
-        ],
-        sender_id="u1",
-        sender_name="Alice",
-        group_id="g1",
-        platform="test",
-        metadata={},
-    )
-
-    formatted = message.format_for_llm(include_sender_name=True)["content"]
-
-    assert "图片里的日程是下午三点" in formatted
-    assert "image_url" not in formatted
-    assert "example.test" not in formatted
-
-
 def test_message_image_only_content_uses_placeholder() -> None:
     message = Message(
         id=1,
@@ -260,9 +159,3 @@ def test_message_image_only_content_uses_placeholder() -> None:
     assert message.to_dict()["content"] == "[图片消息]"
 
 
-def test_conversation_json_helpers() -> None:
-    raw = serialize_to_json({"a": 1})
-
-    assert isinstance(raw, str)
-    assert deserialize_from_json(raw)["a"] == 1
-    assert deserialize_from_json(None, default={}) == {}

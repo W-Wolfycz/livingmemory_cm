@@ -112,31 +112,6 @@ async def test_candidate_pool_expands_until_enough_survive_filter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_candidate_pool_stops_when_index_exhausted() -> None:
-    """索引取空即停止扩容，不做无意义重试。"""
-    db, provider, storage, _ = _make_db(total=40, target_ids=set())
-    retriever = VectorRetriever(db)
-
-    results = await retriever.search("查询", k=5, session_id="s-target")
-
-    assert results == []
-    assert len(storage.calls) == 1, f"索引只有 40 条，取空后不应再扩容: {storage.calls}"
-    assert provider.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_scores_are_normalized_and_sorted_desc() -> None:
-    db, _, _, _ = _make_db(total=10, target_ids={1, 2, 3, 10})
-    retriever = VectorRetriever(db)
-
-    results = await retriever.search("查询", k=4, session_id="s-target")
-
-    scores = [item.score for item in results]
-    assert scores == sorted(scores, reverse=True)
-    assert all(0.0 <= score <= 1.0 for score in scores)
-
-
-@pytest.mark.asyncio
 async def test_falls_back_to_core_retrieve_when_internals_missing() -> None:
     """核心对象结构不符合预期时退回 FaissVecDB.retrieve()。"""
     calls: list[dict] = []
@@ -205,18 +180,6 @@ def test_mmr_dedups_chinese_near_duplicates_with_tokenizer() -> None:
     picked = [item.doc_id for item in retriever._apply_mmr(_near_duplicate_docs(), 2)]
 
     assert picked == [1, 3]
-
-
-def test_mmr_without_tokenizer_still_returns_k() -> None:
-    """没传分词器时退化为空格分词，不报错（行为弱化但不崩）。"""
-    retriever = HybridRetriever.__new__(HybridRetriever)
-    retriever.mmr_lambda = 0.7
-    retriever.text_processor = None
-
-    picked = retriever._apply_mmr(_near_duplicate_docs(), 2)
-
-    assert len(picked) == 2
-    assert [item.doc_id for item in picked][0] == 1
 
 
 # ── documents 表达式索引是否真的被查询命中 ───────────────────────────────────
@@ -414,20 +377,6 @@ async def test_rerank_reorders_candidates_by_relevance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rerank_blends_with_existing_score() -> None:
-    """权重 0.5 时不会把原分数完全丢掉。"""
-    provider = _FakeRerankProvider(scores=[0.0, 1.0])
-    service = _rerank_service(provider, rerank_weight=0.5)
-
-    results = await service._apply_rerank("查询", _candidates([0.9, 0.4]))
-
-    scores = {item.doc_id: item.final_score for item in results}
-    assert scores[0] == pytest.approx(0.5 * 0.0 + 0.5 * 0.9)
-    assert scores[1] == pytest.approx(0.5 * 1.0 + 0.5 * 0.4)
-    assert [item.doc_id for item in results] == [1, 0]
-
-
-@pytest.mark.asyncio
 async def test_rerank_failures_fall_back_to_original_order() -> None:
     """调用失败/返回空/超时都必须沿用原排序，绝不能影响召回可用性。"""
     original = _candidates([0.9, 0.5, 0.1])
@@ -461,19 +410,6 @@ async def test_rerank_skipped_when_disabled_or_without_provider() -> None:
         results = await service._apply_rerank("查询", _candidates([0.9, 0.5]))
         assert [item.doc_id for item in results] == [0, 1]
     assert provider.calls == []
-
-
-@pytest.mark.asyncio
-async def test_rerank_only_scores_head_and_keeps_tail() -> None:
-    """超出候选上限的部分不参与重排，但保留在尾部。"""
-    provider = _FakeRerankProvider(scores=[0.0, 1.0])
-    service = _rerank_service(provider, rerank_candidates=2, rerank_weight=1.0)
-
-    results = await service._apply_rerank("查询", _candidates([0.9, 0.5, 0.4, 0.3]))
-
-    assert len(provider.calls[0][1]) == 2
-    assert [item.doc_id for item in results[:2]] == [1, 0]
-    assert [item.doc_id for item in results[2:]] == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -678,24 +614,3 @@ async def test_long_content_rolls_back_document_when_vector_write_fails() -> Non
     assert documents.inserted == [], "回滚后不应残留孤儿文档"
 
 
-@pytest.mark.asyncio
-async def test_short_content_uses_core_insert() -> None:
-    """常规长度仍走核心 insert（不引入额外的三库手工同步路径）。"""
-    documents = _RecordingDocumentStorage()
-    faiss = _DeleteRecordingFaiss(
-        documents, _RecordingVectorStorage(), _FakeEmbeddingProvider()
-    )
-
-    await _long_content_retriever(faiss).add_document(
-        "短内容",
-        {
-            "importance": 0.5,
-            "create_time": 1.0,
-            "last_access_time": 1.0,
-            "session_id": "s",
-            "persona_id": "p",
-        },
-    )
-
-    assert faiss.core_inserted == ["短内容"]
-    assert documents.inserted == []

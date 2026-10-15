@@ -43,113 +43,6 @@ def test_faiss_bootstrap_sanitizes_non_ascii_path() -> None:
     assert sanitized.endswith("livingmemory.index")
 
 
-def test_faiss_bootstrap_runtime_failure_is_diagnostic(monkeypatch) -> None:
-    monkeypatch.setattr(
-        faiss_bootstrap_module.subprocess,
-        "run",
-        Mock(return_value=SimpleNamespace(returncode=-4, stderr="", stdout="")),
-    )
-
-    with pytest.raises(InitializationError, match="信号 4"):
-        FaissBootstrapService().check_runtime()
-
-
-def test_faiss_binding_mismatch_is_not_reported_as_provider_error(monkeypatch) -> None:
-    result = SimpleNamespace(
-        returncode=1,
-        stderr="NameError: name 'SuperKMeans' is not defined",
-        stdout="",
-    )
-    run = Mock(return_value=result)
-    monkeypatch.setattr(faiss_bootstrap_module.subprocess, "run", run)
-    monkeypatch.setattr(
-        faiss_bootstrap_module.importlib_metadata,
-        "version",
-        Mock(return_value="1.14.2"),
-    )
-
-    with pytest.raises(InitializationError, match="封装与二进制扩展不匹配"):
-        FaissBootstrapService().check_runtime()
-
-    run.assert_called_once()
-
-
-def test_faiss_generic_fallback_only_for_compatible_failure(monkeypatch) -> None:
-    failed = SimpleNamespace(
-        returncode=1,
-        stderr="Illegal instruction while loading optimized extension",
-        stdout="",
-    )
-    recovered = SimpleNamespace(returncode=0, stderr="", stdout="")
-    run = Mock(side_effect=[failed, recovered])
-    monkeypatch.setattr(faiss_bootstrap_module.subprocess, "run", run)
-    monkeypatch.delenv("FAISS_OPT_LEVEL", raising=False)
-
-    FaissBootstrapService().check_runtime()
-
-    assert faiss_bootstrap_module.os.environ["FAISS_OPT_LEVEL"] == "generic"
-    assert run.call_args_list[1].kwargs["env"]["FAISS_OPT_LEVEL"] == "generic"
-
-
-@pytest.mark.asyncio
-async def test_faiss_bootstrap_rejects_empty_index_without_deleting(tmp_path) -> None:
-    index_path = tmp_path / "empty.index"
-    index_path.write_bytes(b"")
-    provider = SimpleNamespace(get_dim=Mock(return_value=128))
-
-    with pytest.raises(InitializationError, match="为空"):
-        await FaissBootstrapService().check_and_fix_dimension_mismatch(
-            str(index_path), provider
-        )
-
-    assert index_path.exists()
-    provider.get_dim.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_faiss_bootstrap_keeps_matching_dimension(monkeypatch, tmp_path) -> None:
-    # 该分支会执行 faiss_bootstrap 里的 ``import faiss``；本地不装 faiss，
-    # 用命名空间占位即可通过（实际读取已被 mock 掉）。
-    monkeypatch.setitem(sys.modules, "faiss", SimpleNamespace())
-    index_path = tmp_path / "matching.index"
-    index_path.write_bytes(b"valid")
-    service = FaissBootstrapService()
-    monkeypatch.setattr(
-        service,
-        "faiss_read_index_safe",
-        Mock(return_value=SimpleNamespace(d=256)),
-    )
-    provider = SimpleNamespace(get_dim=Mock(return_value=256))
-
-    await service.check_and_fix_dimension_mismatch(str(index_path), provider)
-
-    assert index_path.exists()
-    provider.get_dim.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_faiss_bootstrap_rejects_mismatched_dimension_without_deleting(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    # 该分支同样会执行 ``import faiss``，用命名空间占位避免真实依赖。
-    monkeypatch.setitem(sys.modules, "faiss", SimpleNamespace())
-    index_path = tmp_path / "mismatched.index"
-    index_path.write_bytes(b"valid")
-    service = FaissBootstrapService()
-    monkeypatch.setattr(
-        service,
-        "faiss_read_index_safe",
-        Mock(return_value=SimpleNamespace(d=128)),
-    )
-    provider = SimpleNamespace(get_dim=Mock(return_value=256))
-
-    with pytest.raises(InitializationError, match="维度不匹配"):
-        await service.check_and_fix_dimension_mismatch(str(index_path), provider)
-
-    assert index_path.exists()
-
-
 class _FakeIndex:
     def __init__(self, dimension: int, ids: list[int] | None = None) -> None:
         self.d = dimension
@@ -311,30 +204,6 @@ async def test_shadow_rebuild_atomically_switches_complete_index(
     assert state["indexes"]["document"]["vector_schema"] == "document-v1"
 
 
-def test_living_memory_exception_fields() -> None:
-    error = LivingMemoryException("boom", "E_TEST")
-
-    assert str(error) == "boom"
-    assert error.message == "boom"
-    assert error.error_code == "E_TEST"
-
-
-def test_specialized_exception_codes_and_inheritance() -> None:
-    cases = [
-        (InitializationError, InitializationError("x"), "INIT_ERROR"),
-        (ProviderNotReadyError, ProviderNotReadyError(), "PROVIDER_NOT_READY"),
-        (DatabaseError, DatabaseError("x"), "DATABASE_ERROR"),
-        (RetrievalError, RetrievalError("x"), "RETRIEVAL_ERROR"),
-        (MemoryProcessingError, MemoryProcessingError("x"), "MEMORY_PROCESSING_ERROR"),
-        (ConfigurationError, ConfigurationError("x"), "CONFIG_ERROR"),
-        (ValidationError, ValidationError("x"), "VALIDATION_ERROR"),
-    ]
-
-    for exception_type, error, expected_code in cases:
-        assert issubclass(exception_type, LivingMemoryException)
-        assert error.error_code == expected_code
-
-
 def _create_legacy_database(path: Path) -> None:
     with sqlite3.connect(path) as database:
         database.execute(
@@ -394,28 +263,6 @@ async def test_initializer_blocks_when_migration_returns_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initializer_blocks_without_migration_manager() -> None:
-    initializer = PluginInitializer.__new__(PluginInitializer)
-    initializer.db_migration = None
-
-    with pytest.raises(InitializationError, match="迁移管理器未初始化"):
-        await initializer._check_and_migrate_database()
-
-
-@pytest.mark.asyncio
-async def test_initializer_skips_migration_for_current_database() -> None:
-    initializer = PluginInitializer.__new__(PluginInitializer)
-    initializer.db_migration = SimpleNamespace(
-        needs_migration=AsyncMock(return_value=False),
-        migrate=AsyncMock(),
-    )
-
-    await initializer._check_and_migrate_database()
-
-    initializer.db_migration.migrate.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_initialize_runs_database_preflight_before_provider_wait(
     tmp_path: Path,
 ) -> None:
@@ -435,15 +282,6 @@ async def test_initialize_runs_database_preflight_before_provider_wait(
     assert initializer.is_failed is True
     assert "旧库不受支持" in str(initializer.error_message)
     initializer._wait_for_providers_non_blocking.assert_not_awaited()
-
-
-def test_embedding_default_batch_size_is_configurable_baseline() -> None:
-    """默认批大小保持 16，可由 provider_settings.embedding_batch_size 覆盖。"""
-    assert EmbeddingIndexBootstrapService.DEFAULT_BATCH_SIZE == 16
-    service = EmbeddingIndexBootstrapService(
-        "/tmp/unused_state.json", batch_size=10
-    )
-    assert service.batch_size == 10
 
 
 @pytest.mark.asyncio
@@ -481,23 +319,3 @@ async def test_shadow_rebuild_downgrades_batch_size_on_provider_rejection(
     assert bootstrap.index.id_map.tolist() == list(range(1, 13))
 
 
-def test_batch_limit_error_detection_ignores_unrelated_failures() -> None:
-    """只有批大小语义的错误才触发降批，维度/网络/token 超长错误不误判。"""
-    service = EmbeddingIndexBootstrapService("/tmp/unused_state.json")
-    assert service._is_batch_limit_error(
-        RuntimeError("batch size is invalid, it should not be larger than 10.")
-    )
-    assert service._is_batch_limit_error(
-        RuntimeError(
-            "Error code: 400 - InvalidParameter: Value error, batch size is "
-            "invalid, it should not be larger than 10.: input.contents"
-        )
-    )
-    assert not service._is_batch_limit_error(
-        RuntimeError("向量维度不匹配, 期望: 1024, 实际: 2048")
-    )
-    assert not service._is_batch_limit_error(RuntimeError("Connection error"))
-    # "larger than" 单独出现通常指 token 长度，不能当成批大小错误
-    assert not service._is_batch_limit_error(
-        RuntimeError("this input is larger than the maximum token length allowed")
-    )

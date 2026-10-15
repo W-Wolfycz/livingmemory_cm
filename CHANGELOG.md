@@ -22,11 +22,20 @@
 - **面板慢响应覆盖新选择**：详情请求加请求代际守卫，慢响应不再覆盖更新的点击或已关闭的面板。
 - **虚拟滚动漂移**：行高改为实测（样式/换行与硬编码 56px 不一致时行偏移会整体漂移）、宽度变化时作废重测、滚动位置夹到合法范围（末尾回弹不再整屏空白）、滚动渲染 rAF 合帧。
 
+- **纯引用消息不再跳过记忆召回**：只发引用不打字时正文为空，召回查询回退到被引用消息的文本（优先组件自带 `message_str`，退化时拼接引用链里的纯文本）；正文与引用都为空（纯图片/表情/系统事件）时降为 DEBUG 诊断，不再刷 WARNING。
+
 ### 变更
 
 - **注入方式收敛为 add-only**：`recall_engine.injection_method` 只保留 `extra_user_content`；`user_message_before` / `user_message_after` / `fake_tool_call` 三档移除——它们都要靠"下一轮开头把注入内容从历史里抹掉"，清理漏掉就会把注入块或伪造的工具调用留在真实历史里。旧配置值自动降级并在日志给出 WARNING。随之删除 `format_memories_for_fake_tool_call`、伪工具调用清理与 `system_prompt` 遗留清理；保留每轮清理临时附加段（tool loop 会在同一请求内多次触发，否则重复注入）。
+- **按 AGENTS.md 复检后的死代码清理**：删除生产零引用（仅测试引用）的 11 个函数/方法——`utils` 的 `safe_serialize_metadata` / `validate_timestamp` / `retry_on_failure` / `extract_json_from_response` / `get_now_datetime(_from_context)`、`FaissBootstrapService.check_and_fix_dimension_mismatch`（维度校验已由影子索引重建服务承担）、`MessageUtils` 的去重与内容抽取四件套（连带收敛其构造参数与去重缓存字段）、`MemoryProcessor.build_memory_from_structured_data`；连带删除 36 个只覆盖这些死代码的用例与随之无用的 import/常量。
+- **新增 `scripts/verify_mutations.py`**：把「变异验证」固化为可复用脚本（改坏被测逻辑→确认对应用例真的失败），本批 5 条关键断言逐一验证被拦住。
 
-测试：本地回归 561 项通过。
+### 测试精简
+
+- **按「改错了一眼看不出来」判据重筛测试**：507 → 215 项（测试函数 472 → 192，测试代码 −5141 行）。删掉的是"跑一遍或看一眼就知道"的覆盖（CRUD 读回、参数校验与文案、占位结构断言、同族重复的不同输入），留下的是守静默失效的断言：数值/时间算错、缓存失效、游标与水位线推进、归属与冻结边界、跨存储一致性、异常路径回滚、协议串与仓库常量一致、安全边界（转义/公式注入/日志泄漏）。
+- **新增 `scripts/verify_mutations.py`**：把「变异验证」固化为可跑脚本——每条断言改坏被测逻辑后必须真的失败，且带基线校验与"用例确实跑起来了"判定（收集错误/导入失败不再被误判成"被拦住"）；支持多行变异（互为冗余的多层守卫需整组改才跑得出差别）。
+
+测试：本地回归 216 项通过（变异验证 16/16 被拦住）。
 
 ## 2.5.7-cm.4 — 2026-10-15
 

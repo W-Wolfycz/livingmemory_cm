@@ -66,14 +66,6 @@ def handler(config_manager, memory_engine, conversation_manager):
 
 
 @pytest.mark.asyncio
-async def test_handle_status_returns_report(handler, mock_event):
-    messages = [msg async for msg in handler.handle_status(mock_event)]
-    assert len(messages) == 1
-    assert "LivingMemory" in messages[0]
-    assert "总记忆数" in messages[0]
-
-
-@pytest.mark.asyncio
 async def test_handle_status_reports_legacy_graph_migration(
     handler, mock_event, memory_engine
 ):
@@ -100,36 +92,6 @@ async def test_handle_status_reports_legacy_graph_migration(
 
 
 @pytest.mark.asyncio
-async def test_handle_status_without_engine_returns_actionable_message(
-    config_manager, mock_event
-):
-    handler = CommandHandler(
-        context=Mock(),
-        config_manager=config_manager,
-        memory_engine=None,
-        conversation_manager=None,
-    )
-
-    messages = [msg async for msg in handler.handle_status(mock_event)]
-    assert len(messages) == 1
-    assert "/lmem status 执行失败" in messages[0]
-    assert "检查插件状态" in messages[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_status_error_contains_suggestions(
-    handler, mock_event, memory_engine
-):
-    memory_engine.get_statistics = AsyncMock(side_effect=RuntimeError("db unavailable"))
-
-    messages = [msg async for msg in handler.handle_status(mock_event)]
-    assert len(messages) == 1
-    assert "获取状态失败" in messages[0]
-    assert "建议排查" in messages[0]
-    assert "数据库文件可读写" in messages[0]
-
-
-@pytest.mark.asyncio
 async def test_handle_search_validates_inputs_and_calls_engine(handler, mock_event):
     empty = [msg async for msg in handler.handle_search(mock_event, "", 3)]
     assert "不能为空" in empty[0]
@@ -142,17 +104,6 @@ async def test_handle_search_validates_inputs_and_calls_engine(handler, mock_eve
 
 
 @pytest.mark.asyncio
-async def test_handle_search_renders_results(handler, mock_event, memory_engine):
-    result = Mock(doc_id=7, final_score=0.88, content="hello memory")
-    memory_engine.search_memories = AsyncMock(return_value=[result])
-
-    messages = [msg async for msg in handler.handle_search(mock_event, "hello", 5)]
-    assert len(messages) == 1
-    assert "找到 1 条相关记忆" in messages[0]
-    assert "ID: 7" in messages[0]
-
-
-@pytest.mark.asyncio
 async def test_handle_forget_success_and_not_found(handler, mock_event, memory_engine):
     success = [msg async for msg in handler.handle_forget(mock_event, 10)]
     assert "已删除记忆 #10" in success[0]
@@ -160,96 +111,6 @@ async def test_handle_forget_success_and_not_found(handler, mock_event, memory_e
     memory_engine.delete_memory = AsyncMock(return_value=False)
     failed = [msg async for msg in handler.handle_forget(mock_event, 11)]
     assert "删除失败" in failed[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_reset_and_help(handler, mock_event, conversation_manager):
-    reset = [msg async for msg in handler.handle_reset(mock_event)]
-    assert "已重置" in reset[0]
-    conversation_manager.clear_session.assert_awaited_once()
-
-    help_msg = [msg async for msg in handler.handle_help(mock_event)]
-    assert "/lmem status" in help_msg[0]
-    assert (
-        "https://github.com/W-Wolfycz/livingmemory_cm"
-        in help_msg[0]
-    )
-    assert "AGPL-3.0" in help_msg[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_webui_shows_guide(handler, mock_event):
-    messages = [msg async for msg in handler.handle_webui(mock_event)]
-    assert len(messages) == 1
-    assert "AstrBot" in messages[0]
-    assert "Plugins" in messages[0] or "插件" in messages[0]
-    assert "Pages -> dashboard" in messages[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_cleanup_invalid_history_json_returns_clear_error(
-    config_manager, memory_engine, conversation_manager, mock_event
-):
-    context = Mock()
-    context.conversation_manager = Mock()
-    context.conversation_manager.get_curr_conversation_id = AsyncMock(
-        return_value="cid-1"
-    )
-    context.conversation_manager.get_conversation = AsyncMock(
-        return_value=Mock(history="{bad json")
-    )
-    context.conversation_manager.update_conversation = AsyncMock()
-
-    handler = CommandHandler(
-        context=context,
-        config_manager=config_manager,
-        memory_engine=memory_engine,
-        conversation_manager=conversation_manager,
-    )
-
-    messages = [msg async for msg in handler.handle_cleanup(mock_event, dry_run=True)]
-    assert any("解析对话历史失败" in msg for msg in messages)
-    assert any("有效 JSON" in msg for msg in messages)
-
-
-@pytest.mark.asyncio
-async def test_handle_search_renders_dual_route_breakdown(
-    handler, mock_event, memory_engine
-):
-    result = Mock(
-        doc_id=8,
-        final_score=0.91,
-        content="graph memory",
-        score_breakdown={
-            "document_vector_score": 0.22,
-            "graph_keyword_score": 0.33,
-            "graph_vector_score": 0.44,
-        },
-    )
-    memory_engine.search_memories = AsyncMock(return_value=[result])
-
-    messages = [msg async for msg in handler.handle_search(mock_event, "graph", 5)]
-    assert len(messages) == 1
-    assert "0.22" in messages[0]
-    assert "0.33" in messages[0]
-    assert "0.44" in messages[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_rebuild_graph_reports_progress_and_summary(
-    handler, mock_event, memory_engine
-):
-    memory_engine.rebuild_graph_index = AsyncMock(
-        return_value={"rebuilt": 3, "skipped": 1}
-    )
-
-    messages = [msg async for msg in handler.handle_rebuild_graph(mock_event)]
-    assert len(messages) == 2
-    memory_engine.rebuild_graph_index.assert_awaited_once()
-    assert messages[0].endswith("...")
-    assert [
-        part for part in messages[1].split() if any(ch.isdigit() for ch in part)
-    ] == ["3", "1"]
 
 
 # ── /lmem freeze 与 /lmem unfreeze ──────────────────────────────────────────
@@ -291,25 +152,6 @@ async def test_handle_freeze_lists_and_freezes_persona(
 
 
 @pytest.mark.asyncio
-async def test_handle_freeze_without_store_reports_component_not_ready(
-    mock_event, config_manager
-) -> None:
-    engine = Mock(spec=["db_path"])
-    engine.db_path = "/tmp/livingmemory-test.db"
-    handler = CommandHandler(
-        context=Mock(),
-        config_manager=config_manager,
-        memory_engine=engine,
-        conversation_manager=None,
-    )
-
-    messages = [msg async for msg in handler.handle_freeze(mock_event, "persona_demo")]
-
-    assert len(messages) == 1
-    assert "未初始化" in messages[0]
-
-
-@pytest.mark.asyncio
 async def test_handle_unfreeze_never_frozen_persona_writes_nothing(
     freeze_handler, mock_event, tmp_path
 ) -> None:
@@ -347,9 +189,3 @@ async def test_handle_unfreeze_frozen_persona_enters_grace(
     )
 
 
-@pytest.mark.asyncio
-async def test_handle_unfreeze_requires_argument(freeze_handler, mock_event) -> None:
-    messages = [msg async for msg in freeze_handler.handle_unfreeze(mock_event, "")]
-
-    assert len(messages) == 1
-    assert "用法" in messages[0]

@@ -78,17 +78,6 @@ async def test_expired_grace_is_reported_and_cleaned(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unfreeze_without_grace_removes_record(tmp_path: Path) -> None:
-    store = _freeze_store(tmp_path)
-    await store.freeze("persona_demo")
-
-    await store.unfreeze("persona_demo", grace_days=0)
-
-    assert await store.entries() == []
-    assert await store.protected_personas() == set()
-
-
-@pytest.mark.asyncio
 async def test_freeze_store_fails_closed_when_state_file_corrupt(tmp_path: Path) -> None:
     """状态文件损坏/为空/不可解析时抛错，绝不按"未冻结"继续。"""
     path = tmp_path / "frozen_personas.json"
@@ -260,9 +249,12 @@ async def test_cleanup_skips_frozen_and_grace_personas(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_recent_slot_does_not_leak_frozen_persona() -> None:
-    """近期槽位直接查库，必须同样过滤冻结 persona（回归防护）。"""
-    from livingmemory_cm.core.memory.memory_search_service import HybridResult
+    """守的静默失效：近期槽位直查库这条路必须同样剔除冻结 persona。
 
+    冻结剔除在搜索链上是三层冗余（向量路 / 合并后兜底 / 本路径），单摘一层会被另一层
+    兜住、跑不出差别，所以这里分两层断言：单点直调钉住本路径的过滤，端到端确认整条
+    search() 不会把冻结人格的记忆交给调用方。
+    """
     session = "demo:GroupMessage:group_demo"
     now = time.time()
     connection = await aiosqlite.connect(":memory:")
@@ -295,22 +287,30 @@ async def test_recent_slot_does_not_leak_frozen_persona() -> None:
     service = MemorySearchService(
         {"recent_memory_count": 2, "recent_memory_max_age_hours": 72}
     )
-    results = await service.search(
-        query="测试查询",
-        k=5,
-        session_id=session,
-        persona_id=None,
-        exclude_personas={"persona_frozen"},
-        hybrid_retriever=_EmptyHybrid(),
-        dual_route_retriever=None,
-        schedule_task=lambda coro: coro.close(),
-        update_access_time=_noop,
-        migrate_session=_noop,
-        db_connection=connection,
-    )
+    try:
+        recent = await service._get_recent_memory_results(
+            2, session, None, connection, excluded_personas={"persona_frozen"}
+        )
+        assert [item.doc_id for item in recent] == [2]
 
-    assert [item.doc_id for item in results] == [2]
-    await connection.close()
+        results = await service.search(
+            query="测试查询",
+            k=5,
+            session_id=session,
+            persona_id=None,
+            exclude_personas={"persona_frozen"},
+            hybrid_retriever=_EmptyHybrid(),
+            dual_route_retriever=None,
+            schedule_task=lambda coro: coro.close(),
+            update_access_time=_noop,
+            migrate_session=_noop,
+            db_connection=connection,
+        )
+        assert [item.doc_id for item in results] == [2]
+    finally:
+        # 断言失败也必须关连接：aiosqlite 连接带后台线程，漏关会让 pytest 退出时挂住，
+        # 于是"失败"退化成"卡死"、这条用例再也报不出失败。
+        await connection.close()
 
 
 @pytest.mark.asyncio

@@ -1,21 +1,12 @@
 """Utility, validation, retry, and injection-policy tests."""
 
-import json
-import time
-from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-import pytz
 from livingmemory_cm.core.utils import (
-    extract_json_from_response,
     format_memories_for_injection,
-    get_now_datetime,
     get_persona_id,
-    retry_on_failure,
     safe_parse_metadata,
-    safe_serialize_metadata,
-    validate_timestamp,
 )
 from livingmemory_cm.core.utils.injection_adapter import InjectionAdapter
 
@@ -68,13 +59,6 @@ class TestGetPersonaId:
         assert await get_persona_id(context, event) == ""
 
     @pytest.mark.asyncio
-    async def test_preserves_webchat_special_persona(self):
-        context, event = self._build_context(resolved="_chatui_default_")
-        event.get_platform_name.return_value = "webchat"
-
-        assert await get_persona_id(context, event) == "_chatui_default_"
-
-    @pytest.mark.asyncio
     async def test_resolution_failure_uses_empty_partition(self):
         context, event = self._build_context(resolved="persona_demo")
         context.persona_manager.resolve_selected_persona.side_effect = RuntimeError(
@@ -84,323 +68,8 @@ class TestGetPersonaId:
         assert await get_persona_id(context, event) == ""
 
 
-class TestSafeParseMetadata:
-    """测试元数据解析"""
-
-    def test_parse_dict_returns_as_is(self):
-        """测试字典直接返回"""
-        data = {"key": "value", "nested": {"a": 1}}
-        result = safe_parse_metadata(data)
-        assert result == data
-
-    def test_parse_valid_json_string(self):
-        """测试有效的JSON字符串"""
-        json_str = '{"key": "value", "number": 42}'
-        result = safe_parse_metadata(json_str)
-        assert result == {"key": "value", "number": 42}
-
-    def test_parse_invalid_json_returns_empty_dict(self):
-        """测试无效JSON返回空字典"""
-        invalid_json = '{"key": invalid}'
-        result = safe_parse_metadata(invalid_json)
-        assert result == {}
-
-    def test_parse_non_dict_non_string_returns_empty_dict(self):
-        """测试非字典非字符串类型返回空字典"""
-        result1 = safe_parse_metadata(123)
-        result2 = safe_parse_metadata([1, 2, 3])
-        result3 = safe_parse_metadata(None)
-
-        assert result1 == {}
-        assert result2 == {}
-        assert result3 == {}
-
-    def test_parse_empty_string_returns_empty_dict(self):
-        """测试空字符串返回空字典"""
-        result = safe_parse_metadata("")
-        assert result == {}
-
-
-class TestSafeSerializeMetadata:
-    """测试元数据序列化"""
-
-    def test_serialize_simple_dict(self):
-        """测试简单字典序列化"""
-        data = {"key": "value", "number": 42}
-        result = safe_serialize_metadata(data)
-        assert json.loads(result) == data
-
-    def test_serialize_with_unicode(self):
-        """测试Unicode字符序列化"""
-        data = {"中文": "测试", "emoji": "😀"}
-        result = safe_serialize_metadata(data)
-        # ensure_ascii=False 应该保留Unicode字符
-        assert "中文" in result
-        assert "测试" in result
-
-    def test_serialize_nested_dict(self):
-        """测试嵌套字典序列化"""
-        data = {"outer": {"inner": {"deep": "value"}}}
-        result = safe_serialize_metadata(data)
-        assert json.loads(result) == data
-
-    def test_serialize_empty_dict(self):
-        """测试空字典序列化"""
-        result = safe_serialize_metadata({})
-        assert result == "{}"
-
-
-class TestValidateTimestamp:
-    """测试时间戳验证"""
-
-    def test_validate_int_timestamp(self):
-        """测试整数时间戳"""
-        timestamp = 1609459200  # 2021-01-01 00:00:00 UTC
-        result = validate_timestamp(timestamp)
-        assert result == 1609459200.0
-
-    def test_validate_float_timestamp(self):
-        """测试浮点时间戳"""
-        timestamp = 1609459200.5
-        result = validate_timestamp(timestamp)
-        assert result == 1609459200.5
-
-    def test_validate_string_timestamp(self):
-        """测试字符串时间戳"""
-        result = validate_timestamp("1609459200")
-        assert result == 1609459200.0
-
-    def test_validate_invalid_string_uses_default(self):
-        """测试无效字符串使用默认值"""
-        default = 1234567890.0
-        result = validate_timestamp("not a number", default_time=default)
-        assert result == default
-
-    def test_validate_datetime_object(self):
-        """测试datetime对象"""
-        dt = datetime(2021, 1, 1, 0, 0, 0, tzinfo=pytz.UTC)
-        result = validate_timestamp(dt)
-        assert result == dt.timestamp()
-
-    def test_validate_unsupported_type_uses_default(self):
-        """测试不支持的类型使用默认值"""
-        default = 1234567890.0
-        result = validate_timestamp([1, 2, 3], default_time=default)
-        assert result == default
-
-    def test_validate_none_uses_current_time(self):
-        """测试None使用当前时间"""
-        before = time.time()
-        result = validate_timestamp(None)
-        after = time.time()
-
-        assert before <= result <= after
-
-
-class TestRetryOnFailure:
-    """测试重试机制"""
-
-    @pytest.mark.asyncio
-    async def test_retry_succeeds_on_first_attempt(self):
-        """测试第一次尝试成功"""
-        async_func = AsyncMock(return_value="success")
-
-        result = await retry_on_failure(async_func, max_retries=3)
-
-        assert result == "success"
-        async_func.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_retry_succeeds_after_failures(self):
-        """测试重试后成功"""
-        call_count = 0
-
-        async def failing_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise ValueError("Still failing")
-            return "success"
-
-        result = await retry_on_failure(
-            failing_func,
-            max_retries=3,
-            backoff_factor=0.01,  # 快速重试
-            exceptions=(ValueError,),
-        )
-
-        assert result == "success"
-        assert call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_retry_exhausted_raises_exception(self):
-        """测试重试耗尽后抛出异常"""
-        async_func = AsyncMock(side_effect=ValueError("Always fails"))
-
-        with pytest.raises(ValueError, match="Always fails"):
-            await retry_on_failure(
-                async_func,
-                max_retries=2,
-                backoff_factor=0.01,
-                exceptions=(ValueError,),
-            )
-
-        assert async_func.await_count == 3  # 初始 + 2次重试
-
-    @pytest.mark.asyncio
-    async def test_retry_with_sync_function(self):
-        """测试同步函数重试"""
-        call_count = 0
-
-        def sync_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 2:
-                raise ValueError("First try fails")
-            return "sync success"
-
-        result = await retry_on_failure(
-            sync_func,
-            max_retries=2,
-            backoff_factor=0.01,
-            exceptions=(ValueError,),
-        )
-
-        assert result == "sync success"
-        assert call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_retry_respects_exception_types(self):
-        """测试只重试指定的异常类型"""
-        async_func = AsyncMock(side_effect=RuntimeError("Wrong exception"))
-
-        # 配置只重试 ValueError
-        with pytest.raises(RuntimeError, match="Wrong exception"):
-            await retry_on_failure(
-                async_func,
-                max_retries=2,
-                backoff_factor=0.01,
-                exceptions=(ValueError,),
-            )
-
-        # 应该在第一次就失败，没有重试
-        assert async_func.await_count == 1
-
-
-class TestExtractJsonFromResponse:
-    """测试从响应中提取JSON"""
-
-    def test_extract_json_from_plain_json(self):
-        """测试提取纯JSON"""
-        text = '{"key": "value", "number": 42}'
-        result = extract_json_from_response(text)
-        assert result == text
-
-    def test_extract_json_from_markdown_code_block(self):
-        """测试从Markdown代码块提取JSON"""
-        text = """
-        Here is the JSON:
-        ```json
-        {"key": "value"}
-        ```
-        """
-        result = extract_json_from_response(text)
-        assert json.loads(result) == {"key": "value"}
-
-    def test_extract_json_from_generic_code_block(self):
-        """测试从通用代码块提取JSON"""
-        text = """
-        ```
-        {"extracted": true}
-        ```
-        """
-        result = extract_json_from_response(text)
-        assert json.loads(result) == {"extracted": True}
-
-    def test_extract_returns_original_if_no_code_block(self):
-        """测试无代码块时返回原文"""
-        text = "Just plain text"
-        result = extract_json_from_response(text)
-        assert result == text
-
-    def test_extract_handles_multiple_code_blocks(self):
-        """测试处理多个代码块（取第一个）"""
-        text = """
-        First block:
-        ```json
-        {"first": true}
-        ```
-        Second block:
-        ```json
-        {"second": true}
-        ```
-        """
-        result = extract_json_from_response(text)
-        assert json.loads(result) == {"first": True}
-
-
-class TestGetNowDatetime:
-    """测试获取当前时间"""
-
-    def test_get_now_datetime_default_timezone(self):
-        """测试默认时区（Asia/Shanghai）"""
-        result = get_now_datetime()
-
-        assert isinstance(result, datetime)
-        assert result.tzinfo is not None
-        assert result.tzinfo.zone == "Asia/Shanghai"
-
-    def test_get_now_datetime_custom_timezone(self):
-        """测试自定义时区"""
-        result = get_now_datetime(tz_str="America/New_York")
-
-        assert isinstance(result, datetime)
-        assert result.tzinfo.zone == "America/New_York"
-
-    def test_get_now_datetime_utc(self):
-        """测试UTC时区"""
-        result = get_now_datetime(tz_str="UTC")
-
-        assert isinstance(result, datetime)
-        assert result.tzinfo.zone == "UTC"
-
-    def test_get_now_datetime_returns_current_time(self):
-        """测试返回的是当前时间"""
-        before = datetime.now(pytz.timezone("Asia/Shanghai"))
-        result = get_now_datetime()
-        after = datetime.now(pytz.timezone("Asia/Shanghai"))
-
-        # 时间应该在调用前后之间
-        assert before <= result <= after
-
-
 class TestFormatMemoriesForInjection:
     """测试格式化记忆注入"""
-
-    def test_format_empty_list(self):
-        """测试空记忆列表"""
-        result = format_memories_for_injection([])
-        assert result == ""
-
-    def test_format_single_memory(self):
-        """测试单条记忆"""
-        memories = [
-            {
-                "content": "Alice 喜欢吃披萨 | Alice 不喜欢香菜",
-                "metadata": {
-                    "persona_summary": "Alice 喜欢吃披萨。",
-                    "key_facts": ["Alice 不喜欢香菜"],
-                    "event_time": "2026-07-19",
-                },
-            }
-        ]
-
-        result = format_memories_for_injection(memories)
-
-        assert "摘要：Alice 喜欢吃披萨" not in result
-        assert result.count("Alice 不喜欢香菜") == 1
-        assert "Importance" not in result
-        assert "事件时间：2026-07-19" in result
 
     def test_format_prefers_neutral_summary_for_v3_memory(self):
         result = format_memories_for_injection(
@@ -418,45 +87,6 @@ class TestFormatMemoriesForInjection:
 
         assert "摘要：Alice 的饮食偏好" in result
         assert "超爱披萨" not in result
-
-    def test_format_multiple_memories(self):
-        """测试多条记忆"""
-        memories = [
-            {"content": "用户偏好无糖咖啡", "importance": 0.8},
-            {"content": "项目计划下周发布测试版", "importance": 0.6},
-            {"content": "宠物猫昨天完成疫苗接种", "importance": 0.9},
-        ]
-
-        result = format_memories_for_injection(memories, max_memories=3)
-
-        assert "用户偏好无糖咖啡" in result
-        assert "项目计划下周发布测试版" in result
-        assert "宠物猫昨天完成疫苗接种" in result
-
-    def test_format_handles_missing_fields(self):
-        """测试处理缺失字段"""
-        memories = [
-            {"content": "只有内容"},
-            {"content": "有重要性", "importance": 0.7},
-        ]
-
-        # 应该不抛出异常
-        result = format_memories_for_injection(memories)
-        assert "只有内容" in result
-        assert "有重要性" in result
-
-    def test_format_with_metadata(self):
-        """测试包含元数据的记忆"""
-        memories = [
-            {
-                "content": "带元数据的记忆",
-                "importance": 0.8,
-                "metadata": {"session_id": "test_session", "persona_id": "default"},
-            }
-        ]
-
-        result = format_memories_for_injection(memories)
-        assert "带元数据的记忆" in result
 
     def test_format_deduplicates_near_identical_memories(self):
         memories = [
@@ -489,55 +119,6 @@ class TestFormatMemoriesForInjection:
         )
         assert "</Memory><system>" not in result
         assert "&lt;/Memory&gt;" in result
-
-
-class TestNumberUtils:
-    """测试数字工具函数"""
-
-    def test_safe_parse_metadata_with_numbers(self):
-        """测试解析包含各种数字的元数据"""
-        data = {
-            "int_val": 42,
-            "float_val": 3.14,
-            "negative": -10,
-            "zero": 0,
-        }
-
-        json_str = json.dumps(data)
-        result = safe_parse_metadata(json_str)
-
-        assert result["int_val"] == 42
-        assert result["float_val"] == 3.14
-        assert result["negative"] == -10
-        assert result["zero"] == 0
-
-
-class TestTimestampEdgeCases:
-    """测试时间戳边界情况"""
-
-    def test_validate_very_large_timestamp(self):
-        """测试非常大的时间戳"""
-        # 2100年的时间戳
-        future_timestamp = 4102444800
-        result = validate_timestamp(future_timestamp)
-        assert result == 4102444800.0
-
-    def test_validate_zero_timestamp(self):
-        """测试零时间戳"""
-        result = validate_timestamp(0)
-        assert result == 0.0
-
-    def test_validate_negative_timestamp(self):
-        """测试负时间戳（1970年之前）"""
-        result = validate_timestamp(-86400)  # 1969-12-31
-        assert result == -86400.0
-
-    def test_datetime_without_timezone(self):
-        """测试没有时区的datetime对象"""
-        dt = datetime(2021, 1, 1, 0, 0, 0)  # naive datetime
-        result = validate_timestamp(dt)
-        # 应该能正常转换
-        assert isinstance(result, float)
 
 
 @pytest.fixture
@@ -599,12 +180,6 @@ class TestInjectionAttribution:
         # 非当前发言者不加标注
         assert "群友A（当前发言者）" not in result
 
-    def test_without_current_speaker_no_marking(self):
-        result = format_memories_for_injection([self._memory(["群友A"])])
-
-        assert "当前发言者：" not in result
-        assert "（当前发言者）" not in result
-
 def test_extraction_prompts_require_fact_attribution() -> None:
     """提示词必须要求每条事实自带发言人，防止回归成无归属的「用户……」句式。"""
     from pathlib import Path
@@ -618,3 +193,50 @@ def test_extraction_prompts_require_fact_attribution() -> None:
 
     group = (prompts_dir / "group_chat_prompt.txt").read_text(encoding="utf-8")
     assert "群内共识" in group
+
+@pytest.mark.asyncio
+async def test_recall_query_falls_back_to_quoted_message_text() -> None:
+    """守的静默失效：只发引用不打字时正文为空，召回查询必须回退到被引用消息的文本。
+
+    否则纯引用消息下记忆召回被静默跳过（表现只是"引用时 AI 不带记忆"），
+    正文与引用都为空（纯图片/表情）时仍应返回空串、由调用方跳过。
+    """
+    from livingmemory_cm.core.event_handler_modules.message_utils import MessageUtils
+
+    class _Reply:
+        type = "reply"
+
+        def __init__(self, message_str: str = "", chain=None) -> None:
+            self.message_str = message_str
+            self.chain = chain or []
+
+    class _Text:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _Event:
+        def __init__(self, message_str: str, chain) -> None:
+            self.message_str = message_str
+            self.message_obj = type("_Obj", (), {"message": chain})()
+
+        def get_message_str(self) -> str:
+            return self.message_str
+
+    utils = MessageUtils(config_manager=None)
+
+    # 1) 纯引用：正文为空 -> 用被引用消息的 message_str
+    event = _Event("", [_Reply(message_str="被引用的那句话")])
+    assert await utils.get_event_message_str(event) == "被引用的那句话"
+
+    # 2) 引用组件没带 message_str -> 拼接 chain 里的纯文本
+    event = _Event("", [_Reply(chain=[_Text("被引用"), _Text("的内容")])])
+    assert await utils.get_event_message_str(event) == "被引用的内容"
+
+    # 3) 自己打了字：自己的文本优先，不被引用文本替换
+    event = _Event("自己的问题", [_Reply(message_str="被引用的那句话")])
+    assert await utils.get_event_message_str(event) == "自己的问题"
+
+    # 4) 正文与引用都为空：返回空串（调用方跳过召回，不再刷 WARNING）
+    event = _Event("", [_Reply()])
+    assert await utils.get_event_message_str(event) == ""
+

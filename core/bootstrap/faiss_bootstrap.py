@@ -10,7 +10,6 @@ import tempfile
 from importlib import metadata as importlib_metadata
 from typing import Any
 
-from astrbot.core.provider.provider import EmbeddingProvider
 
 from ..base.exceptions import InitializationError
 from ...log import logger, tag
@@ -244,54 +243,6 @@ class FaissBootstrapService:
 
         self._vec_db_class = loaded_vec_db_class
         return loaded_vec_db_class
-
-    async def check_and_fix_dimension_mismatch(
-        self,
-        index_path: str,
-        embedding_provider: EmbeddingProvider,
-    ) -> None:
-        """兼容旧调用方：只检查，不删除不兼容的正式索引。"""
-        if not os.path.exists(index_path):
-            return
-
-        try:
-            if os.path.getsize(index_path) == 0:
-                raise InitializationError("FAISS 索引文件为空。")
-        except OSError:
-            raise InitializationError("FAISS 索引文件不可访问。")
-
-        try:
-            import faiss  # noqa: F401
-        except (ImportError, ModuleNotFoundError, SystemError, OSError) as exc:
-            raise InitializationError(
-                "FAISS 初始化失败，无法读取索引文件。"
-                "请检查 faiss-cpu 安装状态和 CPU 指令集兼容性。"
-            ) from exc
-
-        try:
-            old_index = self.faiss_read_index_safe(index_path)
-        except InitializationError:
-            raise
-        except Exception as exc:
-            raise InitializationError("FAISS 索引文件损坏或无法读取。") from exc
-
-        old_dim = old_index.d
-        new_dim = embedding_provider.get_dim()
-        if old_dim == new_dim:
-            return
-
-        logger.warning(
-            f"{tag('init')} 检测到 FAISS 索引维度不匹配: "
-            f"索引维度={old_dim}, 当前 Embedding Provider 维度={new_dim}"
-        )
-        logger.warning(
-            f"{tag('init')} 这通常由 Embedding 模型切换导致。"
-            "正式索引不会被删除；应由影子索引服务完成重建后原子切换。"
-        )
-        raise InitializationError(
-            f"FAISS 索引维度不匹配（索引 {old_dim}，当前 {new_dim}）；"
-            "影子重建服务未执行。"
-        )
 
     def faiss_read_index_safe(self, index_path: str):
         """通过 ASCII 临时路径桥接 FAISS read_index。"""

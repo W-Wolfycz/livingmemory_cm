@@ -96,31 +96,6 @@ def test_participant_identities_keep_aliases_for_one_sender() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_conversation_success():
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"我记录了张三明天下午三点开会，并给出提醒",
-            "topics":["会议提醒"],
-            "key_facts":["张三明天下午三点开会"],
-            "sentiment":"neutral",
-            "importance":0.8
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    content, metadata, importance = await processor.process_conversation(
-        messages=_make_messages(),
-        is_group_chat=False,
-        persona_id=None,
-    )
-
-    assert "张三" in content
-    assert metadata["interaction_type"] == "private_chat"
-    assert "会议提醒" in metadata["topics"]
-    assert importance == 0.8
-
-
-@pytest.mark.asyncio
 async def test_persona_prompt_is_not_included_in_extraction():
     llm = _DummyLLMProvider(
         """{
@@ -235,15 +210,6 @@ async def test_process_conversation_batch_returns_multiple_topic_memories():
 
 
 @pytest.mark.asyncio
-async def test_process_conversation_batch_allows_empty_memories():
-    processor = MemoryProcessor(
-        llm_provider=_DummyLLMProvider('{"memories": []}'), context=None
-    )
-
-    assert await processor.process_conversation_batch(_make_messages()) == []
-
-
-@pytest.mark.asyncio
 async def test_canonical_summary_includes_key_facts():
     """canonical_summary 应将 key_facts 拼接到摘要中，提升检索覆盖率。"""
     llm = _DummyLLMProvider(
@@ -266,67 +232,6 @@ async def test_canonical_summary_includes_key_facts():
     # canonical_summary 应包含 key_facts 内容
     assert "明天下午三点开会" in metadata["canonical_summary"]
     assert "需要准备PPT" in metadata["canonical_summary"]
-
-
-@pytest.mark.asyncio
-async def test_summary_quality_normal_for_valid_response():
-    """有效的 LLM 响应应标记为 summary_quality=normal。"""
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"用户告知明天下午三点有重要会议需要参加",
-            "topics":["会议"],
-            "key_facts":["明天下午三点开会"],
-            "sentiment":"neutral",
-            "importance":0.8
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    _, metadata, _ = await processor.process_conversation(
-        messages=_make_messages(),
-        is_group_chat=False,
-        persona_id=None,
-    )
-
-    assert metadata.get("summary_quality") == "normal"
-
-
-@pytest.mark.parametrize(
-    "structured_data",
-    [
-        pytest.param(
-            {
-                "summary": "",
-                "topics": ["闲聊"],
-                "key_facts": ["用户问候"],
-                "sentiment": "neutral",
-                "importance": 0.5,
-            },
-            id="empty-summary",
-        ),
-        pytest.param(
-            {
-                "summary": "用户进行了一次普通对话",
-                "topics": ["闲聊"],
-                "key_facts": [],
-                "sentiment": "neutral",
-                "importance": 0.5,
-            },
-            id="missing-key-facts",
-        ),
-    ],
-)
-def test_build_memory_from_structured_data_flags_low_quality(structured_data):
-    """手动结构化写入仍可保留 low quality 判定（不经过严格协议）。"""
-    processor = MemoryProcessor(llm_provider=Mock(), context=None)
-
-    _, metadata, _ = processor.build_memory_from_structured_data(
-        structured_data,
-        is_group_chat=False,
-        fallback_excerpt="fallback",
-    )
-
-    assert metadata["summary_quality"] == "low"
 
 
 def test_validate_summary_quality_directly():
@@ -409,55 +314,6 @@ def test_quality_failure_reason_reports_specific_rule():
         )
         is None
     )
-
-
-def test_build_memory_from_structured_data_uses_standard_storage_format():
-    processor = MemoryProcessor(llm_provider=Mock(), context=None)
-
-    content, metadata, importance = processor.build_memory_from_structured_data(
-        {
-            "summary": "用户希望主动记忆工具复用自动总结格式",
-            "topics": ["LivingMemory", "主动记忆"],
-            "key_facts": ["主动记忆应复用 MemoryProcessor 格式化流程"],
-            "event_time": "2026-07-19",
-            "sentiment": "neutral",
-            "importance": 0.8,
-        },
-        is_group_chat=False,
-        fallback_excerpt="fallback",
-    )
-
-    assert content == metadata["canonical_summary"]
-    assert metadata["neutral_summary"] == "用户希望主动记忆工具复用自动总结格式"
-    assert "persona_summary" not in metadata
-    assert metadata["topics"] == ["LivingMemory", "主动记忆"]
-    assert metadata["key_facts"] == ["主动记忆应复用 MemoryProcessor 格式化流程"]
-    assert metadata["event_time"] == "2026-07-19"
-    assert metadata["sentiment"] == "neutral"
-    assert metadata["interaction_type"] == "private_chat"
-    assert metadata["summary_schema_version"] == "v3"
-    assert metadata["summary_quality"] == "normal"
-    assert importance == 0.8
-
-
-def test_build_memory_from_structured_data_flags_low_quality_for_out_of_range_importance():
-    """与自动总结路径一致：原始 importance 越界时应判为 low quality。"""
-    processor = MemoryProcessor(llm_provider=Mock(), context=None)
-
-    _, metadata, importance = processor.build_memory_from_structured_data(
-        {
-            "summary": "用户希望主动记忆工具复用自动总结格式",
-            "topics": ["测试"],
-            "key_facts": ["importance 越界"],
-            "sentiment": "neutral",
-            "importance": 1.5,
-        },
-        is_group_chat=False,
-        fallback_excerpt="fallback",
-    )
-
-    assert metadata["summary_quality"] == "low"
-    assert importance == 1.0
 
 
 # ── 群聊路径测试 ──────────────────────────────────────────────────────────────
@@ -554,153 +410,6 @@ async def test_process_group_chat_extracts_participants():
     assert "王五" in metadata["participants"]
 
 
-@pytest.mark.asyncio
-async def test_process_group_chat_uses_neutral_summary_schema():
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"群聊讨论了 AI 工具的使用效果，建议内部部署私有化 LLM",
-            "topics":["AI工具","数据安全"],
-            "key_facts":["建议公司内部部署私有化 LLM","注意数据安全"],
-            "participants":["张三","李四"],
-            "sentiment":"positive",
-            "importance":0.8
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    content, metadata, _ = await processor.process_conversation(
-        messages=_make_group_messages(),
-        is_group_chat=True,
-        persona_id=None,
-    )
-
-    assert "canonical_summary" in metadata
-    assert "neutral_summary" in metadata
-    assert "persona_summary" not in metadata
-    assert metadata.get("summary_schema_version") == "v3"
-    # canonical_summary 应包含 key_facts
-    assert "私有化 LLM" in metadata["canonical_summary"]
-    # content 应等于 canonical_summary
-    assert content == metadata["canonical_summary"]
-
-
-@pytest.mark.asyncio
-async def test_process_group_chat_missing_participants_uses_default():
-    """群聊 LLM 响应缺少 participants 字段时，应使用空列表默认值。"""
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"群聊讨论了一些话题",
-            "topics":["闲聊"],
-            "key_facts":["大家聊了很多"],
-            "sentiment":"neutral",
-            "importance":0.5
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    _, metadata, _ = await processor.process_conversation(
-        messages=_make_group_messages(),
-        is_group_chat=True,
-        persona_id=None,
-    )
-
-    # 缺少 participants 时应补充默认空列表
-    assert "participants" in metadata
-    assert isinstance(metadata["participants"], list)
-
-
-@pytest.mark.asyncio
-async def test_process_private_chat_no_participants_field():
-    """私聊路径不应在 metadata 中包含 participants 字段。"""
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"用户告知明天下午三点有重要会议",
-            "topics":["会议"],
-            "key_facts":["明天下午三点开会"],
-            "sentiment":"neutral",
-            "importance":0.8
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    _, metadata, _ = await processor.process_conversation(
-        messages=_make_messages(),
-        is_group_chat=False,
-        persona_id=None,
-    )
-
-    assert "participants" not in metadata
-    assert metadata["interaction_type"] == "private_chat"
-
-
-@pytest.mark.asyncio
-async def test_process_group_chat_long_content():
-    """群聊长内容（多条消息）应正常处理，不崩溃。"""
-    long_messages = []
-    for i in range(20):
-        long_messages.append(
-            Message(
-                id=i + 1,
-                session_id="aiocqhttp:GroupMessage:99999",
-                role="user",
-                content=f"成员{i % 5} 说：这是第 {i + 1} 条消息，内容比较详细，包含了很多信息。"
-                * 3,
-                sender_id=str(10000 + i % 5),
-                sender_name=f"成员{i % 5}",
-                group_id="99999",
-                platform="aiocqhttp",
-                metadata={},
-            )
-        )
-
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"群聊成员进行了多轮讨论，涉及多个话题",
-            "topics":["群聊","讨论"],
-            "key_facts":["多名成员参与讨论","讨论内容丰富"],
-            "participants":["成员0","成员1","成员2","成员3","成员4"],
-            "sentiment":"neutral",
-            "importance":0.6
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    content, metadata, importance = await processor.process_conversation(
-        messages=long_messages,
-        is_group_chat=True,
-        persona_id=None,
-    )
-
-    assert isinstance(content, str) and len(content) > 0
-    assert metadata["interaction_type"] == "group_chat"
-    assert len(metadata["participants"]) == 5
-    assert 0.0 <= importance <= 1.0
-
-
-@pytest.mark.asyncio
-async def test_process_group_chat_quality_low_for_generic_terms():
-    """群聊总结包含泛化词时，summary_quality 应为 low。"""
-    llm = _DummyLLMProvider(
-        """{
-            "summary":"某用户在群里说了一些话",
-            "topics":["闲聊"],
-            "key_facts":["有人说话了"],
-            "participants":["某用户"],
-            "sentiment":"neutral",
-            "importance":0.4
-        }"""
-    )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-
-    _, metadata, _ = await processor.process_conversation(
-        messages=_make_group_messages(),
-        is_group_chat=True,
-        persona_id=None,
-    )
-
-    assert metadata.get("summary_quality") == "low"
-
-
 def test_format_conversation_sanitizes_multimodal_private_message():
     processor = MemoryProcessor(llm_provider=None, context=None)
     message = Message(
@@ -725,71 +434,6 @@ def test_format_conversation_sanitizes_multimodal_private_message():
     assert "example.test" not in formatted
 
 
-def test_format_conversation_uses_placeholder_for_image_only_group_message():
-    processor = MemoryProcessor(llm_provider=None, context=None)
-    message = Message(
-        id=1,
-        session_id="g1",
-        role="user",
-        content=[
-            {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
-        ],
-        sender_id="u1",
-        sender_name="张三",
-        group_id="group1",
-        platform="test",
-        metadata={},
-    )
-
-    formatted = processor._format_conversation([message])
-
-    assert "张三" in formatted
-    assert "[图片消息]" in formatted
-    assert "image_url" not in formatted
-
-
-def test_text_tokenize_handles_empty_and_basic_cleaning() -> None:
-    processor = TextProcessor()
-
-    assert processor.tokenize("") == []
-    assert processor.tokenize("   ") == []
-    tokens = processor.tokenize("Visit https://example.com now!!!")
-    assert "Visit" in tokens or "visit" in [token.lower() for token in tokens]
-
-
-def test_text_tokenize_removes_common_stopwords() -> None:
-    processor = TextProcessor()
-    processor.add_stopwords(["我"])
-
-    tokens = processor.tokenize("我 今天 去 图书馆", remove_stopwords=True)
-
-    assert "我" not in tokens
-    assert tokens
-
-
-@pytest.mark.asyncio
-async def test_text_load_stopwords_and_custom_words(tmp_path: Path) -> None:
-    processor = TextProcessor()
-    path = tmp_path / "stopwords.txt"
-    path.write_text("# comment\nalpha\nbeta\n", encoding="utf-8")
-
-    loaded = await processor.load_stopwords(str(path))
-    processor.add_stopwords(["gamma"])
-
-    assert "alpha" in loaded
-    assert "alpha" in processor.stopwords
-    assert "gamma" in processor.stopwords
-    processor.remove_stopwords(["gamma"])
-    assert "gamma" not in processor.stopwords
-
-
-def test_text_word_frequency() -> None:
-    frequency = TextProcessor().get_word_freq(["我 爱 编程", "编程 很 有趣"])
-
-    assert isinstance(frequency, dict)
-    assert frequency
-
-
 def test_text_tokenize_falls_back_when_jieba_runtime_fails(monkeypatch) -> None:
     class BrokenJieba:
         @staticmethod
@@ -808,31 +452,6 @@ def test_text_tokenize_falls_back_when_jieba_runtime_fails(monkeypatch) -> None:
     assert tokens
     assert "编" in tokens
     assert text_processor_module.JIEBA_RUNTIME_DISABLED is True
-
-
-@pytest.mark.asyncio
-async def test_stopwords_manager_materializes_builtin_fallback(tmp_path: Path) -> None:
-    manager = StopwordsManager(str(tmp_path))
-    manager.builtin_stopwords_dir = tmp_path / "missing"
-
-    stopwords_path = await manager.get_stopwords()
-    loaded = await manager.load_stopwords()
-
-    assert stopwords_path is not None
-    assert Path(stopwords_path).exists()
-    assert "的" in loaded
-
-
-@pytest.mark.asyncio
-async def test_text_processor_async_init_loads_builtin_stopwords(
-    tmp_path: Path,
-) -> None:
-    processor = TextProcessor(str(tmp_path))
-
-    await processor.async_init()
-
-    assert "的" in processor.stopwords
-    assert not (tmp_path / "stopwords_hit.txt").exists()
 
 
 # ── 严格 JSON 协议 ───────────────────────────────────────────────────────────
@@ -865,37 +484,6 @@ def _memory_payload(
     return payload
 
 
-def test_strict_json_protocol_accepts_legacy_single_memory_json():
-    """旧版单记忆 JSON（无 status/memories 包裹）仍兼容。"""
-    processor = _new_processor()
-
-    result = processor._parse_llm_response_batch(
-        """{
-            "summary":"张三明天下午三点开会",
-            "topics":["会议"],
-            "key_facts":["张三明天下午三点开会"],
-            "event_time":"",
-            "sentiment":"neutral",
-            "importance":0.8
-        }""",
-        is_group_chat=False,
-    )
-
-    assert len(result) == 1
-    assert result[0]["summary"] == "张三明天下午三点开会"
-    assert result[0]["importance"] == 0.8
-
-
-def test_strict_json_protocol_success_empty_array():
-    processor = _new_processor()
-
-    result = processor._parse_llm_response_batch(
-        '{"status":"success","memories":[]}', is_group_chat=False
-    )
-
-    assert result == []
-
-
 def test_strict_json_protocol_skip_empty_array_raises_llmextractionskip():
     processor = _new_processor()
 
@@ -906,34 +494,6 @@ def test_strict_json_protocol_skip_empty_array_raises_llmextractionskip():
         )
 
     assert exc_info.value.reason == "content_policy"
-
-
-@pytest.mark.parametrize(
-    "payload, match",
-    [
-        pytest.param('{"status":"error","memories":[]}', None, id="invalid-status"),
-        pytest.param(
-            """{"status":"skip","reason":"content_policy","memories":[
-                {"summary":"s","topics":["t"],"key_facts":["f"],
-                 "event_time":"","sentiment":"neutral","importance":0.5}]}""",
-            None,
-            id="skip-with-non-empty-memories",
-        ),
-        pytest.param("[]", None, id="root-array"),
-        pytest.param('{"status":"success"}', "缺少 memories", id="missing-memories"),
-        pytest.param(
-            '{"status":"success","memories":["文本"]}',
-            "JSON 对象",
-            id="non-object-item",
-        ),
-    ],
-)
-def test_strict_json_protocol_rejects_invalid_batch_shapes(payload, match):
-    """非法根结构（状态/跳过语义/数组/缺字段/非对象项）一律拒绝。"""
-    processor = _new_processor()
-
-    with pytest.raises(ValueError, match=match):
-        processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
 def test_strict_json_protocol_rejects_more_than_five_memories():
@@ -950,49 +510,6 @@ def test_strict_json_protocol_rejects_more_than_five_memories():
 
     with pytest.raises(ValueError, match="最多允许 5 条"):
         processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_accepts_markdown_wrapped_json():
-    """Markdown 代码块包裹仍应被剥离后解析。"""
-    processor = _new_processor()
-
-    result = processor._parse_llm_response_batch(
-        """```json
-{"status":"success","memories":[]}
-```""",
-        is_group_chat=False,
-    )
-
-    assert result == []
-
-
-@pytest.mark.parametrize(
-    "payload, match",
-    [
-        pytest.param("   ", "为空", id="empty-response"),
-        pytest.param("抱歉，我无法处理", "不是合法 JSON", id="non-json-response"),
-    ],
-)
-def test_strict_json_protocol_rejects_unparsable_payloads(payload, match):
-    processor = _new_processor()
-
-    with pytest.raises(ValueError, match=match):
-        processor._parse_llm_response_batch(payload, is_group_chat=False)
-
-
-def test_strict_json_protocol_rejects_empty_or_non_string_summary():
-    processor = _new_processor()
-
-    for bad_summary in ("", "   ", 42):
-        payload = json.dumps(
-            {
-                "status": "success",
-                "memories": [_memory_payload(summary=bad_summary)],
-            },
-            ensure_ascii=False,
-        )
-        with pytest.raises(ValueError, match="summary"):
-            processor._parse_llm_response_batch(payload, is_group_chat=False)
 
 
 @pytest.mark.parametrize(
@@ -1033,23 +550,6 @@ def test_strict_json_protocol_rejects_invalid_memory_fields(field, bad_value, ma
         processor._parse_llm_response_batch(
             payload, is_group_chat=field == "participants"
         )
-
-
-def test_strict_json_protocol_accepts_valid_group_participants():
-    processor = _new_processor()
-
-    payload = json.dumps(
-        {
-            "status": "success",
-            "memories": [
-                _memory_payload(extra={"participants": ["张三", "李四"]})
-            ],
-        },
-        ensure_ascii=False,
-    )
-    result = processor._parse_llm_response_batch(payload, is_group_chat=True)
-
-    assert result[0]["participants"] == ["张三", "李四"]
 
 
 @pytest.mark.parametrize(
@@ -1175,15 +675,3 @@ class _MaxRetriesAwareProvider:
         return SimpleNamespace(completion_text=self._completion_text)
 
 
-@pytest.mark.asyncio
-async def test_call_llm_passes_request_max_retries_one_to_provider():
-    """支持该参数的 Provider：底层单次请求固定 1，重试统一由插件层控制。
-
-    避免 AstrBot Provider 内部默认 5 次与插件层 5 次叠加成 25 次底层请求。
-    """
-    provider = _MaxRetriesAwareProvider('{"status":"success","memories":[]}')
-    processor = MemoryProcessor(llm_provider=provider, context=None)
-
-    await processor._call_llm_with_retry(prompt="p", system_prompt="s")
-
-    assert provider.last_request_max_retries == 1

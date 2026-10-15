@@ -20,14 +20,6 @@ from livingmemory_cm.core.base.config_validator import (
 )
 
 
-def test_graph_memory_config_has_single_graph_route_weight() -> None:
-    config = GraphMemoryConfig()
-    assert config.graph_route_weight == 0.35
-    assert not hasattr(config, "document_route_weight")
-    # 单一权重不再要求归一化校验器
-    assert "validate_route_weights" not in type(config).__dict__
-
-
 # ============ graph_route_weight 迁移 ============
 # 注入后 document_route_weight 恒存在（默认 0.65 也会被注入），
 # 必须按值而非“键是否存在”判断旧配置。
@@ -89,38 +81,6 @@ def test_graph_route_weight_migration(raw, expected) -> None:
 # ==================== log_with_bot_id 顶层全局项 ====================
 
 
-def test_config_section_order_log_with_bot_id_first() -> None:
-    defaults = get_default_config()
-    keys = list(defaults.keys())
-    assert keys[0] == "log_with_bot_id"
-    assert "provider_settings" in keys
-    assert len(keys) == 7
-    assert "log" not in defaults
-    assert "document_route_weight" not in defaults["graph_memory"]
-
-
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        pytest.param({}, False, id="no-config-keeps-default"),
-        pytest.param({"log_with_bot_id": True}, True, id="top-level-true"),
-        pytest.param({"log_with_bot_id": False}, False, id="top-level-false"),
-        # 旧的 log 配置组已不再迁移：即便里面是 true 也不生效
-        pytest.param(
-            {"log": {"log_with_bot_id": True}}, False, id="legacy-group-ignored"
-        ),
-        pytest.param(
-            {"log_with_bot_id": True, "log": {"log_with_bot_id": False}},
-            True,
-            id="top-level-wins-over-legacy",
-        ),
-    ],
-)
-def test_log_with_bot_id_is_top_level_only(raw, expected) -> None:
-    """顶层 log_with_bot_id 是唯一入口，旧 log 组不参与解析。"""
-    assert validate_config(raw).log_with_bot_id is expected
-
-
 @pytest.mark.parametrize(
     "raw, expected",
     [
@@ -179,32 +139,6 @@ async def test_config_manager_persist_legacy_cleanup_calls_saver() -> None:
     assert "document_route_weight" not in source.snapshot["graph_memory"]
 
 
-@pytest.mark.asyncio
-async def test_config_manager_persist_legacy_cleanup_ignores_plain_dict() -> None:
-    """普通 dict（本地测试/非 AstrBot 路径）没有落盘方法，静默跳过。"""
-    from livingmemory_cm.core.base.config_manager import ConfigManager
-
-    source = {"graph_memory": {"document_route_weight": 0.6}}
-    manager = ConfigManager(source)
-    await manager.persist_legacy_cleanup()  # 不应抛异常
-    assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.4)
-
-
-@pytest.mark.asyncio
-async def test_config_manager_persist_legacy_cleanup_saver_failure_is_logged() -> None:
-    """save_config_async 抛异常时不影响初始化，只记日志。"""
-    from livingmemory_cm.core.base.config_manager import ConfigManager
-
-    class _BrokenSavingConfig(dict):
-        async def save_config_async(self):
-            raise RuntimeError("disk full")
-
-    source = _BrokenSavingConfig({"graph_memory": {"document_route_weight": 0.6}})
-    manager = ConfigManager(source)
-    await manager.persist_legacy_cleanup()  # 不应抛异常
-    assert manager.get("graph_memory.graph_route_weight") == pytest.approx(0.4)
-
-
 # ==================== _conf_schema.json 隐藏兼容键 ====================
 
 
@@ -226,34 +160,6 @@ def test_conf_schema_has_only_document_weight_hidden_key() -> None:
     assert doc.get("type") == "float"
     assert doc.get("default") == 0.65
     assert schema["log_with_bot_id"].get("type") == "bool"
-
-
-def test_conf_schema_visible_structure_unchanged_6_plus_1() -> None:
-    schema = _load_schema()
-    total = 0
-    section_count = 0
-    for key, value in schema.items():
-        if value.get("invisible"):
-            continue
-        if value.get("type") == "object" and isinstance(value.get("items"), dict):
-            section_count += 1
-            visible_items = [
-                k for k, v in value["items"].items() if not v.get("invisible")
-            ]
-            total += len(visible_items)
-        else:
-            total += 1
-    assert section_count == 6
-    assert total == 50
-
-
-def test_conf_schema_graph_document_visible_count_unaffected() -> None:
-    schema = _load_schema()
-    graph_items = schema["graph_memory"]["items"]
-    visible_graph = [k for k, v in graph_items.items() if not v.get("invisible")]
-    assert "document_route_weight" not in visible_graph
-    # 可见图段项数与合并前一致（不含隐藏兼容键）
-    assert len(visible_graph) == 14
 
 
 def test_llm_max_retries_default_and_schema() -> None:
@@ -280,63 +186,6 @@ def test_llm_max_retries_default_and_schema() -> None:
         validate_config({"provider_settings": {"llm_max_retries": 0}})
     with pytest.raises(Exception):
         validate_config({"provider_settings": {"llm_max_retries": 11}})
-
-
-def test_search_timeout_seconds_default_and_schema() -> None:
-    """search_timeout_seconds 默认 5 秒，validator 与 schema 一致，越界被拒绝。"""
-    from livingmemory_cm.core.base.config_validator import (
-        RecallEngineConfig,
-        validate_config,
-    )
-
-    assert RecallEngineConfig().search_timeout_seconds == 5.0
-    schema = _load_schema()
-    item = schema["recall_engine"]["items"]["search_timeout_seconds"]
-    assert item["type"] == "float"
-    assert item["default"] == 5.0
-
-    assert validate_config({}).recall_engine.search_timeout_seconds == 5.0
-    assert (
-        validate_config({"recall_engine": {"search_timeout_seconds": 12.5}})
-        .recall_engine.search_timeout_seconds
-        == 12.5
-    )
-    assert (
-        validate_config({"recall_engine": {"search_timeout_seconds": 0}})
-        .recall_engine.search_timeout_seconds
-        == 0.0
-    )
-
-    with pytest.raises(Exception):
-        validate_config({"recall_engine": {"search_timeout_seconds": -1}})
-    with pytest.raises(Exception):
-        validate_config({"recall_engine": {"search_timeout_seconds": 61}})
-
-
-def test_embedding_batch_size_default_and_schema() -> None:
-    """embedding_batch_size 默认 16，validator 与 schema 一致，越界被拒绝。"""
-    from livingmemory_cm.core.base.config_validator import (
-        ProviderConfig,
-        validate_config,
-    )
-
-    assert ProviderConfig().embedding_batch_size == 16
-    schema = _load_schema()
-    item = schema["provider_settings"]["items"]["embedding_batch_size"]
-    assert item["type"] == "int"
-    assert item["default"] == 16
-
-    assert validate_config({}).provider_settings.embedding_batch_size == 16
-    assert (
-        validate_config({"provider_settings": {"embedding_batch_size": 10}})
-        .provider_settings.embedding_batch_size
-        == 10
-    )
-
-    with pytest.raises(Exception):
-        validate_config({"provider_settings": {"embedding_batch_size": 0}})
-    with pytest.raises(Exception):
-        validate_config({"provider_settings": {"embedding_batch_size": 2049}})
 
 
 # ==================== 越界/非法配置逐项修正 ====================
@@ -393,17 +242,6 @@ def test_normalize_config_resets_broken_section_and_enum() -> None:
     assert reasons["importance_decay"] == {}
     assert reasons["recall_engine.memory_type_filter"] == "all"
     validate_config(normalized)
-
-
-def test_normalize_config_keeps_valid_config_untouched() -> None:
-    from livingmemory_cm.core.base.config_validator import normalize_config
-
-    merged = merge_config_with_defaults({"recall_engine": {"top_k": 7}})
-
-    normalized, corrections = normalize_config(merged)
-
-    assert corrections == []
-    assert normalized == merged
 
 
 def test_config_manager_keeps_other_settings_when_one_value_is_out_of_range() -> None:

@@ -145,7 +145,12 @@ class MemoryRecall:
                     return
 
                 if not actual_query:
-                    logger.warning(f"{tag_event('recall', event)} [{session_ref}] 原始用户消息为空，跳过记忆召回")
+                    # 正文与引用文本都为空（纯图片/表情/系统事件）属正常情况，只留诊断；
+                    # 引用消息的文本已由 get_event_message_str 回退取得，不会走到这里。
+                    logger.debug(
+                        f"{tag_event('recall', event)} [{session_ref}] "
+                        f"本轮无可召回文本（正文与引用均为空），跳过记忆召回"
+                    )
                     return
 
                 # 获取 persona_id，与 AstrBot 主流程保持一致的三级优先级：

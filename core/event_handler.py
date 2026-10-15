@@ -50,7 +50,7 @@ class EventHandler:
         self.conversation_manager = conversation_manager
 
         # 初始化子模块
-        self._message_utils = MessageUtils(config_manager, conversation_manager)
+        self._message_utils = MessageUtils(config_manager)
         self._injection_adapter = InjectionAdapter()
         self._memory_recall = MemoryRecall(
             context,
