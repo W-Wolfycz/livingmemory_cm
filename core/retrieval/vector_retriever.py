@@ -5,14 +5,19 @@
 
 import asyncio
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 
 from ...log import logger, tag
 
 _TRUNCATED_CONTENT_MARKER = "\n...[中间内容已截断]...\n"
+# 向量输入（embedding）的字符上限：超过则只压缩送进 embedding 的文本，
+# 全文照常入库，避免中间内容被永久丢弃。
+_MAX_EMBEDDING_CHARS = 4000
 
 
 @dataclass
@@ -159,21 +164,67 @@ class VectorRetriever:
                 else:  # session_id, persona_id
                     metadata[field] = None
 
-        # 插入到Faiss向量库，同样截断过长内容防止 embedding token 超限
-        _MAX_CONTENT_CHARS = 4000
-        insert_content = content
-        if len(insert_content) > _MAX_CONTENT_CHARS:
+        # 超长内容：全文入库，只压缩送进 embedding 的文本。直接截断后入库会让
+        # 中间内容永久丢失（列表/导出里看不出来，只在"想不起细节"时才察觉）。
+        if len(content) > _MAX_EMBEDDING_CHARS:
+            embedding_text = self._fit_content_for_embedding(
+                content,
+                _MAX_EMBEDDING_CHARS,
+            )
             logger.warning(
-                f"{tag('retrieval')} 记忆内容过长 ({len(insert_content)} 字符)，"
-                f"保留开头和结尾并压缩至 {_MAX_CONTENT_CHARS} 字符"
+                f"{tag('retrieval')} 记忆内容过长 ({len(content)} 字符)，"
+                f"全文入库、向量输入压缩至 {_MAX_EMBEDDING_CHARS} 字符"
             )
-            insert_content = self._fit_content_for_embedding(
-                insert_content,
-                _MAX_CONTENT_CHARS,
+            return await self._insert_with_embedding_text(
+                content,
+                embedding_text,
+                metadata,
             )
-        doc_id = await self.faiss_db.insert(content=insert_content, metadata=metadata)
 
-        return doc_id
+        return await self.faiss_db.insert(content=content, metadata=metadata)
+
+    async def _insert_with_embedding_text(
+        self,
+        content: str,
+        embedding_text: str,
+        metadata: dict[str, Any],
+    ) -> int:
+        """全文入库、仅向量输入用压缩文本（核心 insert 不支持两者分离，故等价手工实现）。
+
+        写向量失败时必须回滚已落库的文档行，否则会留下"有文本没向量"的孤儿记忆：
+        列表与导出里看得见，召回永远找不到它。
+        """
+        vector_store = getattr(self.faiss_db, "embedding_storage", None)
+        document_store = getattr(self.faiss_db, "document_storage", None)
+        embedder = getattr(self.faiss_db, "embedding_provider", None)
+        if vector_store is None or document_store is None or embedder is None:
+            # 拿不到核心内部对象（旧版或其他实现）：退回整段截断，保证写不失败
+            logger.warning(
+                f"{tag('retrieval')} 无法分离全文与向量输入，回退按截断入库"
+                f"（{len(embedding_text)} 字符，中间内容会丢失）"
+            )
+            return await self.faiss_db.insert(
+                content=embedding_text, metadata=metadata
+            )
+
+        doc_uuid = str(uuid.uuid4())
+        vector = np.asarray(
+            await embedder.get_embedding(embedding_text), dtype=np.float32
+        )
+        int_id = await document_store.insert_document(doc_uuid, content, metadata)
+        try:
+            await vector_store.insert(vector, int_id)
+        except BaseException:
+            # shield：即便本协程被取消，回滚也要跑完，否则留下孤儿文档
+            try:
+                await asyncio.shield(self.faiss_db.delete(doc_uuid))
+            except Exception as rollback_error:
+                logger.error(
+                    f"{tag('retrieval')} 超长记忆写入回滚失败，可能残留孤儿文档: "
+                    f"{type(rollback_error).__name__}"
+                )
+            raise
+        return int_id
 
     async def search(
         self,

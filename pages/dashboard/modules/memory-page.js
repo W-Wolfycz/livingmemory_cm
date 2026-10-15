@@ -21,15 +21,13 @@ export class MemoryPage {
   }
 
   /**
-   * 获取记忆列表
+   * 当前筛选条件 → 查询参数
+   *
+   * 列表与导出共用这一份：导出集合必须等于页面当前所见，否则会静默导出
+   * 一组不同的记忆（多导出的人格/会话在文件里看不出来）。
    */
-  async fetch() {
-    const fetchGeneration = ++this._fetchGeneration;
-    const params = {
-      page: String(this.state.memory.page),
-      page_size: String(this.state.memory.pageSize)
-    };
-
+  filterParams() {
+    const params = {};
     if (this.state.memory.session) params.session_id = this.state.memory.session;
     if (this.state.memory.keyword) params.keyword = this.state.memory.keyword;
     if (this.state.memory.status && this.state.memory.status !== "all") {
@@ -38,9 +36,20 @@ export class MemoryPage {
     if (this.state.memory.type && this.state.memory.type !== "all") {
       params.type = this.state.memory.type;
     }
-    if (this.state.memory.sort) {
-      params.sort = this.state.memory.sort;
-    }
+    if (this.state.memory.sort) params.sort = this.state.memory.sort;
+    return params;
+  }
+
+  /**
+   * 获取记忆列表
+   */
+  async fetch() {
+    const fetchGeneration = ++this._fetchGeneration;
+    const params = {
+      page: String(this.state.memory.page),
+      page_size: String(this.state.memory.pageSize),
+      ...this.filterParams()
+    };
 
     try {
       const data = await this.api.get("memories", params);
@@ -277,6 +286,44 @@ export class MemoryPage {
   }
 
   /**
+   * 导出记忆：有勾选时只导出勾选，否则导出当前筛选的全部。
+   *
+   * 文件由宿主保存（插件页在 iframe 内，不能自行触发下载）；文件名由后端带上
+   * 条数与 `_partial` 截断标记，这里解析出来给用户明确反馈。
+   */
+  async exportMemories() {
+    const button = document.getElementById("mem-export");
+    const selectedIds = Array.from(this.state.memory.selectedIds);
+    const formatSelect = document.getElementById("mem-export-format");
+    const params = {
+      ...this.filterParams(),
+      format: formatSelect ? formatSelect.value : "json"
+    };
+    if (selectedIds.length) params.ids = selectedIds.join(",");
+
+    if (button) button.disabled = true;
+    try {
+      const result = await this.api.download("memories/export", params);
+      const filename = String((result && result.filename) || "");
+      const match = /_(\d+)(_partial)?\.[a-z]+$/i.exec(filename);
+      const count = match
+        ? match[1]
+        : String(selectedIds.length || this.state.memory.total || 0);
+      if (match && match[2]) {
+        this.showToast(window.t("export.partial", count), true);
+      } else if (selectedIds.length) {
+        this.showToast(window.t("export.selected", count, filename));
+      } else {
+        this.showToast(window.t("export.filtered", count, filename));
+      }
+    } catch (error) {
+      this.showToast(error.message || window.t("export.error"), true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  /**
    * 根据 key 获取记忆项
    * @param {string} key - 记忆键（格式：m:id）
    * @returns {Object|undefined} 记忆对象
@@ -336,6 +383,13 @@ export class MemoryPage {
     document.getElementById("mem-batch-edit").addEventListener("click", () => {
       this.batchEdit();
     });
+
+    const exportButton = document.getElementById("mem-export");
+    if (exportButton) {
+      exportButton.addEventListener("click", () => {
+        this.exportMemories();
+      });
+    }
 
     // 筛选：关键词
     document.getElementById("mem-keyword").addEventListener("input", debounce(() => {

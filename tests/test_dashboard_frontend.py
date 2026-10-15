@@ -8,13 +8,36 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-NODE = shutil.which("node")
+
+def _resolve_node() -> str | None:
+    """优先 PATH 里的 node；没有则用 AstrBot 自带解释器里 Playwright 捆绑的 node。
+
+    后者按 ``sys.executable`` 相对推导，不写死绝对路径，因此任意用该解释器
+    跑测试的环境都能真正执行前端断言，而不是静默跳过。
+    """
+    found = shutil.which("node")
+    if found:
+        return found
+    candidate = (
+        Path(sys.executable).parent
+        / "Lib"
+        / "site-packages"
+        / "playwright"
+        / "driver"
+        / "node.exe"
+    )
+    return str(candidate) if candidate.is_file() else None
+
+
+NODE = _resolve_node()
 pytestmark = pytest.mark.skipif(NODE is None, reason="node 不可用，跳过前端行为测试")
 
 DASHBOARD_DIR = Path(__file__).resolve().parents[1] / "pages" / "dashboard"
@@ -59,7 +82,7 @@ globalThis.setTimeout = (fn) => {
 };
 
 function makeBridge({ failTimes = 0, failForever = false } = {}) {
-  const calls = { get: 0, post: 0 };
+  const calls = { get: 0, post: 0, download: 0, endpoint: "", params: null };
   const bridge = {
     async apiGet() {
       calls.get += 1;
@@ -70,6 +93,12 @@ function makeBridge({ failTimes = 0, failForever = false } = {}) {
       calls.post += 1;
       if (failForever || calls.post <= failTimes) throw new Error("bridge timeout");
       return { status: "ok", data: { ok: true } };
+    },
+    async download(endpoint, params, filename) {
+      calls.download += 1;
+      calls.endpoint = endpoint;
+      calls.params = params;
+      return { filename: filename || "export.json" };
     },
     async ready() {
       return {};
@@ -113,6 +142,39 @@ check("GET 失败一次后成功：2 次调用并返回数据", calls.get === 2,
 calls = await withClient({}, (c) => c.post("recall/test", {}, { retries: 2 }));
 check("POST 成功路径：1 次调用即返回", calls.post === 1, JSON.stringify(calls));
 
+// ---------- 3) 导出下载通道 ----------
+globalThis.window.lmPersonaId = "";
+calls = await withClient({}, (c) => c.download("memories/export", { format: "json" }));
+check(
+  "download 端点走 page/ 前缀",
+  calls.endpoint === "page/memories/export",
+  calls.endpoint
+);
+check(
+  "download 单次调用（重试会重复落盘）",
+  calls.download === 1,
+  JSON.stringify(calls)
+);
+check(
+  "未选人格时不注入 persona_id",
+  !calls.params || !calls.params.persona_id,
+  JSON.stringify(calls.params)
+);
+
+globalThis.window.lmPersonaId = "persona_demo";
+calls = await withClient({}, (c) => c.download("memories/export", { format: "csv" }));
+check(
+  "download 注入当前 persona（否则静默导出全部人格）",
+  calls.params && calls.params.persona_id === "persona_demo",
+  JSON.stringify(calls.params)
+);
+check(
+  "download 保留原有参数",
+  calls.params && calls.params.format === "csv",
+  JSON.stringify(calls.params)
+);
+globalThis.window.lmPersonaId = "";
+
 console.log(JSON.stringify(results));
 """
 
@@ -129,9 +191,10 @@ def _run_harness(tmp_path: Path) -> list[dict]:
         [NODE, str(harness)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
         env={
-            "PATH": "/usr/bin:/bin",
+            **os.environ,
             "UTILS_MJS": str(utils_mjs),
             "CLIENT_MJS": str(client_mjs),
         },
@@ -159,3 +222,13 @@ def test_dashboard_write_calls_declare_no_retry() -> None:
     )
     assert peek.count("{ retries: 0 }") == 5, "peek-panel 的 4 次 update + 1 次删除需显式不重试"
     assert memory_page.count("{ retries: 0 }") == 2
+
+
+def test_memory_page_export_reuses_list_filters() -> None:
+    """导出必须复用列表的筛选参数，否则导出集合与界面所见不一致（文件里看不出来）。"""
+    memory_page = (DASHBOARD_DIR / "modules" / "memory-page.js").read_text(
+        encoding="utf-8"
+    )
+    assert memory_page.count("this.filterParams()") == 2, (
+        "fetch() 与 exportMemories() 需共用 filterParams()，保证导出＝所见"
+    )

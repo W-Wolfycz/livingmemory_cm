@@ -422,3 +422,228 @@ async def test_rerank_only_scores_head_and_keeps_tail() -> None:
     assert len(provider.calls[0][1]) == 2
     assert [item.doc_id for item in results[:2]] == [1, 0]
     assert [item.doc_id for item in results[2:]] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_rerank_resolver_is_used_per_call_not_cached() -> None:
+    """守的静默失效：AstrBot 重建 provider 后旧实例 httpx 已关闭，若长期缓存实例，
+    重排会永久静默降级（无报错、只是不再重排）。"""
+    from livingmemory_cm.core.memory.memory_search_service import MemorySearchService
+
+    first = _FakeRerankProvider(scores=[1.0, 0.0])
+    second = _FakeRerankProvider(scores=[1.0, 0.0])
+    resolved: list[_FakeRerankProvider] = [first, second, None]
+
+    def resolver():
+        return resolved.pop(0)
+
+    service = MemorySearchService(
+        {"rerank_enabled": True, "rerank_weight": 1.0},
+        rerank_provider=None,
+        rerank_provider_resolver=resolver,
+    )
+
+    await service._apply_rerank("查询", _candidates([0.9, 0.4]))
+    await service._apply_rerank("查询", _candidates([0.9, 0.4]))
+    # 第三次 resolver 返回 None（provider 已被移除）→ 沿用原排序且不报错
+    unchanged = await service._apply_rerank("查询", _candidates([0.9, 0.4]))
+
+    assert first.calls and second.calls, "每次调用都应重新解析一次"
+    assert [item.doc_id for item in unchanged] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_dual_route_batches_missing_payload_lookup() -> None:
+    """守的静默性能退化：候选缺正文时逐条回库会让召回延迟按候选数线性增长。"""
+    from livingmemory_cm.core.retrieval.dual_route_retriever import DualRouteRetriever
+
+    class _Route:
+        def __init__(self, results):
+            self._results = results
+
+        async def search(self, query, k, session_id=None, persona_id=None):
+            return self._results
+
+    class _GraphResult:
+        """图路结果比文档路多 keyword_score/vector_score/score_breakdown。"""
+
+        def __init__(self, doc_id, score, content, metadata):
+            self.doc_id = doc_id
+            self.final_score = score
+            self.vector_score = score
+            self.keyword_score = score
+            self.content = content
+            self.metadata = metadata
+            self.score_breakdown: dict[str, float] = {}
+
+    doc_route = _Route(
+        [HybridResult(1, 0.9, 0.9, "", {}), HybridResult(2, 0.8, 0.8, "", {})]
+    )
+    graph_route = _Route([_GraphResult(3, 0.7, "图路内容", {"persona_id": "p"})])
+    single_calls: list[int] = []
+    batch_calls: list[list[int]] = []
+
+    async def single_loader(doc_id):
+        single_calls.append(doc_id)
+        return None
+
+    async def batch_loader(doc_ids):
+        batch_calls.append(list(doc_ids))
+        return {
+            doc_id: {"id": doc_id, "text": f"补取内容 {doc_id}", "metadata": {"persona_id": "p"}}
+            for doc_id in doc_ids
+        }
+
+    retriever = DualRouteRetriever(
+        doc_route,
+        graph_route,
+        single_loader,
+        {},
+        memory_batch_loader=batch_loader,
+    )
+    results = await retriever.search("查询", k=5)
+
+    assert sorted(batch_calls[0]) == [1, 2, 3], "缺内容的候选（含图路独有）必须一次批量取回"
+    assert len(batch_calls) == 1
+    assert single_calls == []
+    assert {item.doc_id for item in results} == {1, 2, 3}
+    assert all(item.content for item in results)
+
+
+# ── 超长内容写入（全文入库 / 向量输入截断 / 失败回滚）──────────────────────
+
+
+class _RecordingDocumentStorage:
+    def __init__(self) -> None:
+        self.inserted: list[tuple[str, str, dict]] = []
+
+    async def insert_document(self, doc_id, text, metadata):
+        self.inserted.append((doc_id, text, metadata))
+        return len(self.inserted)
+
+
+class _FailingVectorStorage:
+    def __init__(self) -> None:
+        self.deleted: list[list[int]] = []
+
+    async def insert(self, vector, id):
+        raise RuntimeError("faiss down")
+
+    async def delete(self, ids):
+        self.deleted.append(list(ids))
+
+
+class _RecordingVectorStorage:
+    def __init__(self) -> None:
+        self.inserted: list[int] = []
+
+    async def insert(self, vector, id):
+        self.inserted.append(id)
+
+
+class _DeleteRecordingFaiss:
+    def __init__(self, documents, vectors, embedder) -> None:
+        self.document_storage = documents
+        self.embedding_storage = vectors
+        self.embedding_provider = embedder
+        self.deleted_uuids: list[str] = []
+        self.core_inserted: list[str] = []
+
+    async def insert(self, content, metadata=None):
+        self.core_inserted.append(content)
+        return 0
+
+    async def delete(self, doc_id):
+        self.deleted_uuids.append(doc_id)
+        self.document_storage.inserted = [
+            item for item in self.document_storage.inserted if item[0] != doc_id
+        ]
+
+
+def _long_content_retriever(faiss):
+    from livingmemory_cm.core.retrieval.vector_retriever import VectorRetriever
+
+    return VectorRetriever(faiss)
+
+
+@pytest.mark.asyncio
+async def test_long_content_stores_full_text_and_truncates_only_embedding() -> None:
+    """守的静默失效：直接截断后入库会让中间内容永久丢失（列表/导出里看不出来）。"""
+    from livingmemory_cm.core.retrieval.vector_retriever import _MAX_EMBEDDING_CHARS
+
+    documents = _RecordingDocumentStorage()
+    vectors = _RecordingVectorStorage()
+    embedder = _FakeEmbeddingProvider()
+    embed_inputs: list[str] = []
+
+    async def _get_embedding(text):
+        embed_inputs.append(text)
+        return [0.1] * 4
+
+    embedder.get_embedding = _get_embedding
+    faiss = _DeleteRecordingFaiss(documents, vectors, embedder)
+
+    content = "头" * 3000 + "中段唯一内容" + "尾" * 2000
+    doc_id = await _long_content_retriever(faiss).add_document(
+        content,
+        {
+            "importance": 0.5,
+            "create_time": 1.0,
+            "last_access_time": 1.0,
+            "session_id": "s",
+            "persona_id": "p",
+        },
+    )
+
+    assert doc_id == 1
+    assert documents.inserted[0][1] == content, "全文必须原样入库"
+    assert len(embed_inputs[0]) <= _MAX_EMBEDDING_CHARS
+    assert "中段唯一内容" not in embed_inputs[0], "向量输入只保留首尾"
+    assert vectors.inserted == [1]
+
+
+@pytest.mark.asyncio
+async def test_long_content_rolls_back_document_when_vector_write_fails() -> None:
+    """守的静默失效：向量写失败却不回滚，会留下"有文本没向量"的孤儿记忆。"""
+    documents = _RecordingDocumentStorage()
+    vectors = _FailingVectorStorage()
+    faiss = _DeleteRecordingFaiss(documents, vectors, _FakeEmbeddingProvider())
+
+    content = "长" * 5000
+    with pytest.raises(RuntimeError):
+        await _long_content_retriever(faiss).add_document(
+            content,
+            {
+                "importance": 0.5,
+                "create_time": 1.0,
+                "last_access_time": 1.0,
+                "session_id": "s",
+                "persona_id": "p",
+            },
+        )
+
+    assert len(faiss.deleted_uuids) == 1, "失败必须按 uuid 回滚文档行"
+    assert documents.inserted == [], "回滚后不应残留孤儿文档"
+
+
+@pytest.mark.asyncio
+async def test_short_content_uses_core_insert() -> None:
+    """常规长度仍走核心 insert（不引入额外的三库手工同步路径）。"""
+    documents = _RecordingDocumentStorage()
+    faiss = _DeleteRecordingFaiss(
+        documents, _RecordingVectorStorage(), _FakeEmbeddingProvider()
+    )
+
+    await _long_content_retriever(faiss).add_document(
+        "短内容",
+        {
+            "importance": 0.5,
+            "create_time": 1.0,
+            "last_access_time": 1.0,
+            "session_id": "s",
+            "persona_id": "p",
+        },
+    )
+
+    assert faiss.core_inserted == ["短内容"]
+    assert documents.inserted == []

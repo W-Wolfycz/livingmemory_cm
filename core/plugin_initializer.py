@@ -320,11 +320,15 @@ class PluginInitializer:
                     logger.debug(f"{tag('init')} 获取默认 LLM Provider 失败: {e}")
                 self.llm_provider = None
 
-    def _resolve_rerank_provider(self):
+    def _resolve_rerank_provider(self, *, quiet: bool = False):
         """解析 Rerank Provider；未启用或不可用时返回 None（召回自动降级）。
 
         留空 provider_id 时回退到 AstrBot 已加载的默认 Rerank 提供商（取第一个），
         拿不到就保持关闭——绝不让重排失败影响召回本身。
+
+        ``quiet=True`` 供**每次召回**调用：AstrBot 重建 provider 后旧实例的 httpx
+        可能已关闭，因此必须重新解析而不是长期缓存实例；逐次解析的告警只在初始化
+        那次打印，避免刷屏。
         """
         if not bool(self.config_manager.get("recall_engine.rerank_enabled", False)):
             return None
@@ -335,25 +339,29 @@ class PluginInitializer:
         if provider_id:
             provider = self._get_provider_by_id(provider_id, silent=True)
             if provider is None:
-                logger.warning(
-                    f"{tag('init')} Rerank Provider {provider_id} 未找到，已关闭重排序"
-                )
+                if not quiet:
+                    logger.warning(
+                        f"{tag('init')} Rerank Provider {provider_id} 未找到，"
+                        "已关闭重排序"
+                    )
                 return None
             if not isinstance(provider, RerankProvider):
-                logger.warning(
-                    f"{tag('init')} Provider {provider_id} 不是 RerankProvider 类型，"
-                    "已关闭重排序"
-                )
+                if not quiet:
+                    logger.warning(
+                        f"{tag('init')} Provider {provider_id} 不是 RerankProvider 类型，"
+                        "已关闭重排序"
+                    )
                 return None
             return provider
 
         manager = getattr(self.context, "provider_manager", None)
         for candidate in getattr(manager, "rerank_provider_insts", []) or []:
             return candidate
-        logger.warning(
-            f"{tag('init')} 未找到可用的 Rerank Provider，已关闭重排序"
-            "（请在 AstrBot 模型提供商页面添加 Rerank 提供商）"
-        )
+        if not quiet:
+            logger.warning(
+                f"{tag('init')} 未找到可用的 Rerank Provider，已关闭重排序"
+                "（请在 AstrBot 模型提供商页面添加 Rerank 提供商）"
+            )
         return None
 
     def _get_provider_by_id(self, provider_id: str, *, silent: bool):
@@ -556,6 +564,8 @@ class PluginInitializer:
             }
 
             freeze_store = FreezeStore(data_dir_path / "frozen_personas.json")
+            # 初始化时解析一次用于告警；同时把"逐次重新解析"的回调交给检索层，
+            # AstrBot 重建 provider 后旧实例的 httpx 可能已关闭，不能长期缓存。
             self.rerank_provider = self._resolve_rerank_provider()
             self.memory_engine = MemoryEngine(
                 db_path=str(db_path),
@@ -565,6 +575,9 @@ class PluginInitializer:
                 config=memory_engine_config,
                 freeze_store=freeze_store,
                 rerank_provider=self.rerank_provider,
+                rerank_provider_resolver=lambda: self._resolve_rerank_provider(
+                    quiet=True
+                ),
             )
             await self.memory_engine.initialize()
             logger.info(f"{tag('init')} MemoryEngine 已初始化")

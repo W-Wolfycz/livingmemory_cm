@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .page_api_modules import (
@@ -94,6 +95,12 @@ class PluginPageApi:
             "LivingMemory Page batch update memories",
         )
         register(
+            f"{PAGE_API_PREFIX}/memories/export",
+            self.export_memories,
+            ["GET"],
+            "LivingMemory Page export memories",
+        )
+        register(
             f"{PAGE_API_PREFIX}/recall/test",
             self.test_recall,
             ["POST"],
@@ -168,6 +175,24 @@ class PluginPageApi:
         if error:
             return error
         return await self.memory_handler.batch_update_memories(ready["memory_engine"])
+
+    async def export_memories(self):
+        """导出记忆（返回原始文件响应，供插件页 files:download 存盘）。
+
+        下载路径不会解析 ``{"status": "error"}`` 包装——插件未就绪时必须给非 2xx，
+        否则用户会存下一份写着错误的 JSON 文件。
+        """
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            return (
+                json.dumps(error, ensure_ascii=False),
+                503,
+                {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Cache-Control": "no-store",
+                },
+            )
+        return await self.memory_handler.export_memories(ready["memory_engine"])
 
     async def test_recall(self):
         """测试记忆召回功能"""

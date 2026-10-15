@@ -82,6 +82,7 @@ class MemoryEngine:
         config: dict[str, Any] | None = None,
         freeze_store=None,
         rerank_provider=None,
+        rerank_provider_resolver=None,
     ):
         """
         初始化记忆引擎
@@ -103,8 +104,10 @@ class MemoryEngine:
         self.config = config or {}
         # 冻结（冷存储）状态：冻结中的 persona 不召回，且清理任务跳过
         self.freeze_store = freeze_store
-        # Rerank 提供商：召回后重排序，未配置时 None（自动跳过）
+        # Rerank 提供商：召回后重排序，未配置时 None（自动跳过）。
+        # resolver 存在时逐次调用它重新解析（provider 重建后缓存实例会失效）。
         self.rerank_provider = rerank_provider
+        self.rerank_provider_resolver = rerank_provider_resolver
         self.graph_enabled = bool(self.config.get("graph_memory_enabled", False))
         self.atom_enabled = bool(
             self.config.get(
@@ -135,7 +138,9 @@ class MemoryEngine:
         self.db_connection = None
         self._document_repository = DocumentRepository(self.faiss_db)
         self._search_service = MemorySearchService(
-            self.config, rerank_provider=self.rerank_provider
+            self.config,
+            rerank_provider=self.rerank_provider,
+            rerank_provider_resolver=self.rerank_provider_resolver,
         )
         self._statistics_service = MemoryStatisticsService(
             self.db_path,
@@ -218,6 +223,7 @@ class MemoryEngine:
                 self.graph_retriever,
                 self.get_memory,
                 self.config,
+                memory_batch_loader=self.get_memories_by_ids,
             )
 
         if self._write_op_repair_enabled:
@@ -548,6 +554,12 @@ class MemoryEngine:
             Optional[Dict]: 记忆数据,包含text和metadata
         """
         return await self._document_repository.get_memory(memory_id)
+
+    async def get_memories_by_ids(
+        self, memory_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        """批量取记忆（召回合并阶段一次性补齐候选，避免逐条往返）。"""
+        return await self._document_repository.get_memories_by_ids(memory_ids)
 
     async def update_memory(
         self,

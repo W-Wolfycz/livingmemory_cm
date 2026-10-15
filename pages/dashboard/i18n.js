@@ -135,6 +135,17 @@
     "batchEdit.valueRequired":{ zh: "请输入新值" },
     "batchEdit.importanceRange":{ zh: "重要性必须在 0-10 之间" },
 
+    /* ---- Export ---- */
+    "export.button":      { zh: "导出" },
+    "export.title":       { zh: "导出记忆：有勾选时只导出勾选，否则导出当前筛选的全部" },
+    "export.formatTitle": { zh: "导出文件格式" },
+    "export.formatJson":  { zh: "JSON" },
+    "export.formatCsv":   { zh: "CSV" },
+    "export.selected":    { zh: "已导出选中 {0} 条：{1}" },
+    "export.filtered":    { zh: "已导出当前筛选 {0} 条：{1}" },
+    "export.partial":     { zh: "导出达到条数上限，文件只含前 {0} 条（文件名含 _partial）" },
+    "export.error":       { zh: "导出失败，请稍后重试" },
+
     /* ---- Archive ---- */
     "archive.success":    { zh: "已归档 {0} 条记忆" },
     "archive.fail":       { zh: "归档失败" },

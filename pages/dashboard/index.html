@@ -155,6 +155,14 @@
                 <i data-lucide="pencil" aria-hidden="true"></i>
                 <span id="mem-batch-edit-label" data-i18n="batchEdit.button">Batch edit</span>
               </button>
+              <select id="mem-export-format" class="select input" style="width:auto" data-i18n-title="export.formatTitle">
+                <option value="json" data-i18n="export.formatJson">JSON</option>
+                <option value="csv" data-i18n="export.formatCsv">CSV</option>
+              </select>
+              <button class="btn btn-sm btn-secondary" id="mem-export" data-i18n-title="export.title">
+                <i data-lucide="download" aria-hidden="true"></i>
+                <span data-i18n="export.button">Export</span>
+              </button>
               <button class="btn btn-sm btn-danger" id="mem-delete-selected" disabled data-i18n-title="delete.selectedTitle">
                 <i data-lucide="trash-2" aria-hidden="true"></i>
                 <span id="mem-delete-selected-label" data-i18n="delete.selected">Delete selected</span>

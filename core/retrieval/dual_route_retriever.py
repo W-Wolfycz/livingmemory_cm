@@ -10,6 +10,15 @@ from .graph_retriever import GraphRetriever
 from .hybrid_retriever import HybridResult, HybridRetriever
 
 
+def _has_payload(result: HybridResult | None) -> bool:
+    """候选自身已带正文与元数据（无需回库补取）时返回 True。"""
+    if result is None:
+        return False
+    return bool(result.content) and isinstance(result.metadata, dict) and bool(
+        result.metadata
+    )
+
+
 class DualRouteRetriever:
     """Coordinate document and graph retrieval routes."""
 
@@ -19,10 +28,14 @@ class DualRouteRetriever:
         graph_retriever: GraphRetriever,
         memory_loader: Callable[[int], Awaitable[dict[str, Any] | None]],
         config: dict[str, Any] | None = None,
+        memory_batch_loader: (
+            Callable[[list[int]], Awaitable[dict[int, dict[str, Any]]]] | None
+        ) = None,
     ):
         self.document_retriever = document_retriever
         self.graph_retriever = graph_retriever
         self.memory_loader = memory_loader
+        self.memory_batch_loader = memory_batch_loader
         self.config = config or {}
         self.graph_route_weight = float(self.config.get("graph_route_weight", 0.35))
         # 文档路权重：优先使用显式旧键，否则自动 = 1 - 图路权重
@@ -67,6 +80,17 @@ class DualRouteRetriever:
         graph_map = {item.doc_id: item for item in graph_results}
         all_doc_ids = set(doc_map) | set(graph_map)
 
+        # 缺内容/元数据的候选先集中补取一次，避免逐个 id 往返（每个 id 一次
+        # 查询在候选多时会把召回延迟按 id 数线性拉长）。
+        # 判定口径必须与下面合并时的取值口径一致——合并只从 doc_result 取正文
+        # 与元数据，因此"图路独有"的候选一律要回库补取，否则会被 continue 丢掉。
+        pending_ids = [
+            doc_id
+            for doc_id in all_doc_ids
+            if not _has_payload(doc_map.get(doc_id))
+        ]
+        loaded = await self._load_memories(pending_ids)
+
         merged_results: list[HybridResult] = []
         for doc_id in all_doc_ids:
             doc_result = doc_map.get(doc_id)
@@ -94,7 +118,10 @@ class DualRouteRetriever:
             )
 
             if not memory_content or not memory_metadata:
-                memory = await self.memory_loader(doc_id)
+                memory = loaded.get(doc_id)
+                if memory is None and not self.memory_batch_loader:
+                    # 无批量通道时退回逐条补取（保持旧行为）
+                    memory = await self.memory_loader(doc_id)
                 if not memory:
                     continue
                 memory_content = str(memory.get("text") or memory_content)
@@ -155,6 +182,40 @@ class DualRouteRetriever:
 
         merged_results.sort(key=lambda item: item.final_score, reverse=True)
         return merged_results[:k]
+
+    async def _load_memories(
+        self, doc_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        """批量补齐候选的正文/元数据；无批量通道或批量失败时退回逐条。"""
+        if not doc_ids:
+            return {}
+        if self.memory_batch_loader is not None:
+            try:
+                loaded = await self.memory_batch_loader(doc_ids)
+                if loaded:
+                    return loaded
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    f"{tag('retrieval')} 批量补取候选记忆失败，退回逐条补取",
+                    exc_info=True,
+                )
+        fallback: dict[int, dict[str, Any]] = {}
+        for doc_id in doc_ids:
+            try:
+                memory = await self.memory_loader(doc_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    f"{tag('retrieval')} 补取候选记忆失败: {doc_id}",
+                    exc_info=True,
+                )
+                continue
+            if memory:
+                fallback[doc_id] = memory
+        return fallback
 
     def _route_weights_for_query(self, query: str) -> tuple[float, float, str]:
         """Adjust document/graph weights with lightweight query intent rules."""

@@ -38,12 +38,20 @@ _DOC_PERSONA_EXPR = (
 class MemorySearchService:
     """协调文档/图双路检索，并维护进程内 TTL 缓存。"""
 
-    def __init__(self, config: dict[str, Any], rerank_provider=None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        rerank_provider=None,
+        rerank_provider_resolver=None,
+    ) -> None:
         self.config = config
-        # Rerank 提供商（可选）：启用后对合并结果重排序，失败自动沿用原排序
+        # Rerank 提供商（可选）：启用后对合并结果重排序，失败自动沿用原排序。
+        # 给了 resolver 就逐次重新解析（AstrBot 重建 provider 后旧实例的 httpx
+        # 可能已关闭，长期缓存实例会让重排永久静默降级）。
         self.rerank_provider = rerank_provider
+        self._rerank_provider_resolver = rerank_provider_resolver
         self._rerank_enabled = bool(config.get("rerank_enabled", False)) and (
-            rerank_provider is not None
+            rerank_provider is not None or rerank_provider_resolver is not None
         )
         self._rerank_candidates = max(2, int(config.get("rerank_candidates", 20)))
         self._rerank_weight = min(
@@ -199,6 +207,21 @@ class MemorySearchService:
             )
         return filtered
 
+    def _current_rerank_provider(self):
+        """取当前可用的 Rerank 提供商；有 resolver 时逐次重新解析。"""
+        resolver = self._rerank_provider_resolver
+        if resolver is None:
+            return self.rerank_provider
+        try:
+            return resolver()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                f"{tag('retrieval')} Rerank 提供商解析失败，沿用原排序", exc_info=True
+            )
+            return None
+
     async def _apply_rerank(
         self,
         query: str,
@@ -214,12 +237,19 @@ class MemorySearchService:
         if not self._rerank_enabled or len(results) < 2:
             return results
 
+        provider = self._current_rerank_provider()
+        if provider is None:
+            logger.debug(
+                f"{tag('retrieval')} Rerank 提供商当前不可用，沿用原排序"
+            )
+            return results
+
         head = results[: self._rerank_candidates]
         tail = results[len(head) :]
         documents = [item.content or "" for item in head]
 
         try:
-            rerank_call = self.rerank_provider.rerank(query, documents)
+            rerank_call = provider.rerank(query, documents)
             if self._rerank_timeout > 0:
                 scored = await asyncio.wait_for(
                     rerank_call, timeout=self._rerank_timeout

@@ -46,7 +46,6 @@ def test_distribution_metadata_and_required_notices_are_consistent():
     dashboard = (ROOT / "pages" / "dashboard" / "index.html").read_text(
         encoding="utf-8"
     )
-    sync_script = (ROOT / "sync.sh").read_text(encoding="utf-8")
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 
     for content in (metadata, readme, notice, help_catalog, dashboard):
@@ -58,6 +57,8 @@ def test_distribution_metadata_and_required_notices_are_consistent():
         ROOT / "pages" / "dashboard" / "vendor" / "LUCIDE_LICENSE"
     ).read_text(encoding="utf-8")
     assert "## [2.5.7-cm]" in changelog
+    # 发行所需的许可证/声明文件必须真的在仓库里（同步已改为工作区 root 的 robocopy 规则，
+    # 不再有 sync.sh 可断言；这里改为直接校验文件存在，守住同一件事）。
     for required in (
         "LICENSE",
         "NOTICE.md",
@@ -65,7 +66,7 @@ def test_distribution_metadata_and_required_notices_are_consistent():
         "CHANGELOG.md",
         "pages/dashboard/vendor/LUCIDE_LICENSE",
     ):
-        assert f'"{required}"' in sync_script
+        assert (ROOT / required).is_file(), f"缺少发行文件: {required}"
     for ignored in (
         ".venv-test/",
         "__pycache__/",

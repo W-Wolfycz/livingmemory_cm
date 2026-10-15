@@ -133,7 +133,6 @@ class MemoryProcessor:
         ``persona_id`` 只用于存储和召回分区。保留参数与方法名是为了兼容旧
         调用方；萃取阶段不读取 Persona Prompt，也不模仿角色语气。
         """
-        current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         if persona_id:
             logger.debug(
                 f"{tag('processor')} persona_id 仅用于分区，不注入萃取提示词"
@@ -141,7 +140,6 @@ class MemoryProcessor:
         return (
             "你是长期记忆事实萃取器。只能输出一个标准 JSON 对象，禁止输出 Markdown、"
             "解释、道歉或其他自然语言。\n"
-            f"当前日期时间: {current_date}\n"
             "只提取对未来有用、能够由对话支持的事实。使用中性、简洁、第三人称或"
             "直接事实表述；不得模仿任何角色人格、语气或文风，不得文学化补写。\n"
             "必须区分消息前缀中的具体发言者和 Bot，不得把不同人的行为合并。\n"

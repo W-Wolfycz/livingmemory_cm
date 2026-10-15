@@ -2,6 +2,7 @@
 记忆管理处理模块
 """
 
+import json
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,14 @@ if TYPE_CHECKING:
 
 class MemoryHandler:
     """记忆管理处理器"""
+
+    # 导出：默认 2 万条、上限 10 万条（limit<=0 视为取上限），避免一次导出
+    # 把整库读进内存；触到上限时文件名带 _partial，页面据此提示用户。
+    EXPORT_DEFAULT_LIMIT = 20000
+    EXPORT_MAX_LIMIT = 100000
+    EXPORT_FORMATS = ("json", "csv")
+    # 以这些字符开头的单元格会被表格软件当公式执行，导出时加前导单引号切断
+    _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
     def __init__(self, utils: "PageApiUtils"):
         """
@@ -69,14 +78,9 @@ class MemoryHandler:
             包含记忆列表和分页信息的字典
         """
         query = request.args
-        session_id = self.utils.optional_text(query.get("session_id"))
-        persona_id = self.utils.optional_text(query.get("persona_id"))
-        keyword = str(query.get("keyword", "")).strip()
-        status_filter = str(query.get("status", "all")).strip().lower() or "all"
-        type_filter = self.utils.optional_text(query.get("type"))
-        if type_filter and type_filter.lower() == "all":
-            type_filter = None
-        sort_key = str(query.get("sort", "created_desc")).strip().lower()
+        spec, error = self._build_query_spec(query)
+        if error:
+            return self.utils.error(error)
 
         try:
             page = max(1, int(query.get("page", 1)))
@@ -88,7 +92,78 @@ class MemoryHandler:
         if not db_path:
             return self.utils.error("MemoryEngine db_path unavailable")
 
+        where_clause = spec["where_clause"]
+        params = list(spec["params"])
+        sort_expr = spec["sort_expr"]
+        sort_key = spec["sort_key"]
         offset = (page - 1) * page_size
+
+        try:
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+
+                count_cursor = await db.execute(
+                    f"SELECT COUNT(*) AS total FROM documents {where_clause}",
+                    params,
+                )
+                count_row = await count_cursor.fetchone()
+                total = int(count_row["total"]) if count_row else 0
+
+                cursor = await db.execute(
+                    f"""
+                    SELECT id, doc_id, text, metadata, created_at, updated_at
+                    FROM documents
+                    {where_clause}
+                    ORDER BY {sort_expr}
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, page_size, offset),
+                )
+                rows = await cursor.fetchall()
+        except Exception as exc:
+            logger.error(f"{tag('page')} 获取记忆列表失败: {exc}", exc_info=True)
+            return self.utils.error(str(exc))
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "id": row["id"],
+                    "doc_id": row["doc_id"],
+                    "text": row["text"],
+                    "metadata": self.utils.normalize_metadata(row["metadata"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+
+        return self.utils.ok(
+            {
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "has_more": (offset + page_size) < total,
+                "filters": spec["filters"],
+                "sort": sort_key,
+            }
+        )
+
+    def _build_query_spec(self, query) -> tuple[dict[str, Any] | None, str | None]:
+        """把列表与导出共用的过滤/排序参数编译成 SQL 片段。
+
+        两处必须共用这一份：否则「导出」的集合会与页面当前所见不一致，
+        而这种错位在导出文件里看不出来（静默错位）。
+        """
+        session_id = self.utils.optional_text(query.get("session_id"))
+        persona_id = self.utils.optional_text(query.get("persona_id"))
+        keyword = str(query.get("keyword", "")).strip()
+        status_filter = str(query.get("status", "all")).strip().lower() or "all"
+        type_filter = self.utils.optional_text(query.get("type"))
+        if type_filter and type_filter.lower() == "all":
+            type_filter = None
+        sort_key = str(query.get("sort", "created_desc")).strip().lower()
+
         where_clauses: list[str] = []
         params: list[Any] = []
         type_expr = (
@@ -189,10 +264,71 @@ class MemoryHandler:
             sort_key = "created_desc"
             sort_expr = sort_options[sort_key]
 
+        return {
+            "where_clause": where_clause,
+            "params": params,
+            "sort_key": sort_key,
+            "sort_expr": sort_expr,
+            "persona_id": persona_id,
+            "filters": {
+                "session_id": session_id,
+                "keyword": keyword,
+                "status": status_filter,
+                "type": type_filter,
+            },
+        }, None
+
+    async def export_memories(self, memory_engine):
+        """按当前筛选（或指定 ID）导出记忆，返回可直接存盘的文件响应。
+
+        返回 ``(content, status_code, headers)`` 元组：官方插件页桥的
+        ``files:download`` 会把响应体原样存成文件，因此这里不能返回
+        ``{"status": "ok"}`` 包装，否则用户存下的是包装 JSON。
+
+        查询参数: 与列表相同，另加
+            - format: json（默认）| csv
+            - ids: 逗号分隔的记忆 ID；给出时只导出这些 ID（页面勾选场景）
+            - limit: 条数上限（默认 20000、上限 100000、0 表示取上限）
+        """
+        query = request.args
+        export_format = str(query.get("format", "json")).strip().lower() or "json"
+        if export_format not in self.EXPORT_FORMATS:
+            return self._export_error("导出格式仅支持 json / csv", 400)
+
+        spec, error = self._build_query_spec(query)
+        if error:
+            return self._export_error(error, 400)
+
+        ids, id_error = self._parse_export_ids(query.get("ids"))
+        if id_error:
+            return self._export_error(id_error, 400)
+
+        try:
+            limit = int(query.get("limit", self.EXPORT_DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            return self._export_error("limit 参数无效", 400)
+        if limit <= 0:
+            limit = self.EXPORT_MAX_LIMIT
+        else:
+            limit = min(limit, self.EXPORT_MAX_LIMIT)
+
+        db_path = getattr(memory_engine, "db_path", None)
+        if not db_path:
+            return self._export_error("MemoryEngine db_path unavailable", 500)
+
+        where_clause = spec["where_clause"]
+        params = list(spec["params"])
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            ids_clause = f"id IN ({placeholders})"
+            where_clause = (
+                f"{where_clause} AND {ids_clause}" if where_clause else f"WHERE {ids_clause}"
+            )
+            params.extend(ids)
+
         try:
             async with aiosqlite.connect(db_path) as db:
                 db.row_factory = aiosqlite.Row
-
                 count_cursor = await db.execute(
                     f"SELECT COUNT(*) AS total FROM documents {where_clause}",
                     params,
@@ -205,45 +341,157 @@ class MemoryHandler:
                     SELECT id, doc_id, text, metadata, created_at, updated_at
                     FROM documents
                     {where_clause}
-                    ORDER BY {sort_expr}
-                    LIMIT ? OFFSET ?
+                    ORDER BY {spec["sort_expr"]}
+                    LIMIT ?
                     """,
-                    (*params, page_size, offset),
+                    (*params, limit),
                 )
                 rows = await cursor.fetchall()
         except Exception as exc:
-            logger.error(f"{tag('page')} 获取记忆列表失败: {exc}", exc_info=True)
-            return self.utils.error(str(exc))
+            logger.error(f"{tag('page')} 导出记忆失败: {exc}", exc_info=True)
+            return self._export_error("导出失败", 500)
 
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            items.append(
+        items = [self._export_item(row) for row in rows]
+        truncated = total > len(items)
+        filename = self._export_filename(export_format, len(items), truncated)
+        if export_format == "csv":
+            content = self._to_csv(items)
+            content_type = "text/csv; charset=utf-8"
+        else:
+            content = json.dumps(
                 {
-                    "id": row["id"],
-                    "doc_id": row["doc_id"],
-                    "text": row["text"],
-                    "metadata": self.utils.normalize_metadata(row["metadata"]),
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-            )
-
-        return self.utils.ok(
-            {
-                "items": items,
-                "total": total,
-                "page": page,
-                "page_size": page_size,
-                "has_more": (offset + page_size) < total,
-                "filters": {
-                    "session_id": session_id,
-                    "keyword": keyword,
-                    "status": status_filter,
-                    "type": type_filter,
+                    "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "format_version": 1,
+                    "format": "json",
+                    "filtered_by": {
+                        **spec["filters"],
+                        "persona_id": spec["persona_id"],
+                        "ids": ids,
+                        "sort": spec["sort_key"],
+                    },
+                    "count": len(items),
+                    "total_matched": total,
+                    "truncated": truncated,
+                    "memories": items,
                 },
-                "sort": sort_key,
-            }
+                ensure_ascii=False,
+                indent=2,
+            )
+            content_type = "application/json; charset=utf-8"
+
+        logger.info(
+            f"{tag('page')} 导出记忆: {len(items)}/{total} 条，格式 {export_format}"
+            + ("（触达上限，文件名含 _partial）" if truncated else "")
         )
+        return (
+            content,
+            200,
+            {
+                "Content-Type": content_type,
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    def _parse_export_ids(self, raw: Any) -> tuple[list[int], str | None]:
+        """解析逗号分隔的 ID 列表；未提供时返回空列表表示"按筛选导出"。"""
+        text = str(raw or "").strip()
+        if not text:
+            return [], None
+        ids: list[int] = []
+        for part in text.split(","):
+            piece = part.strip()
+            if not piece:
+                continue
+            try:
+                ids.append(int(piece))
+            except (TypeError, ValueError):
+                return [], f"ids 含非法记忆 ID：{piece}"
+        return ids, None
+
+    def _export_item(self, row) -> dict[str, Any]:
+        """把一行文档展开成导出字段（CSV/JSON 共用）。"""
+        metadata = self.utils.normalize_metadata(row["metadata"])
+        return {
+            "id": row["id"],
+            "doc_id": row["doc_id"],
+            "text": row["text"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "memory_type": metadata.get("memory_type", "GENERAL"),
+            "status": metadata.get("status", "active"),
+            "importance": metadata.get("importance"),
+            "persona_id": metadata.get("persona_id"),
+            "session_id": metadata.get("session_id"),
+            "create_time": metadata.get("create_time"),
+            "event_time": metadata.get("event_time"),
+            "participants": metadata.get("participants"),
+            "topics": metadata.get("topics"),
+            "key_facts": metadata.get("key_facts"),
+            "summary": metadata.get("neutral_summary") or metadata.get("canonical_summary"),
+        }
+
+    def _export_filename(self, export_format: str, count: int, truncated: bool) -> str:
+        """文件名自带条数与截断标记，页面无需额外协议即可提示用户。"""
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        suffix = "_partial" if truncated else ""
+        return f"livingmemory_cm_memories_{stamp}_{count}{suffix}.{export_format}"
+
+    @staticmethod
+    def _export_error(message: str, status_code: int):
+        """下载路径不会解析 {"status": "error"}，改用非 2xx 让页面提示错误。"""
+        return (
+            json.dumps({"status": "error", "message": message}, ensure_ascii=False),
+            status_code,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+        )
+
+    @classmethod
+    def _to_csv(cls, items: list[dict[str, Any]]) -> str:
+        """导出 CSV：UTF-8 BOM 便于 Excel 直接打开中文，单元格按 RFC 4180 转义。"""
+        columns = [
+            ("id", "ID"),
+            ("doc_id", "doc_id"),
+            ("memory_type", "类型"),
+            ("status", "状态"),
+            ("importance", "重要性"),
+            ("persona_id", "人格"),
+            ("session_id", "会话"),
+            ("create_time", "创建时间戳"),
+            ("event_time", "事件时间"),
+            ("participants", "参与者"),
+            ("topics", "主题"),
+            ("key_facts", "事实"),
+            ("summary", "摘要"),
+            ("text", "内容"),
+            ("created_at", "入库时间"),
+            ("updated_at", "更新时间"),
+        ]
+        lines = [",".join(name for _, name in columns)]
+        for item in items:
+            lines.append(
+                ",".join(cls._csv_cell(item.get(key)) for key, _ in columns)
+            )
+        return "\ufeff" + "\r\n".join(lines) + "\r\n"
+
+    @classmethod
+    def _csv_cell(cls, value: Any) -> str:
+        """列表字段用 、 连接；含分隔符/换行/引号时按标准加引号并转义。"""
+        if value is None:
+            text = ""
+        elif isinstance(value, list | tuple):
+            text = "、".join(str(part) for part in value)
+        elif isinstance(value, dict):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+
+        if text.startswith(cls._CSV_FORMULA_PREFIXES):
+            # 记忆正文可能来自群成员，前导公式字符会被表格软件执行
+            text = "'" + text
+        if any(char in text for char in (",", '"', "\n", "\r")):
+            text = '"' + text.replace('"', '""') + '"'
+        return text
 
     async def get_memory_detail(self, memory_engine) -> dict[str, Any]:
         """

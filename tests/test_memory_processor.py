@@ -4,6 +4,7 @@ Tests for MemoryProcessor.
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -142,6 +143,25 @@ async def test_persona_prompt_is_not_included_in_extraction():
     assert "长期记忆事实萃取器" in system_prompt
     assert "活泼助手" not in system_prompt
     context.persona_manager.get_persona.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extraction_prompt_static_prefix_is_cache_friendly():
+    """守的静默失效：静态前缀里一旦含逐次变化的日期，提供商的自动前缀缓存会整体
+    失效——没有任何报错，只是每次请求都全量计费。"""
+    processor = MemoryProcessor(llm_provider=_DummyLLMProvider("{}"), context=Mock())
+
+    system_prompt = await processor._build_system_prompt_with_persona(None)
+    assert not re.search(r"\d{4}-\d{2}-\d{2}", system_prompt), (
+        "system prompt 必须逐字节稳定，不能带日期/时间"
+    )
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "core" / "prompts"
+    for name in ("group_chat_prompt.txt", "private_chat_prompt.txt"):
+        text = (prompts_dir / name).read_text(encoding="utf-8")
+        static_head, _, dynamic_tail = text.partition("{conversation}")
+        assert "{current_date}" not in static_head, f"{name} 的静态段不能带日期"
+        assert "{current_date}" in dynamic_tail, f"{name} 末尾仍需给出当前日期"
 
 
 # ── 中性摘要与质量校验 ───────────────────────────────────────────────────────

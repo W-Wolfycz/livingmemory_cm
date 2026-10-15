@@ -168,4 +168,26 @@ export class ApiClient {
       retries: options.retries,
     }));
   }
+
+  /**
+   * 文件下载：交给宿主执行（插件页在 iframe 里，不能自己触发下载）。
+   *
+   * 端点与 apiGet 同源，因此同样走 buildEndpoint、同样注入当前 persona——
+   * 否则用户在面板选了人格后导出，会静默导出全部人格的记忆。
+   * 不重试：宿主可能已在保存文件，重试会重复落盘。
+   *
+   * @param {string} path - API 路径（如 "memories/export"）
+   * @param {Object} params - Query 参数
+   * @param {string} filename - 建议文件名（可空，留空用响应头的 content-disposition）
+   * @returns {Promise<{filename: string}>} 宿主保存的文件名
+   */
+  async download(path, params = {}, filename = "") {
+    if (!this.bridge || typeof this.bridge.download !== "function") {
+      throw new Error(window.t ? window.t("bridge.error") : "Bridge not available");
+    }
+    if (window.lmPersonaId && !this._isPersonasEndpoint(path)) {
+      params = { ...params, persona_id: window.lmPersonaId };
+    }
+    return this.bridge.download(this.buildEndpoint(path), params, filename);
+  }
 }

@@ -58,6 +58,35 @@ class DocumentRepository:
             logger.warning(f"{tag('memory-doc')} 获取记忆详情失败", exc_info=True)
             return None
 
+    async def get_memories_by_ids(
+        self, memory_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        """批量按整数 ID 取记忆，返回 ``{id: {"text", "metadata"}}``。
+
+        召回合并阶段要在一次查询里补齐所有缺内容的候选——逐条 ``get_memory``
+        会让召回延迟按候选数线性增长。
+        """
+        wanted = [int(item) for item in memory_ids if item is not None]
+        if not wanted:
+            return {}
+        try:
+            docs = await self.faiss_db.document_storage.get_documents(
+                metadata_filters={}, ids=wanted, limit=len(wanted)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(f"{tag('memory-doc')} 批量获取记忆详情失败", exc_info=True)
+            return {}
+        return {
+            int(doc["id"]): {
+                "id": doc["id"],
+                "text": doc["text"],
+                "metadata": doc["metadata"],
+            }
+            for doc in docs
+        }
+
     async def get_session_memories(
         self,
         session_id: str,
